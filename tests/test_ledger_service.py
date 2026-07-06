@@ -58,6 +58,7 @@ def test_read_only_service_can_list_positions(tmp_path) -> None:
 def test_read_only_service_exposes_no_mutation_methods(tmp_path) -> None:
     _, read_only, connection_cm = make_services(tmp_path)
     try:
+        assert not hasattr(read_only, "repository")
         for method_name in ["add_position", "update_position", "remove_position", "import_csv"]:
             assert not hasattr(read_only, method_name)
     finally:

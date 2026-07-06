@@ -13,24 +13,24 @@ def current_time() -> datetime:
 
 class ReadOnlyLedgerService:
     def __init__(self, repository: PositionRepository) -> None:
-        self.repository = repository
+        self._repository = repository
 
     def get_position(self, symbol: str) -> Position | None:
-        return self.repository.get(symbol)
+        return self._repository.get(symbol)
 
     def list_positions(self) -> list[Position]:
-        return self.repository.list()
+        return self._repository.list()
 
 
 class LedgerService(ReadOnlyLedgerService):
     def add_position(self, position: PositionInput, *, now: datetime | None = None) -> Position:
-        return self.repository.add(position, now=now or current_time())
+        return self._repository.add(position, now=now or current_time())
 
     def update_position(self, position: PositionInput, *, now: datetime | None = None) -> Position:
-        return self.repository.update(position, now=now or current_time())
+        return self._repository.update(position, now=now or current_time())
 
     def remove_position(self, symbol: str) -> None:
-        self.repository.remove(symbol)
+        self._repository.remove(symbol)
 
     def import_csv(self, path: Path, *, now: datetime | None = None) -> list[Position]:
-        return self.repository.import_csv(path, now=now or current_time())
+        return self._repository.import_csv(path, now=now or current_time())
