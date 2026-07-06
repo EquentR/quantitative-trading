@@ -8,8 +8,16 @@
 
 设置本地 SQLite 路径：
 
+PowerShell:
+
+```powershell
+$env:QT_DATABASE_PATH = "data/quant_trading.db"
+```
+
+bash:
+
 ```bash
-set QT_DATABASE_PATH=data/quant_trading.db
+export QT_DATABASE_PATH=data/quant_trading.db
 ```
 
 新增持仓：
