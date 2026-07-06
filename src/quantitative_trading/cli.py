@@ -30,10 +30,17 @@ app.add_typer(service_app, name="service")
 def _services() -> tuple[Any, LedgerService, ReadOnlyLedgerService]:
     settings = load_settings()
     connection_cm = connect(settings)
-    connection = connection_cm.__enter__()
-    migrate(connection)
-    repository = PositionRepository(connection)
-    return connection_cm, LedgerService(repository), ReadOnlyLedgerService(repository)
+    entered = False
+    try:
+        connection = connection_cm.__enter__()
+        entered = True
+        migrate(connection)
+        repository = PositionRepository(connection)
+        return connection_cm, LedgerService(repository), ReadOnlyLedgerService(repository)
+    except BaseException:
+        if entered:
+            connection_cm.__exit__(*sys.exc_info())
+        raise
 
 
 def _position_input(

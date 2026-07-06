@@ -1,7 +1,9 @@
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
+import quantitative_trading.cli as cli
 from quantitative_trading.cli import app
 
 
@@ -41,6 +43,7 @@ def test_ledger_add_and_list(tmp_path) -> None:
     assert "数量=1000" in list_result.output
     assert "可用=800" in list_result.output
     assert "成本=9.5" in list_result.output
+    assert "更新=" in list_result.output
 
 
 def test_ledger_update_and_remove(tmp_path) -> None:
@@ -113,3 +116,35 @@ def test_service_check_reads_ledger(tmp_path) -> None:
     assert result.exit_code == 0
     assert "服务检查通过" in result.output
     assert "当前持仓数量: 0" in result.output
+
+
+def test_services_closes_connection_when_migrate_fails(monkeypatch) -> None:
+    class FakeConnectionManager:
+        def __init__(self) -> None:
+            self.exited = False
+            self.exit_args = None
+
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            self.exited = True
+            self.exit_args = (exc_type, exc, tb)
+            return False
+
+    connection_cm = FakeConnectionManager()
+
+    def fake_connect(settings):
+        return connection_cm
+
+    def fail_migrate(connection) -> None:
+        raise RuntimeError("migration failed")
+
+    monkeypatch.setattr(cli, "connect", fake_connect)
+    monkeypatch.setattr(cli, "migrate", fail_migrate)
+
+    with pytest.raises(RuntimeError, match="migration failed"):
+        cli._services()
+
+    assert connection_cm.exited is True
+    assert connection_cm.exit_args[0] is RuntimeError
