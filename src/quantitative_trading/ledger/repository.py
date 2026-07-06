@@ -85,6 +85,7 @@ class PositionRepository:
             (symbol,),
         )
         if cursor.rowcount == 0:
+            self.connection.rollback()
             raise MissingPositionError(f"position not found: {symbol}")
         self.connection.commit()
 
@@ -162,13 +163,22 @@ class PositionRepository:
 
     def _read_csv_positions(self, path: Path) -> list[PositionInput]:
         positions: list[PositionInput] = []
+        seen_symbols: dict[str, int] = {}
         with path.open(newline="", encoding="utf-8") as file:
             reader = csv.DictReader(file)
             for row_number, row in enumerate(reader, start=2):
                 try:
-                    positions.append(PositionInput.model_validate(row))
+                    position = PositionInput.model_validate(row)
                 except ValidationError as exc:
                     raise ValueError(f"invalid position row {row_number}") from exc
+                if position.symbol in seen_symbols:
+                    first_row = seen_symbols[position.symbol]
+                    raise ValueError(
+                        f"duplicate symbol {position.symbol} at row {row_number}; "
+                        f"first seen at row {first_row}"
+                    )
+                seen_symbols[position.symbol] = row_number
+                positions.append(position)
         return positions
 
     def _with_updated_at(self, position: PositionInput, now: datetime) -> Position:
