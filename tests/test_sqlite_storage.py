@@ -1,7 +1,48 @@
 import sqlite3
 
+import pytest
+
 from quantitative_trading.config import Settings
 from quantitative_trading.storage.sqlite import connect, migrate
+
+
+def insert_position(
+    connection: sqlite3.Connection,
+    **overrides: object,
+) -> None:
+    data = {
+        "symbol": "600000",
+        "name": "Ping An Bank",
+        "quantity": 1000,
+        "available_quantity": 800,
+        "cost_price": 9.5,
+        "opened_at": "2026-07-06",
+        "updated_at": "2026-07-06T15:00:00+08:00",
+    }
+    data.update(overrides)
+
+    connection.execute(
+        """
+        INSERT INTO positions (
+          symbol,
+          name,
+          quantity,
+          available_quantity,
+          cost_price,
+          opened_at,
+          updated_at
+        ) VALUES (
+          :symbol,
+          :name,
+          :quantity,
+          :available_quantity,
+          :cost_price,
+          :opened_at,
+          :updated_at
+        )
+        """,
+        data,
+    )
 
 
 def test_migrate_creates_positions_table(tmp_path) -> None:
@@ -32,3 +73,54 @@ def test_connection_enforces_foreign_keys(tmp_path) -> None:
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
 
     assert foreign_keys == 1
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    ["60000", "6000000", "SH600000", "abcdef", "60000A"],
+)
+def test_positions_reject_invalid_symbol(tmp_path, symbol: str) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_position(connection, symbol=symbol)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("available_quantity", 1001),
+        ("cost_price", 0),
+        ("cost_price", -1.0),
+    ],
+)
+def test_positions_enforce_quantity_and_cost_constraints(
+    tmp_path,
+    field: str,
+    value: object,
+) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_position(connection, **{field: value})
+
+
+def test_positions_default_note_to_empty_string(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        insert_position(connection)
+
+        row = connection.execute(
+            "SELECT note FROM positions WHERE symbol = ?",
+            ("600000",),
+        ).fetchone()
+
+    assert row["note"] == ""

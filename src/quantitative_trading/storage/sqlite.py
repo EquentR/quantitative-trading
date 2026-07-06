@@ -9,7 +9,7 @@ from quantitative_trading.config import Settings
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS positions (
-  symbol TEXT PRIMARY KEY,
+  symbol TEXT PRIMARY KEY NOT NULL,
   name TEXT NOT NULL,
   quantity INTEGER NOT NULL CHECK (quantity >= 0),
   available_quantity INTEGER NOT NULL CHECK (available_quantity >= 0),
@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS positions (
   opened_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
+  CHECK (symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'),
   CHECK (available_quantity <= quantity)
 );
 """
