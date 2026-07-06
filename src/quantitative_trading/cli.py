@@ -143,15 +143,12 @@ def list_positions() -> None:
 
         for position in positions:
             typer.echo(
-                "\t".join(
-                    [
-                        position.symbol,
-                        position.name,
-                        str(position.quantity),
-                        str(position.available_quantity),
-                        f"{position.cost_price:g}",
-                        position.updated_at.isoformat(),
-                    ]
+                (
+                    f"{position.symbol} {position.name} "
+                    f"数量={position.quantity} "
+                    f"可用={position.available_quantity} "
+                    f"成本={position.cost_price:g} "
+                    f"更新={position.updated_at.isoformat()}"
                 )
             )
     finally:

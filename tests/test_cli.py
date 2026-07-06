@@ -38,7 +38,9 @@ def test_ledger_add_and_list(tmp_path) -> None:
     assert list_result.exit_code == 0
     assert "600000" in list_result.output
     assert "浦发银行" in list_result.output
-    assert "1000" in list_result.output
+    assert "数量=1000" in list_result.output
+    assert "可用=800" in list_result.output
+    assert "成本=9.5" in list_result.output
 
 
 def test_ledger_update_and_remove(tmp_path) -> None:
