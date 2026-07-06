@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import csv
+import sqlite3
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -37,6 +40,35 @@ def _services() -> tuple[Any, LedgerService, ReadOnlyLedgerService]:
         migrate(connection)
         repository = PositionRepository(connection)
         return connection_cm, LedgerService(repository), ReadOnlyLedgerService(repository)
+    except BaseException:
+        if entered:
+            connection_cm.__exit__(*sys.exc_info())
+        raise
+
+
+@contextmanager
+def _connect_read_only(database_path: Path) -> Iterator[sqlite3.Connection]:
+    connection = sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def _read_only_services() -> tuple[Any | None, ReadOnlyLedgerService | None]:
+    settings = load_settings()
+    if not settings.database_path.exists():
+        return None, None
+
+    connection_cm = _connect_read_only(settings.database_path)
+    entered = False
+    try:
+        connection = connection_cm.__enter__()
+        entered = True
+        repository = PositionRepository(connection)
+        return connection_cm, ReadOnlyLedgerService(repository)
     except BaseException:
         if entered:
             connection_cm.__exit__(*sys.exc_info())
@@ -166,7 +198,10 @@ def list_positions() -> None:
 def import_positions(path: Annotated[Path, typer.Argument()]) -> None:
     connection_cm, service, _ = _services()
     try:
-        positions = service.import_csv(path)
+        try:
+            positions = service.import_csv(path)
+        except (OSError, ValueError) as exc:
+            raise typer.BadParameter(f"导入持仓失败: {exc}") from exc
         typer.echo(f"已导入 {len(positions)} 条持仓")
     finally:
         connection_cm.__exit__(None, None, None)
@@ -206,10 +241,11 @@ def export_positions() -> None:
 
 @service_app.command("check")
 def check_service() -> None:
-    connection_cm, _, read_only = _services()
+    connection_cm, read_only = _read_only_services()
     try:
-        positions = read_only.list_positions()
+        positions = [] if read_only is None else read_only.list_positions()
         typer.echo("服务检查通过")
         typer.echo(f"当前持仓数量: {len(positions)}")
     finally:
-        connection_cm.__exit__(None, None, None)
+        if connection_cm is not None:
+            connection_cm.__exit__(None, None, None)

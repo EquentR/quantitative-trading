@@ -110,12 +110,72 @@ def test_ledger_import_and_export(tmp_path) -> None:
     assert "600000,浦发银行,1000,800,9.5,2026-07-06,首批" in export_result.output
 
 
+def test_ledger_import_reports_duplicate_symbol_error(tmp_path) -> None:
+    csv_path = tmp_path / "positions.csv"
+    csv_path.write_text(
+        "symbol,name,quantity,available_quantity,cost_price,opened_at,note\n"
+        "600000,浦发银行,1000,800,9.5,2026-07-06,首批\n"
+        "600000,浦发银行,1000,800,9.5,2026-07-06,重复\n",
+        encoding="utf-8",
+    )
+
+    result = run_cli(tmp_path, "ledger", "import", str(csv_path))
+
+    assert result.exit_code != 0
+    assert "导入持仓失败" in result.output
+    assert "duplicate symbol 600000" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_ledger_import_reports_missing_file_error(tmp_path) -> None:
+    csv_path = tmp_path / "missing.csv"
+
+    result = run_cli(tmp_path, "ledger", "import", str(csv_path))
+
+    assert result.exit_code != 0
+    assert "导入持仓失败" in result.output
+    assert "missing.csv" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_service_check_reads_ledger(tmp_path) -> None:
+    db_path = tmp_path / "ledger.db"
+
     result = run_cli(tmp_path, "service", "check")
 
     assert result.exit_code == 0
     assert "服务检查通过" in result.output
     assert "当前持仓数量: 0" in result.output
+    assert not db_path.exists()
+
+
+def test_service_check_reads_existing_ledger_without_writing(tmp_path) -> None:
+    db_path = tmp_path / "ledger.db"
+    add_result = run_cli(
+        tmp_path,
+        "ledger",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "浦发银行",
+        "--quantity",
+        "1000",
+        "--available-quantity",
+        "800",
+        "--cost-price",
+        "9.5",
+        "--opened-at",
+        "2026-07-06",
+    )
+
+    result = run_cli(tmp_path, "service", "check")
+
+    assert add_result.exit_code == 0
+    assert db_path.exists()
+    assert result.exit_code == 0
+    assert "服务检查通过" in result.output
+    assert "当前持仓数量: 1" in result.output
 
 
 def test_services_closes_connection_when_migrate_fails(monkeypatch) -> None:
