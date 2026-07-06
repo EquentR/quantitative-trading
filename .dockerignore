@@ -1,20 +1,21 @@
-.env
-.env.*
-!.env.example
-
+.git/
+.worktrees/
 .idea/
 .tmp/
-.worktrees/
 .venv/
-
 __pycache__/
 *.py[cod]
 *.egg-info/
 
-logs/
-*.log
+.env
+.env.*
+!.env.example
 
 data/
+logs/
+*.log
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm

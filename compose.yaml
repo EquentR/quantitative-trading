@@ -1,0 +1,10 @@
+services:
+  qt:
+    build:
+      context: .
+    image: quantitative-trading:local
+    environment:
+      QT_DATABASE_PATH: /app/data/quant_trading.db
+    volumes:
+      - ./data:/app/data
+    command: ["service", "check"]
