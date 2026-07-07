@@ -95,10 +95,16 @@ qt account snapshot
 qt service check
 ```
 
-调试版后台服务单次运行：
+统一 HTTP API 服务启动：
 
 ```bash
-qt service run --once
+qt service run
+```
+
+调试版后台服务单次快照：
+
+```bash
+qt service debug-run --once
 ```
 
 ## Docker 示例

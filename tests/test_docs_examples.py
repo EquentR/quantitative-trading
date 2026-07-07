@@ -42,7 +42,8 @@ def test_docs_document_cash_and_account_service_scope() -> None:
     assert "资金上下文" in recommendation_contract
     assert "qt cash init" in readme
     assert "qt account snapshot" in readme
-    assert "qt service run --once" in readme
+    assert "```bash\nqt service run\n```" in readme
+    assert "qt service debug-run --once" in readme
     assert "QT_LOG_DIR=data/logs" in env_example
     assert "QT_MARKET_PROVIDER=akshare" in env_example
     assert "QT_TIMEZONE=Asia/Shanghai" in env_example
