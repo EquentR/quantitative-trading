@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from quantitative_trading.api import dependencies
 from quantitative_trading.api.dependencies import ApiContainer
 from quantitative_trading.api.errors import install_error_handlers
-from quantitative_trading.api.routes import auth, positions, service
+from quantitative_trading.api.routes import auth, cash, positions, service
 from quantitative_trading.config import Settings
 
 
@@ -20,6 +20,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     install_error_handlers(app)
     app.include_router(auth.router, prefix="/api/v1")
+    app.include_router(cash.router, prefix="/api/v1")
     app.include_router(positions.router, prefix="/api/v1")
     app.include_router(service.router, prefix="/api/v1")
 
