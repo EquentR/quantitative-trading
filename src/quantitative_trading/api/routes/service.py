@@ -29,17 +29,15 @@ def status(container: ApiContainer = Depends(get_container)) -> dict[str, object
 
 @router.post("/scheduler/start", dependencies=[Depends(require_token)])
 def start_scheduler(container: ApiContainer = Depends(get_container)) -> dict[str, object]:
+    _control_scheduler(container.scheduler, action="start")
     _set_scheduler_enabled(container, enabled=True)
-    if container.scheduler is not None:
-        container.scheduler.start()
     return _status_payload(container)
 
 
 @router.post("/scheduler/stop", dependencies=[Depends(require_token)])
 def stop_scheduler(container: ApiContainer = Depends(get_container)) -> dict[str, object]:
+    _control_scheduler(container.scheduler, action="stop")
     _set_scheduler_enabled(container, enabled=False)
-    if container.scheduler is not None:
-        container.scheduler.stop()
     return _status_payload(container)
 
 
@@ -59,22 +57,25 @@ def run_once(container: ApiContainer = Depends(get_container)) -> dict[str, obje
         error = _safe_error_summary(exc)
 
     finished_at = datetime.now(UTC)
-    with connection_scope(container.settings) as connection:
-        repository = SchedulerStateRepository(connection)
-        repository.get_or_create(
-            interval_seconds=container.settings.intraday_interval_seconds,
-            run_on_start=container.settings.service_run_on_start_when_scheduler_enabled,
-            now=started_at,
-        )
-        repository.record_result(
-            started_at=started_at,
-            finished_at=finished_at,
-            status=status_value,
-            reason="manual_api",
-            error=error,
-            snapshot_id=snapshot_id,
-            now=finished_at,
-        )
+    try:
+        with connection_scope(container.settings) as connection:
+            repository = SchedulerStateRepository(connection)
+            repository.get_or_create(
+                interval_seconds=container.settings.intraday_interval_seconds,
+                run_on_start=container.settings.service_run_on_start_when_scheduler_enabled,
+                now=started_at,
+            )
+            repository.record_result(
+                started_at=started_at,
+                finished_at=finished_at,
+                status=status_value,
+                reason="manual_api",
+                error=error,
+                snapshot_id=snapshot_id,
+                now=finished_at,
+            )
+    except (sqlite3.Error, ValidationError) as exc:
+        raise _service_state_failed() from exc
     return _status_payload(container)
 
 
@@ -122,6 +123,15 @@ def _set_scheduler_enabled(container: ApiContainer, *, enabled: bool) -> None:
         raise _service_state_failed() from exc
 
 
+def _control_scheduler(scheduler: object | None, *, action: str) -> None:
+    if scheduler is None:
+        return
+    try:
+        getattr(scheduler, action)()
+    except Exception as exc:
+        raise _scheduler_control_failed() from exc
+
+
 def _scheduler_running(scheduler: object | None) -> bool:
     if scheduler is None:
         return False
@@ -142,9 +152,46 @@ def _scheduler_next_run_time(scheduler: object | None) -> object | None:
 
 def _safe_error_summary(exc: Exception) -> str:
     summary = str(exc).strip() or exc.__class__.__name__
-    summary = re.sub(r"(?i)\b(token|password|secret|cookie|api[_-]?key)=\S+", r"\1=[redacted]", summary)
+    summary = re.sub(
+        r"(?i)\bAuthorization\s*:\s*Bearer\s+[^\s,;]+",
+        "Authorization: Bearer [redacted]",
+        summary,
+    )
+    summary = re.sub(
+        r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^@\s/]+)@",
+        r"\1[redacted]@",
+        summary,
+    )
+    summary = re.sub(
+        r"(?i)([?&](?:token|password|secret|cookie|api[_-]?key)=)[^&#\s]+",
+        r"\1[redacted]",
+        summary,
+    )
+    summary = re.sub(
+        r"(?i)\b(token|password|secret|cookie|api[_-]?key)\b\s*=\s*[^\s,;&]+",
+        r"\1=[redacted]",
+        summary,
+    )
+    summary = re.sub(
+        r"(?i)\b(token|password|secret|cookie|api[_-]?key)\b\s*:\s*[^\s,;&]+",
+        r"\1: [redacted]",
+        summary,
+    )
+    summary = re.sub(
+        r"(?i)\b(token|password|secret|cookie|api[_-]?key)\b\s+(?!\[redacted\])[^\s,;&]+",
+        r"\1 [redacted]",
+        summary,
+    )
     summary = re.sub(r"(?<!\w)/(?:[^/\s]+/)*[^/\s]+", "[path]", summary)
     return summary[:300]
+
+
+def _scheduler_control_failed() -> ApiError:
+    return ApiError(
+        status_code=500,
+        code="scheduler_error",
+        message="scheduler control failed",
+    )
 
 
 def _service_state_failed() -> ApiError:

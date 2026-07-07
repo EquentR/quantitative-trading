@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import sqlite3
+
 from fastapi.testclient import TestClient
+import pytest
 
 from quantitative_trading.api.app import create_app
 from quantitative_trading.config import Settings
 
 
-def authenticated_client(tmp_path) -> tuple[TestClient, dict[str, str]]:
+def authenticated_client(
+    tmp_path,
+    *,
+    scheduler: object | None = None,
+    raise_server_exceptions: bool = True,
+) -> tuple[TestClient, dict[str, str]]:
     settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
-    client = TestClient(create_app(settings))
+    client = TestClient(
+        create_app(settings, scheduler=scheduler),
+        raise_server_exceptions=raise_server_exceptions,
+    )
     client.post("/api/v1/auth/setup-password", json={"password": "local-password"})
     login = client.post("/api/v1/auth/login", json={"password": "local-password"})
     return client, {"Authorization": f"Bearer {login.json()['access_token']}"}
@@ -131,3 +142,119 @@ def test_scheduler_start_and_stop_call_injected_scheduler(tmp_path) -> None:
     assert stop_response.status_code == 200
     assert scheduler.started == 1
     assert scheduler.stopped == 1
+
+
+def test_scheduler_start_failure_returns_uniform_error_without_enabling(tmp_path) -> None:
+    class FailingStartScheduler:
+        is_running = False
+        next_run_time = None
+
+        def start(self) -> bool:
+            raise RuntimeError("scheduler backend failed at /tmp/private/scheduler.py")
+
+        def stop(self) -> bool:
+            return True
+
+    client, headers = authenticated_client(
+        tmp_path,
+        scheduler=FailingStartScheduler(),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post("/api/v1/service/scheduler/start", headers=headers)
+    status_response = client.get("/api/v1/service/status", headers=headers)
+
+    assert status_response.json()["scheduler_enabled"] is False
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]["code"] == "scheduler_error"
+    assert response.json()["error"]["message"] == "scheduler control failed"
+    assert "/tmp/private" not in response.text
+
+
+def test_scheduler_stop_failure_returns_uniform_error_without_disabling(tmp_path) -> None:
+    class FailingStopScheduler:
+        def __init__(self) -> None:
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            raise RuntimeError("scheduler backend failed at /tmp/private/scheduler.py")
+
+    client, headers = authenticated_client(
+        tmp_path,
+        scheduler=FailingStopScheduler(),
+        raise_server_exceptions=False,
+    )
+    client.post("/api/v1/service/scheduler/start", headers=headers)
+
+    response = client.post("/api/v1/service/scheduler/stop", headers=headers)
+    status_response = client.get("/api/v1/service/status", headers=headers)
+
+    assert status_response.json()["scheduler_enabled"] is True
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]["code"] == "scheduler_error"
+    assert response.json()["error"]["message"] == "scheduler control failed"
+    assert "/tmp/private" not in response.text
+
+
+def test_run_once_state_record_failure_returns_uniform_internal_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.api.routes.service as service_routes
+
+    class FailingSchedulerStateRepository:
+        def __init__(self, connection) -> None:
+            pass
+
+        def get_or_create(self, **kwargs):
+            return None
+
+        def record_result(self, **kwargs):
+            raise sqlite3.OperationalError("database is locked: /tmp/private/api.db")
+
+    monkeypatch.setattr(
+        service_routes,
+        "SchedulerStateRepository",
+        FailingSchedulerStateRepository,
+    )
+    client, headers = authenticated_client(tmp_path, raise_server_exceptions=False)
+
+    response = client.post("/api/v1/service/run-once", headers=headers)
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]["code"] == "internal_error"
+    assert response.json()["error"]["message"] == "service state storage failed"
+    assert "/tmp/private" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("raw", "forbidden"),
+    [
+        ("token=abc123", ["abc123"]),
+        ("password: hunter2", ["hunter2"]),
+        ("secret open-sesame", ["open-sesame"]),
+        ("api_key=key-123", ["key-123"]),
+        ("cookie: session-123", ["session-123"]),
+        ("Authorization: Bearer bearer-token-123", ["bearer-token-123"]),
+        ("request failed ?token=query-token&x=1", ["query-token"]),
+        ("request failed &api_key=query-key&x=1", ["query-key"]),
+        ("https://user:pass@example.com/path", ["user:pass"]),
+        ("failed at /tmp/private/vendor.py", ["/tmp/private/vendor.py"]),
+    ],
+)
+def test_safe_error_summary_redacts_sensitive_values(raw, forbidden) -> None:
+    from quantitative_trading.api.routes.service import _safe_error_summary
+
+    summary = _safe_error_summary(RuntimeError(raw))
+
+    assert len(summary) <= 300
+    for value in forbidden:
+        assert value not in summary

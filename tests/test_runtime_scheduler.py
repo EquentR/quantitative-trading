@@ -101,12 +101,14 @@ def test_scheduler_state_rejects_naive_update_time(tmp_path) -> None:
 
 def test_scheduler_manager_start_and_stop_are_idempotent(tmp_path) -> None:
     calls: list[str] = []
+    created_schedulers = []
 
     class FakeScheduler:
         def __init__(self, *, timezone: str) -> None:
             self.timezone = timezone
             self.jobs = []
             self.running = False
+            created_schedulers.append(self)
 
         def add_job(self, func, **kwargs) -> None:
             self.jobs.append((func, kwargs))
@@ -126,9 +128,20 @@ def test_scheduler_manager_start_and_stop_are_idempotent(tmp_path) -> None:
 
     first = manager.start()
     second = manager.start()
+    scheduler = created_schedulers[0]
+    job_func, job_kwargs = scheduler.jobs[0]
+    job_func()
     manager.stop()
     manager.stop()
 
     assert first is True
     assert second is False
     assert manager.is_running is False
+    assert calls == ["intraday"]
+    assert job_kwargs == {
+        "trigger": "interval",
+        "seconds": 7,
+        "id": "account_snapshot_intraday",
+        "max_instances": 1,
+        "replace_existing": True,
+    }
