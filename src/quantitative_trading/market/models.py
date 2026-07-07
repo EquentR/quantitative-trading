@@ -49,8 +49,17 @@ class QuoteSnapshot(BaseModel):
         elif self.status is QuoteStatus.PARTIAL:
             if self.current_price is None:
                 raise ValueError("partial quote requires current_price")
+            if self.data_time is None:
+                raise ValueError("partial quote requires data_time")
             if not self.warning:
                 raise ValueError("partial quote requires warning")
-        elif self.status in {QuoteStatus.FAILED, QuoteStatus.STALE} and not self.warning:
-            raise ValueError(f"{self.status.value} quote requires warning")
+        elif self.status is QuoteStatus.STALE:
+            if self.current_price is None:
+                raise ValueError("stale quote requires current_price")
+            if self.data_time is None:
+                raise ValueError("stale quote requires data_time")
+            if not self.warning:
+                raise ValueError("stale quote requires warning")
+        elif self.status is QuoteStatus.FAILED and not self.warning:
+            raise ValueError("failed quote requires warning")
         return self

@@ -115,13 +115,37 @@ def test_ok_quote_requires_price_and_data_time(missing_field: str) -> None:
         QuoteSnapshot.model_validate(payload)
 
 
-@pytest.mark.parametrize("overrides", [{"current_price": None}, {"warning": ""}])
-def test_partial_quote_requires_price_and_warning(overrides: dict[str, object]) -> None:
+@pytest.mark.parametrize("overrides", [{"current_price": None}, {"data_time": None}, {"warning": ""}])
+def test_partial_quote_requires_price_data_time_and_warning(overrides: dict[str, object]) -> None:
     payload = valid_quote_payload(status="partial", warning="missing name")
     payload.update(overrides)
 
     with pytest.raises(ValidationError):
         QuoteSnapshot.model_validate(payload)
+
+
+@pytest.mark.parametrize("overrides", [{"current_price": None}, {"data_time": None}, {"warning": ""}])
+def test_stale_quote_requires_price_data_time_and_warning(overrides: dict[str, object]) -> None:
+    payload = valid_quote_payload(status="stale", warning="quote is stale")
+    payload.update(overrides)
+
+    with pytest.raises(ValidationError):
+        QuoteSnapshot.model_validate(payload)
+
+
+def test_stale_quote_accepts_old_price_data_time_and_warning() -> None:
+    quote = QuoteSnapshot.model_validate(
+        valid_quote_payload(
+            status="stale",
+            warning="quote is stale",
+            data_time=datetime(2026, 7, 6, 7, 0, tzinfo=UTC),
+            fetched_at=datetime(2026, 7, 7, 2, 30, tzinfo=UTC),
+        )
+    )
+
+    assert quote.status is QuoteStatus.STALE
+    assert quote.current_price == 10.5
+    assert quote.data_time == datetime(2026, 7, 6, 7, 0, tzinfo=UTC)
 
 
 @pytest.mark.parametrize("status", [QuoteStatus.FAILED, QuoteStatus.STALE])
@@ -157,7 +181,7 @@ def test_quote_snapshot_allows_missing_price_for_failed_quote() -> None:
 )
 def test_quote_statuses_serialize_to_contract_values(status: QuoteStatus) -> None:
     quote_kwargs: dict[str, object] = {}
-    if status is QuoteStatus.PARTIAL:
+    if status in {QuoteStatus.PARTIAL, QuoteStatus.STALE}:
         quote_kwargs = {
             "current_price": 10.5,
             "data_time": datetime(2026, 7, 7, 2, 30, tzinfo=UTC),
