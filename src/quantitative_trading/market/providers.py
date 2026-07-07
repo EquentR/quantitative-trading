@@ -6,6 +6,7 @@ from math import isfinite
 from typing import Any, Protocol
 
 from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
+from quantitative_trading.sanitization import safe_error_summary
 
 
 class MarketDataProvider(Protocol):
@@ -69,7 +70,7 @@ class AkShareMarketProvider:
                 symbol: self._failed_quote(
                     symbol=symbol,
                     fetched_at=fetched_at,
-                    warning=f"akshare quote fetch failed: {exc}",
+                    warning=f"akshare quote fetch failed: {safe_error_summary(exc)}",
                 )
                 for symbol in symbols
             }
@@ -92,7 +93,7 @@ class AkShareMarketProvider:
             return self._failed_quote(
                 symbol=symbol,
                 fetched_at=fetched_at,
-                warning=f"akshare quote mapping failed: {exc}",
+                warning=f"akshare quote mapping failed: {safe_error_summary(exc)}",
             )
 
         try:
@@ -102,7 +103,7 @@ class AkShareMarketProvider:
             return self._failed_quote(
                 symbol=symbol,
                 fetched_at=fetched_at,
-                warning=f"akshare quote mapping failed: {exc}",
+                warning=f"akshare quote mapping failed: {safe_error_summary(exc)}",
             )
 
         warnings: list[str] = []
@@ -110,13 +111,15 @@ class AkShareMarketProvider:
         try:
             name = _required_text(row, AKSHARE_NAME_FIELD)
         except Exception as exc:
-            warnings.append(f"{AKSHARE_NAME_FIELD} missing or unavailable: {exc}")
+            warnings.append(
+                f"{AKSHARE_NAME_FIELD} missing or unavailable: {safe_error_summary(exc)}"
+            )
 
         change_pct: float | None = None
         try:
             change_pct = _required_float(row, AKSHARE_CHANGE_PCT_FIELD, positive=False)
         except Exception as exc:
-            warnings.append(f"{AKSHARE_CHANGE_PCT_FIELD} unavailable: {exc}")
+            warnings.append(f"{AKSHARE_CHANGE_PCT_FIELD} unavailable: {safe_error_summary(exc)}")
 
         return QuoteSnapshot(
             symbol=symbol,

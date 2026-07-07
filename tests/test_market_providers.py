@@ -112,6 +112,15 @@ class FailingAkShare:
         raise RuntimeError("service unavailable")
 
 
+class SensitiveFailingAkShare:
+    @staticmethod
+    def stock_zh_a_spot_em():
+        raise RuntimeError(
+            "service unavailable token=supersecret Authorization: Bearer abc "
+            "at /tmp/private.db"
+        )
+
+
 def test_akshare_provider_wraps_fetch_failure_for_all_requested_symbols() -> None:
     fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
     provider = AkShareMarketProvider(akshare_module=FailingAkShare, now=lambda: fetched_at)
@@ -125,6 +134,23 @@ def test_akshare_provider_wraps_fetch_failure_for_all_requested_symbols() -> Non
         assert quote.fetched_at == fetched_at
         assert "akshare quote fetch failed" in quote.warning
         assert "service unavailable" in quote.warning
+
+
+def test_akshare_provider_sanitizes_fetch_failure_warning() -> None:
+    fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
+    provider = AkShareMarketProvider(
+        akshare_module=SensitiveFailingAkShare,
+        now=lambda: fetched_at,
+    )
+
+    quote = provider.get_quotes(["600000"])["600000"]
+
+    assert quote.status is QuoteStatus.FAILED
+    assert "akshare quote fetch failed" in quote.warning
+    assert "service unavailable" in quote.warning
+    assert "supersecret" not in quote.warning
+    assert "Bearer abc" not in quote.warning
+    assert "/tmp/private.db" not in quote.warning
 
 
 class EmptyInputAkShare:
