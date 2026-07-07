@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -176,6 +177,127 @@ def test_service_check_reads_existing_ledger_without_writing(tmp_path) -> None:
     assert result.exit_code == 0
     assert "服务检查通过" in result.output
     assert "当前持仓数量: 1" in result.output
+
+
+def test_cash_init_show_and_transfer_commands(tmp_path) -> None:
+    init_result = run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
+    show_result = run_cli(tmp_path, "cash", "show")
+    transfer_result = run_cli(
+        tmp_path,
+        "cash",
+        "transfer-in",
+        "--amount",
+        "10000",
+        "--note",
+        "bank transfer in",
+    )
+    final_show_result = run_cli(tmp_path, "cash", "show")
+
+    assert init_result.exit_code == 0
+    assert "cash_balance=50000.00" in init_result.output
+    assert "net_principal=50000.00" in init_result.output
+    assert show_result.exit_code == 0
+    assert "cash_balance=50000.00" in show_result.output
+    assert "net_principal=50000.00" in show_result.output
+    assert transfer_result.exit_code == 0
+    assert "transfer_in=10000.00" in transfer_result.output
+    assert "cash_balance=60000.00" in final_show_result.output
+
+
+def test_cash_show_json_outputs_account_model(tmp_path) -> None:
+    run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
+
+    result = run_cli(tmp_path, "cash", "show", "--json")
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["cash_balance"] == 50000
+    assert payload["total_transfer_in"] == 50000
+    assert payload["total_transfer_out"] == 0
+    assert payload["net_principal"] == 50000
+
+
+def test_cash_show_reports_not_initialized(tmp_path) -> None:
+    result = run_cli(tmp_path, "cash", "show")
+
+    assert result.exit_code == 0
+    assert "cash account not initialized" in result.output
+
+
+def test_cash_transfer_out_rejects_excess_cash(tmp_path) -> None:
+    run_cli(tmp_path, "cash", "init", "--cash", "1000", "--note", "initial principal")
+
+    result = run_cli(
+        tmp_path,
+        "cash",
+        "transfer-out",
+        "--amount",
+        "1001",
+        "--note",
+        "too much cash out",
+    )
+
+    assert result.exit_code != 0
+    assert "cannot exceed cash balance" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cash_adjust_changes_cash_without_changing_net_principal(tmp_path) -> None:
+    run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
+
+    adjust_result = run_cli(
+        tmp_path,
+        "cash",
+        "adjust",
+        "--cash",
+        "48000",
+        "--note",
+        "manual broker correction",
+    )
+    show_result = run_cli(tmp_path, "cash", "show", "--json")
+
+    assert adjust_result.exit_code == 0
+    assert "cash_balance=48000.00" in adjust_result.output
+    payload = json.loads(show_result.output)
+    assert payload["cash_balance"] == 48000
+    assert payload["net_principal"] == 50000
+
+
+def test_cash_transactions_lists_recent_cash_events(tmp_path) -> None:
+    run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
+    run_cli(
+        tmp_path,
+        "cash",
+        "transfer-in",
+        "--amount",
+        "10000",
+        "--note",
+        "bank transfer in",
+    )
+
+    result = run_cli(tmp_path, "cash", "transactions", "--limit", "5")
+
+    assert result.exit_code == 0
+    assert "initial_deposit" in result.output
+    assert "transfer_in" in result.output
+    assert "50000.00" in result.output
+    assert "60000.00" in result.output
+
+
+def test_account_snapshot_reports_cash_not_initialized(tmp_path) -> None:
+    result = run_cli(tmp_path, "account", "snapshot")
+
+    assert result.exit_code == 0
+    assert "cash_not_initialized" in result.output
+
+
+def test_account_snapshot_json_outputs_status(tmp_path) -> None:
+    result = run_cli(tmp_path, "account", "snapshot", "--json")
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "cash_not_initialized"
+    assert payload["warnings"] == ["cash account not initialized"]
 
 
 def test_services_closes_connection_when_migrate_fails(monkeypatch) -> None:

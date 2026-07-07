@@ -11,6 +11,9 @@ from typing import Annotated, Any
 import typer
 from pydantic import ValidationError
 
+from quantitative_trading.account.service import AccountService
+from quantitative_trading.cash.repository import CashAccountNotInitializedError, CashAccountRepository
+from quantitative_trading.cash.service import CashService, CashTransferError, ReadOnlyCashService
 from quantitative_trading.config import load_settings
 from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import (
@@ -19,18 +22,29 @@ from quantitative_trading.ledger.repository import (
     PositionRepository,
 )
 from quantitative_trading.ledger.service import LedgerService, ReadOnlyLedgerService
+from quantitative_trading.market.providers import DisabledMarketProvider
 from quantitative_trading.storage.sqlite import connect, migrate
 
 
 app = typer.Typer()
 ledger_app = typer.Typer()
 service_app = typer.Typer()
+cash_app = typer.Typer()
+account_app = typer.Typer()
 
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(service_app, name="service")
+app.add_typer(cash_app, name="cash")
+app.add_typer(account_app, name="account")
 
 
-def _services() -> tuple[Any, LedgerService, ReadOnlyLedgerService]:
+def _services() -> tuple[
+    Any,
+    LedgerService,
+    ReadOnlyLedgerService,
+    CashService,
+    ReadOnlyCashService,
+]:
     settings = load_settings()
     connection_cm = connect(settings)
     entered = False
@@ -39,7 +53,14 @@ def _services() -> tuple[Any, LedgerService, ReadOnlyLedgerService]:
         entered = True
         migrate(connection)
         repository = PositionRepository(connection)
-        return connection_cm, LedgerService(repository), ReadOnlyLedgerService(repository)
+        cash_repository = CashAccountRepository(connection)
+        return (
+            connection_cm,
+            LedgerService(repository),
+            ReadOnlyLedgerService(repository),
+            CashService(cash_repository),
+            ReadOnlyCashService(cash_repository),
+        )
     except BaseException:
         if entered:
             connection_cm.__exit__(*sys.exc_info())
@@ -101,6 +122,16 @@ def _position_input(
         raise typer.BadParameter(str(exc)) from exc
 
 
+def _format_money(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.2f}"
+
+
+def _cash_cli_error(exc: Exception) -> typer.BadParameter:
+    return typer.BadParameter(str(exc))
+
+
 @ledger_app.command("add")
 def add_position(
     symbol: Annotated[str, typer.Option("--symbol")],
@@ -111,7 +142,7 @@ def add_position(
     opened_at: Annotated[str, typer.Option("--opened-at")],
     note: Annotated[str, typer.Option("--note")] = "",
 ) -> None:
-    connection_cm, service, _ = _services()
+    connection_cm, service, _, _, _ = _services()
     try:
         position = _position_input(
             symbol=symbol,
@@ -140,7 +171,7 @@ def update_position(
     opened_at: Annotated[str, typer.Option("--opened-at")],
     note: Annotated[str, typer.Option("--note")] = "",
 ) -> None:
-    connection_cm, service, _ = _services()
+    connection_cm, service, _, _, _ = _services()
     try:
         position = _position_input(
             symbol=symbol,
@@ -161,7 +192,7 @@ def update_position(
 
 @ledger_app.command("remove")
 def remove_position(symbol: Annotated[str, typer.Argument()]) -> None:
-    connection_cm, service, _ = _services()
+    connection_cm, service, _, _, _ = _services()
     try:
         service.remove_position(symbol)
         typer.echo(f"已删除持仓 {symbol}")
@@ -173,7 +204,7 @@ def remove_position(symbol: Annotated[str, typer.Argument()]) -> None:
 
 @ledger_app.command("list")
 def list_positions() -> None:
-    connection_cm, _, read_only = _services()
+    connection_cm, _, read_only, _, _ = _services()
     try:
         positions = read_only.list_positions()
         if not positions:
@@ -196,7 +227,7 @@ def list_positions() -> None:
 
 @ledger_app.command("import")
 def import_positions(path: Annotated[Path, typer.Argument()]) -> None:
-    connection_cm, service, _ = _services()
+    connection_cm, service, _, _, _ = _services()
     try:
         try:
             positions = service.import_csv(path)
@@ -209,7 +240,7 @@ def import_positions(path: Annotated[Path, typer.Argument()]) -> None:
 
 @ledger_app.command("export")
 def export_positions() -> None:
-    connection_cm, _, read_only = _services()
+    connection_cm, _, read_only, _, _ = _services()
     try:
         writer = csv.writer(sys.stdout, lineterminator="\n")
         writer.writerow(
@@ -235,6 +266,145 @@ def export_positions() -> None:
                     position.note,
                 ]
             )
+    finally:
+        connection_cm.__exit__(None, None, None)
+
+
+@cash_app.command("init")
+def init_cash(
+    cash: Annotated[float, typer.Option("--cash")],
+    note: Annotated[str, typer.Option("--note")] = "initial principal",
+) -> None:
+    connection_cm, _, _, cash_service, _ = _services()
+    try:
+        try:
+            account = cash_service.initialize(cash, note=note)
+        except CashTransferError as exc:
+            raise _cash_cli_error(exc) from exc
+        typer.echo(
+            "cash account initialized "
+            f"cash_balance={account.cash_balance:.2f} "
+            f"net_principal={account.net_principal:.2f}"
+        )
+    finally:
+        connection_cm.__exit__(None, None, None)
+
+
+@cash_app.command("show")
+def show_cash(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    connection_cm, _, _, _, cash_read_only = _services()
+    try:
+        account = cash_read_only.get_account()
+        if account is None:
+            typer.echo("cash account not initialized")
+            return
+        if json_output:
+            typer.echo(account.model_dump_json())
+            return
+        typer.echo(
+            f"cash_balance={account.cash_balance:.2f} "
+            f"total_transfer_in={account.total_transfer_in:.2f} "
+            f"total_transfer_out={account.total_transfer_out:.2f} "
+            f"net_principal={account.net_principal:.2f} "
+            f"updated_at={account.updated_at.isoformat()}"
+        )
+    finally:
+        connection_cm.__exit__(None, None, None)
+
+
+@cash_app.command("transfer-in")
+def transfer_in(
+    amount: Annotated[float, typer.Option("--amount")],
+    note: Annotated[str, typer.Option("--note")] = "",
+) -> None:
+    connection_cm, _, _, cash_service, _ = _services()
+    try:
+        try:
+            account = cash_service.transfer_in(amount, note=note)
+        except (CashAccountNotInitializedError, CashTransferError) as exc:
+            raise _cash_cli_error(exc) from exc
+        typer.echo(f"transfer_in={amount:.2f} cash_balance={account.cash_balance:.2f}")
+    finally:
+        connection_cm.__exit__(None, None, None)
+
+
+@cash_app.command("transfer-out")
+def transfer_out(
+    amount: Annotated[float, typer.Option("--amount")],
+    note: Annotated[str, typer.Option("--note")] = "",
+) -> None:
+    connection_cm, _, _, cash_service, _ = _services()
+    try:
+        try:
+            account = cash_service.transfer_out(amount, note=note)
+        except (CashAccountNotInitializedError, CashTransferError) as exc:
+            raise _cash_cli_error(exc) from exc
+        typer.echo(f"transfer_out={amount:.2f} cash_balance={account.cash_balance:.2f}")
+    finally:
+        connection_cm.__exit__(None, None, None)
+
+
+@cash_app.command("adjust")
+def adjust_cash(
+    cash: Annotated[float, typer.Option("--cash")],
+    note: Annotated[str, typer.Option("--note")],
+) -> None:
+    connection_cm, _, _, cash_service, _ = _services()
+    try:
+        try:
+            account = cash_service.adjust_cash(cash, note=note)
+        except (CashAccountNotInitializedError, CashTransferError) as exc:
+            raise _cash_cli_error(exc) from exc
+        typer.echo(
+            f"cash_adjustment cash_balance={account.cash_balance:.2f} "
+            f"net_principal={account.net_principal:.2f}"
+        )
+    finally:
+        connection_cm.__exit__(None, None, None)
+
+
+@cash_app.command("transactions")
+def list_cash_transactions(
+    limit: Annotated[int, typer.Option("--limit", min=1)] = 20,
+) -> None:
+    connection_cm, _, _, _, cash_read_only = _services()
+    try:
+        transactions = cash_read_only.list_transactions(limit=limit)
+        if not transactions:
+            typer.echo("no cash transactions")
+            return
+        for transaction in transactions:
+            typer.echo(
+                f"{transaction.type.value} "
+                f"amount={transaction.amount:.2f} "
+                f"cash_after={transaction.cash_after:.2f} "
+                f"occurred_at={transaction.occurred_at.isoformat()} "
+                f"note={transaction.note}"
+            )
+    finally:
+        connection_cm.__exit__(None, None, None)
+
+
+@account_app.command("snapshot")
+def account_snapshot(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    connection_cm, _, ledger_read_only, _, cash_read_only = _services()
+    try:
+        account_service = AccountService(
+            ledger=ledger_read_only,
+            cash=cash_read_only,
+            market=DisabledMarketProvider(),
+        )
+        snapshot = account_service.create_snapshot()
+        if json_output:
+            typer.echo(snapshot.model_dump_json())
+            return
+        typer.echo(
+            f"status={snapshot.status.value} "
+            f"cash_balance={_format_money(snapshot.cash_balance)} "
+            f"total_assets={_format_money(snapshot.total_assets)}"
+        )
+        for warning in snapshot.warnings:
+            typer.echo(f"warning={warning}")
     finally:
         connection_cm.__exit__(None, None, None)
 
