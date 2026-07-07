@@ -1,7 +1,14 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from quantitative_trading.api.auth import (
+    AuthAlreadyConfiguredError,
+    AuthService,
+    AuthSetupRequiredError,
+    InvalidCredentialsError,
+    InvalidTokenError,
+)
 from quantitative_trading.config import Settings
 from quantitative_trading.storage.api_auth import ApiAuthRepository
 from quantitative_trading.storage.sqlite import connect, migrate
@@ -84,3 +91,122 @@ def test_auth_repository_rejects_naive_update_time(tmp_path) -> None:
 
         with pytest.raises(ValueError, match="timezone-aware"):
             repository.save_password_hash("hash-value", now=datetime(2026, 7, 7, 2, 0))
+
+
+def test_auth_service_reports_setup_required_without_password(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(ApiAuthRepository(connection), token_ttl_seconds=3600)
+
+        assert service.status() == "setup_required"
+
+
+def test_auth_service_setup_hashes_password_and_login_returns_token(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(ApiAuthRepository(connection), token_ttl_seconds=3600)
+
+        service.setup_password("local-password", now=NOW)
+        login = service.login("local-password", now=NOW)
+        claims = service.verify_token(login.access_token, now=NOW)
+
+    assert login.token_type == "bearer"
+    assert login.expires_at == NOW + timedelta(seconds=3600)
+    assert claims.user == "local"
+
+
+def test_auth_service_rejects_login_when_password_is_not_configured(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(ApiAuthRepository(connection), token_ttl_seconds=3600)
+
+        with pytest.raises(AuthSetupRequiredError):
+            service.login("local-password", now=NOW)
+
+
+def test_auth_service_rejects_expired_token(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(ApiAuthRepository(connection), token_ttl_seconds=60)
+        service.setup_password("local-password", now=NOW)
+        login = service.login("local-password", now=NOW)
+
+        with pytest.raises(InvalidTokenError):
+            service.verify_token(login.access_token, now=NOW + timedelta(seconds=61))
+
+
+def test_auth_service_setup_stores_password_hash_not_plaintext(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = ApiAuthRepository(connection)
+        service = AuthService(repository, token_ttl_seconds=3600)
+
+        service.setup_password("local-password", now=NOW)
+        state = repository.get()
+
+    assert state.password_hash is not None
+    assert state.password_hash != "local-password"
+    assert state.password_hash.startswith("pbkdf2_sha256$")
+
+
+def test_auth_service_rejects_second_setup(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(ApiAuthRepository(connection), token_ttl_seconds=3600)
+        service.setup_password("local-password", now=NOW)
+
+        with pytest.raises(AuthAlreadyConfiguredError):
+            service.setup_password("other-password", now=NOW)
+
+
+def test_auth_service_rejects_invalid_credentials(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(ApiAuthRepository(connection), token_ttl_seconds=3600)
+        service.setup_password("local-password", now=NOW)
+
+        with pytest.raises(InvalidCredentialsError):
+            service.login("wrong-password", now=NOW)
+
+
+def test_auth_service_rejects_malformed_stored_password_hash(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = ApiAuthRepository(connection)
+        repository.save_password_hash("not-a-valid-hash", now=NOW)
+        service = AuthService(repository, token_ttl_seconds=3600)
+
+        with pytest.raises(InvalidCredentialsError):
+            service.login("local-password", now=NOW)
+
+
+def test_auth_service_rejects_malformed_token(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(ApiAuthRepository(connection), token_ttl_seconds=3600)
+        service.setup_password("local-password", now=NOW)
+
+        with pytest.raises(InvalidTokenError):
+            service.verify_token("not-a-token", now=NOW)
+
+
+def test_auth_service_rejects_non_ascii_malformed_token(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(ApiAuthRepository(connection), token_ttl_seconds=3600)
+        service.setup_password("local-password", now=NOW)
+        login = service.login("local-password", now=NOW)
+        payload_part = login.access_token.split(".", 1)[0]
+
+        with pytest.raises(InvalidTokenError):
+            service.verify_token(f"{payload_part}.令牌", now=NOW)
