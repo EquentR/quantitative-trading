@@ -34,3 +34,13 @@ def test_bash_backend_script_bootstraps_environment_and_runs_service_check() -> 
     assert 'python" -m pip install -e ".[dev]"' in script
     assert "QT_DATABASE_PATH" in script
     assert 'exec "$VENV_DIR/bin/qt" service check' in script
+
+
+def test_env_example_contains_api_placeholders_only() -> None:
+    text = Path(".env.example").read_text(encoding="utf-8")
+
+    assert "QT_API_HOST=127.0.0.1" in text
+    assert "QT_API_ACCESS_PASSWORD=" in text
+    assert "QT_API_TOKEN_SECRET=" in text
+    assert "QT_SERVICE_RUN_ON_START_WHEN_SCHEDULER_ENABLED=true" in text
+    assert "local-password" not in text

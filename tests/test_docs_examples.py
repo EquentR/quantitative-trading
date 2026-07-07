@@ -47,3 +47,20 @@ def test_docs_document_cash_and_account_service_scope() -> None:
     assert "QT_LOG_DIR=data/logs" in env_example
     assert "QT_MARKET_PROVIDER=akshare" in env_example
     assert "QT_TIMEZONE=Asia/Shanghai" in env_example
+
+
+def test_api_docs_document_auth_and_error_contract() -> None:
+    text = Path("docs/api.md").read_text(encoding="utf-8")
+
+    assert "POST /api/v1/auth/setup-password" in text
+    assert "POST /api/v1/auth/login" in text
+    assert '"error"' in text
+    assert "auth_setup_required" in text
+    assert "Authorization: Bearer" in text
+
+
+def test_project_docs_mention_http_api_without_frontend_scope() -> None:
+    text = Path("docs/project-spec.md").read_text(encoding="utf-8")
+
+    assert "HTTP API" in text
+    assert "不实现前端" in text or "不涉及前端" in text
