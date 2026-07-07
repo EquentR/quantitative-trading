@@ -203,6 +203,103 @@ def test_scheduler_stop_failure_returns_uniform_error_without_disabling(tmp_path
     assert "/tmp/private" not in response.text
 
 
+def test_scheduler_start_persistence_failure_rolls_back_live_start(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.api.routes.service as service_routes
+
+    class RecordingScheduler:
+        def __init__(self) -> None:
+            self.starts = 0
+            self.stops = 0
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.starts += 1
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.stops += 1
+            self.is_running = False
+            return True
+
+    def fail_set_enabled(container, *, enabled: bool) -> None:
+        raise sqlite3.OperationalError("database is locked: /tmp/private/api.db")
+
+    scheduler = RecordingScheduler()
+    monkeypatch.setattr(service_routes, "_set_scheduler_enabled", fail_set_enabled)
+    client, headers = authenticated_client(
+        tmp_path,
+        scheduler=scheduler,
+        raise_server_exceptions=False,
+    )
+
+    response = client.post("/api/v1/service/scheduler/start", headers=headers)
+    status_response = client.get("/api/v1/service/status", headers=headers)
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]["code"] == "internal_error"
+    assert response.json()["error"]["message"] == "service state storage failed"
+    assert "/tmp/private" not in response.text
+    assert scheduler.starts == 1
+    assert scheduler.stops == 1
+    assert scheduler.is_running is False
+    assert status_response.json()["scheduler_enabled"] is False
+
+
+def test_scheduler_stop_persistence_failure_restores_live_scheduler(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.api.routes.service as service_routes
+
+    class RecordingScheduler:
+        def __init__(self) -> None:
+            self.starts = 0
+            self.stops = 0
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.starts += 1
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.stops += 1
+            self.is_running = False
+            return True
+
+    def fail_set_enabled(container, *, enabled: bool) -> None:
+        raise sqlite3.OperationalError("database is locked: /tmp/private/api.db")
+
+    scheduler = RecordingScheduler()
+    client, headers = authenticated_client(
+        tmp_path,
+        scheduler=scheduler,
+        raise_server_exceptions=False,
+    )
+    client.post("/api/v1/service/scheduler/start", headers=headers)
+    monkeypatch.setattr(service_routes, "_set_scheduler_enabled", fail_set_enabled)
+
+    response = client.post("/api/v1/service/scheduler/stop", headers=headers)
+    status_response = client.get("/api/v1/service/status", headers=headers)
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]["code"] == "internal_error"
+    assert response.json()["error"]["message"] == "service state storage failed"
+    assert "/tmp/private" not in response.text
+    assert scheduler.starts == 2
+    assert scheduler.stops == 1
+    assert scheduler.is_running is True
+    assert status_response.json()["scheduler_enabled"] is True
+
+
 def test_run_once_state_record_failure_returns_uniform_internal_error(
     tmp_path,
     monkeypatch,
@@ -246,6 +343,13 @@ def test_run_once_state_record_failure_returns_uniform_internal_error(
         ("Authorization: Bearer bearer-token-123", ["bearer-token-123"]),
         ("request failed ?token=query-token&x=1", ["query-token"]),
         ("request failed &api_key=query-key&x=1", ["query-key"]),
+        ("access_token=access-123", ["access-123"]),
+        ("refresh_token: refresh-123", ["refresh-123"]),
+        ("token_secret secret-123", ["secret-123"]),
+        ("password_hash=hash-123", ["hash-123"]),
+        ("request failed ?access_token=query-access&x=1", ["query-access"]),
+        ("request failed &refresh_token=query-refresh&x=1", ["query-refresh"]),
+        ("api-key=hyphen-key-123", ["hyphen-key-123"]),
         ("https://user:pass@example.com/path", ["user:pass"]),
         ("failed at /tmp/private/vendor.py", ["/tmp/private/vendor.py"]),
     ],

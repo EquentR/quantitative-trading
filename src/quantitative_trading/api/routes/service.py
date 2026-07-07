@@ -20,6 +20,10 @@ from quantitative_trading.storage.scheduler_state import SchedulerStateRepositor
 
 
 router = APIRouter(prefix="/service", tags=["service"])
+_SENSITIVE_ERROR_KEY = (
+    r"(?:[A-Za-z0-9]+[_-])*(?:token|password|secret|cookie|api[_-]?key|apikey)"
+    r"(?:[_-][A-Za-z0-9]+)*"
+)
 
 
 @router.get("/status")
@@ -29,15 +33,25 @@ def status(container: ApiContainer = Depends(get_container)) -> dict[str, object
 
 @router.post("/scheduler/start", dependencies=[Depends(require_token)])
 def start_scheduler(container: ApiContainer = Depends(get_container)) -> dict[str, object]:
-    _control_scheduler(container.scheduler, action="start")
-    _set_scheduler_enabled(container, enabled=True)
+    changed_live_state = _control_scheduler(container.scheduler, action="start")
+    try:
+        _set_scheduler_enabled(container, enabled=True)
+    except (ApiError, sqlite3.Error, ValidationError) as exc:
+        if changed_live_state:
+            _compensate_scheduler(container.scheduler, action="stop")
+        raise _service_state_failed() from exc
     return _status_payload(container)
 
 
 @router.post("/scheduler/stop", dependencies=[Depends(require_token)])
 def stop_scheduler(container: ApiContainer = Depends(get_container)) -> dict[str, object]:
-    _control_scheduler(container.scheduler, action="stop")
-    _set_scheduler_enabled(container, enabled=False)
+    changed_live_state = _control_scheduler(container.scheduler, action="stop")
+    try:
+        _set_scheduler_enabled(container, enabled=False)
+    except (ApiError, sqlite3.Error, ValidationError) as exc:
+        if changed_live_state:
+            _compensate_scheduler(container.scheduler, action="start")
+        raise _service_state_failed() from exc
     return _status_payload(container)
 
 
@@ -123,13 +137,26 @@ def _set_scheduler_enabled(container: ApiContainer, *, enabled: bool) -> None:
         raise _service_state_failed() from exc
 
 
-def _control_scheduler(scheduler: object | None, *, action: str) -> None:
+def _control_scheduler(scheduler: object | None, *, action: str) -> bool:
+    if scheduler is None:
+        return False
+    try:
+        result = getattr(scheduler, action)()
+    except Exception as exc:
+        raise _scheduler_control_failed() from exc
+    if isinstance(result, bool):
+        return result
+    return True
+
+
+def _compensate_scheduler(scheduler: object | None, *, action: str) -> None:
     if scheduler is None:
         return
     try:
         getattr(scheduler, action)()
-    except Exception as exc:
-        raise _scheduler_control_failed() from exc
+    except Exception:
+        # 回滚只用于恢复进程内调度状态；失败时仍返回持久化错误，避免泄露底层异常。
+        return
 
 
 def _scheduler_running(scheduler: object | None) -> bool:
@@ -163,22 +190,22 @@ def _safe_error_summary(exc: Exception) -> str:
         summary,
     )
     summary = re.sub(
-        r"(?i)([?&](?:token|password|secret|cookie|api[_-]?key)=)[^&#\s]+",
+        rf"(?i)([?&](?:{_SENSITIVE_ERROR_KEY})=)[^&#\s]+",
         r"\1[redacted]",
         summary,
     )
     summary = re.sub(
-        r"(?i)\b(token|password|secret|cookie|api[_-]?key)\b\s*=\s*[^\s,;&]+",
+        rf"(?i)\b({_SENSITIVE_ERROR_KEY})\b\s*=\s*[^\s,;&]+",
         r"\1=[redacted]",
         summary,
     )
     summary = re.sub(
-        r"(?i)\b(token|password|secret|cookie|api[_-]?key)\b\s*:\s*[^\s,;&]+",
+        rf"(?i)\b({_SENSITIVE_ERROR_KEY})\b\s*:\s*[^\s,;&]+",
         r"\1: [redacted]",
         summary,
     )
     summary = re.sub(
-        r"(?i)\b(token|password|secret|cookie|api[_-]?key)\b\s+(?!\[redacted\])[^\s,;&]+",
+        rf"(?i)\b({_SENSITIVE_ERROR_KEY})\b\s+(?!\[redacted\])[^\s,;&]+",
         r"\1 [redacted]",
         summary,
     )
