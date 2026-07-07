@@ -33,6 +33,7 @@ class SchedulerStateRepository:
         run_on_start: bool,
         now: datetime,
     ) -> SchedulerState:
+        _require_timezone_aware(now)
         row = self._fetch()
         if row is None:
             with self.connection:
@@ -67,12 +68,14 @@ class SchedulerStateRepository:
         run_on_start: bool,
         now: datetime,
     ) -> SchedulerState:
+        _require_timezone_aware(now)
         self.get_or_create(
             interval_seconds=interval_seconds,
             run_on_start=run_on_start,
             now=now,
         )
         # 启停调度只修改运行配置，保留最近一次执行结果用于 API 展示和恢复。
+        # interval/run_on_start 来自当前配置，和 enabled 一起持久化为下次启动的期望状态。
         with self.connection:
             self.connection.execute(
                 """
@@ -104,6 +107,9 @@ class SchedulerStateRepository:
         snapshot_id: int | None,
         now: datetime,
     ) -> SchedulerState:
+        _require_timezone_aware(started_at)
+        _require_timezone_aware(finished_at)
+        _require_timezone_aware(now)
         if self._fetch() is None:
             # 极端情况下先记录结果再初始化调度配置，使用项目默认轮询间隔兜底。
             self.get_or_create(
@@ -186,3 +192,9 @@ class SchedulerStateRepository:
     @staticmethod
     def _to_int(value: bool) -> int:
         return int(value)
+
+
+def _require_timezone_aware(value: datetime) -> None:
+    # 调度状态会直接暴露给 API，时间必须带时区以保证前端和日志可比较。
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("scheduler timestamps must be timezone-aware")

@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from quantitative_trading.config import Settings
 from quantitative_trading.storage.api_auth import ApiAuthRepository
 from quantitative_trading.storage.sqlite import connect, migrate
@@ -72,3 +74,13 @@ def test_auth_state_repr_masks_password_hash_and_token_secret(tmp_path) -> None:
     representation = repr(state)
     assert "hash-value" not in representation
     assert state.token_secret not in representation
+
+
+def test_auth_repository_rejects_naive_update_time(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = ApiAuthRepository(connection)
+
+        with pytest.raises(ValueError, match="timezone-aware"):
+            repository.save_password_hash("hash-value", now=datetime(2026, 7, 7, 2, 0))

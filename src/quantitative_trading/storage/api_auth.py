@@ -53,6 +53,7 @@ class ApiAuthRepository:
         return self._from_row(row)
 
     def save_password_hash(self, password_hash: str, *, now: datetime) -> ApiAuthState:
+        _require_timezone_aware(now)
         current = self.get()
         # 更新密码哈希时保留 token secret，避免让现有签名状态意外失效。
         with self.connection:
@@ -71,6 +72,7 @@ class ApiAuthRepository:
         )
 
     def save_token_secret(self, token_secret: str, *, now: datetime) -> ApiAuthState:
+        _require_timezone_aware(now)
         current = self.get()
         # 轮换 token secret 时保留密码哈希，认证配置状态不应被清空。
         with self.connection:
@@ -103,3 +105,9 @@ class ApiAuthRepository:
             token_secret=row["token_secret"],
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
+
+
+def _require_timezone_aware(value: datetime) -> None:
+    # 落库时间必须带时区，避免后续和 API 返回的 ISO 时间比较时出现 naive/aware 混用。
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("api auth timestamps must be timezone-aware")

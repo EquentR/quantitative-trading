@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from quantitative_trading.config import Settings
 from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
 from quantitative_trading.storage.sqlite import connect, migrate
@@ -79,3 +81,18 @@ def test_scheduler_state_record_result_creates_default_state_when_missing(tmp_pa
     assert state.run_on_start is False
     assert state.last_status == "failed"
     assert state.last_error == "snapshot failed"
+
+
+def test_scheduler_state_rejects_naive_update_time(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "scheduler.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = SchedulerStateRepository(connection)
+
+        with pytest.raises(ValueError, match="timezone-aware"):
+            repository.set_enabled(
+                True,
+                interval_seconds=180,
+                run_on_start=True,
+                now=datetime(2026, 7, 7, 2, 0),
+            )
