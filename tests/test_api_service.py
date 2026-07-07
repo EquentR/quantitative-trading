@@ -41,8 +41,75 @@ def test_service_status_reports_scheduler_state(tmp_path) -> None:
     assert payload["last_status"] is None
 
 
-def test_scheduler_start_and_stop_persist_state(tmp_path) -> None:
+def test_setup_required_public_status_returns_only_auth_status(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
+    client = TestClient(create_app(settings))
+
+    response = client.get("/api/v1/service/status")
+
+    assert response.status_code == 200
+    assert response.json() == {"auth_status": "setup_required"}
+
+
+def test_configured_public_status_hides_scheduler_and_last_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.api.routes.service as service_routes
+
+    def failing_snapshot(settings):
+        raise RuntimeError("provider failed with token=secret")
+
+    monkeypatch.setattr(
+        service_routes,
+        "create_and_save_account_snapshot",
+        failing_snapshot,
+        raising=False,
+    )
     client, headers = authenticated_client(tmp_path)
+    run_response = client.post("/api/v1/service/run-once", headers=headers)
+
+    response = client.get("/api/v1/service/status")
+
+    assert run_response.status_code == 200
+    assert run_response.json()["last_error"]
+    assert response.status_code == 200
+    assert response.json() == {"auth_status": "configured"}
+
+
+@pytest.mark.parametrize("authorization", ["Basic token", "Bearer", "Bearer not-a-token"])
+def test_status_rejects_invalid_authorization_header(
+    tmp_path,
+    authorization: str,
+) -> None:
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
+    client = TestClient(create_app(settings))
+    client.post("/api/v1/auth/setup-password", json={"password": "local-password"})
+
+    response = client.get(
+        "/api/v1/service/status",
+        headers={"Authorization": authorization},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+    assert "not-a-token" not in response.text
+
+
+def test_scheduler_start_and_stop_persist_state(tmp_path) -> None:
+    class FakeScheduler:
+        is_running = False
+        next_run_time = None
+
+        def start(self) -> bool:
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    client, headers = authenticated_client(tmp_path, scheduler=FakeScheduler())
 
     start_response = client.post("/api/v1/service/scheduler/start", headers=headers)
     started_status = client.get("/api/v1/service/status", headers=headers)
@@ -53,6 +120,31 @@ def test_scheduler_start_and_stop_persist_state(tmp_path) -> None:
     assert started_status.json()["scheduler_enabled"] is True
     assert stop_response.status_code == 200
     assert stop_response.json()["scheduler_enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("path", "field"),
+    [
+        ("/api/v1/service/scheduler/start", "scheduler_enabled"),
+        ("/api/v1/service/scheduler/stop", "scheduler_enabled"),
+    ],
+)
+def test_scheduler_control_without_live_scheduler_requires_auth_and_returns_error(
+    tmp_path,
+    path: str,
+    field: str,
+) -> None:
+    client, headers = authenticated_client(tmp_path, raise_server_exceptions=False)
+
+    unauthenticated_response = client.post(path)
+    response = client.post(path, headers=headers)
+    status_response = client.get("/api/v1/service/status", headers=headers)
+
+    assert unauthenticated_response.status_code == 401
+    assert unauthenticated_response.json()["error"]["code"] == "unauthorized"
+    assert response.status_code != 200
+    assert response.json()["error"]["code"] == "scheduler_error"
+    assert status_response.json()[field] is False
 
 
 def test_run_once_records_latest_result(tmp_path) -> None:

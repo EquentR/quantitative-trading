@@ -4,7 +4,7 @@ import re
 import sqlite3
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from pydantic import ValidationError
 
 from quantitative_trading.api.dependencies import (
@@ -13,6 +13,7 @@ from quantitative_trading.api.dependencies import (
     connection_scope,
     get_container,
     require_token,
+    verify_authorization_header,
 )
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.runtime.account_snapshot_job import create_and_save_account_snapshot
@@ -27,7 +28,13 @@ _SENSITIVE_ERROR_KEY = (
 
 
 @router.get("/status")
-def status(container: ApiContainer = Depends(get_container)) -> dict[str, object]:
+def status(
+    authorization: str | None = Header(default=None),
+    container: ApiContainer = Depends(get_container),
+) -> dict[str, object]:
+    if authorization is None:
+        return _public_status_payload(container)
+    verify_authorization_header(authorization, container)
     return _status_payload(container)
 
 
@@ -123,6 +130,16 @@ def _status_payload(container: ApiContainer) -> dict[str, object]:
     }
 
 
+def _public_status_payload(container: ApiContainer) -> dict[str, str]:
+    try:
+        with connection_scope(container.settings) as connection:
+            current_auth_status = auth_service(container.settings, connection).status()
+    except (sqlite3.Error, ValidationError) as exc:
+        raise _service_state_failed() from exc
+
+    return {"auth_status": current_auth_status}
+
+
 def _set_scheduler_enabled(container: ApiContainer, *, enabled: bool) -> None:
     now = datetime.now(UTC)
     try:
@@ -139,7 +156,7 @@ def _set_scheduler_enabled(container: ApiContainer, *, enabled: bool) -> None:
 
 def _control_scheduler(scheduler: object | None, *, action: str) -> bool:
     if scheduler is None:
-        return False
+        raise _scheduler_control_failed()
     try:
         result = getattr(scheduler, action)()
     except Exception as exc:

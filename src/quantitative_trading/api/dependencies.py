@@ -44,6 +44,13 @@ def require_token(
     authorization: str | None = Header(default=None),
     container: ApiContainer = Depends(get_container),
 ) -> TokenClaims:
+    return verify_authorization_header(authorization, container)
+
+
+def verify_authorization_header(
+    authorization: str | None,
+    container: ApiContainer,
+) -> TokenClaims:
     if authorization is None:
         raise ApiError(
             status_code=401,
