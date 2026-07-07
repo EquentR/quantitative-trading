@@ -56,3 +56,26 @@ def test_scheduler_state_persists_enabled_and_last_result(tmp_path) -> None:
     assert state.last_reason == "manual_api"
     assert state.last_error is None
     assert state.last_snapshot_id == 3
+
+
+def test_scheduler_state_record_result_creates_default_state_when_missing(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "scheduler.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = SchedulerStateRepository(connection)
+
+        state = repository.record_result(
+            started_at=NOW,
+            finished_at=NOW,
+            status="failed",
+            reason="manual_api",
+            error="snapshot failed",
+            snapshot_id=None,
+            now=NOW,
+        )
+
+    assert state.enabled is False
+    assert state.interval_seconds == 180
+    assert state.run_on_start is False
+    assert state.last_status == "failed"
+    assert state.last_error == "snapshot failed"

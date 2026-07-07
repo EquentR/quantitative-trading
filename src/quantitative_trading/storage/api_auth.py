@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import secrets
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 
 @dataclass(frozen=True)
 class ApiAuthState:
-    password_hash: str | None
-    token_secret: str
+    # 只保存密码哈希；明文密码必须在调用方完成哈希后才能传入 repository。
+    password_hash: str | None = field(repr=False)
+    # token_secret 是本地签名密钥，repr 中必须隐藏，避免误写入日志。
+    token_secret: str = field(repr=False)
     updated_at: datetime
 
     @property
@@ -25,6 +27,7 @@ class ApiAuthRepository:
         row = self._fetch()
         if row is None:
             # 首次读取时生成本地 token secret，避免把固定密钥写入仓库或配置示例。
+            # 该密钥明文保存在本机 SQLite 中，部署时应依赖文件权限限制访问。
             token_secret = secrets.token_urlsafe(32)
             now = datetime.now(UTC)
             with self.connection:
