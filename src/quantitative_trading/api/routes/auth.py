@@ -9,6 +9,7 @@ from quantitative_trading.api.auth import (
     AuthAlreadyConfiguredError,
     AuthSetupRequiredError,
     InvalidCredentialsError,
+    TokenClaims,
 )
 from quantitative_trading.api.dependencies import (
     ApiContainer,
@@ -79,9 +80,10 @@ def login(
 
 @router.post("/logout")
 def logout() -> dict[str, str]:
+    # 首版 token 无服务端撤销表，logout 仅确认前端应丢弃本地 bearer token。
     return {"status": "ok"}
 
 
-@router.get("/me", dependencies=[Depends(require_token)])
-def me() -> dict[str, str]:
-    return {"user": "local"}
+@router.get("/me")
+def me(claims: TokenClaims = Depends(require_token)) -> dict[str, str]:
+    return {"user": claims.user}

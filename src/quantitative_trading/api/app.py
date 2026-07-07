@@ -10,6 +10,10 @@ from quantitative_trading.config import Settings
 
 
 def create_app(settings: Settings) -> FastAPI:
+    # 进程启动时完成一次幂等迁移，避免每个 API 请求都产生 schema 写事务。
+    with dependencies.connect(settings) as connection:
+        dependencies.migrate(connection)
+
     app = FastAPI(title="Quantitative Trading API")
     container = ApiContainer(settings=settings)
     app.dependency_overrides[dependencies.get_container] = lambda: container

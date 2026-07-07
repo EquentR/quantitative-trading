@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from fastapi import Depends, Header
 
-from quantitative_trading.api.auth import AuthService, InvalidTokenError
+from quantitative_trading.api.auth import AuthService, InvalidTokenError, TokenClaims
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.config import Settings
 from quantitative_trading.storage.api_auth import ApiAuthRepository
@@ -25,9 +25,8 @@ def get_container() -> ApiContainer:
 
 @contextmanager
 def connection_scope(settings: Settings) -> Iterator[sqlite3.Connection]:
-    # API 请求使用短连接，避免跨请求共享 SQLite 连接状态；迁移保持幂等。
+    # API 请求使用短连接，避免跨请求共享 SQLite 连接状态；schema 迁移由 app 启动阶段完成。
     with connect(settings) as connection:
-        migrate(connection)
         yield connection
 
 
@@ -43,7 +42,7 @@ def auth_service(settings: Settings, connection: sqlite3.Connection) -> AuthServ
 def require_token(
     authorization: str | None = Header(default=None),
     container: ApiContainer = Depends(get_container),
-) -> None:
+) -> TokenClaims:
     if authorization is None:
         raise ApiError(
             status_code=401,
@@ -62,7 +61,7 @@ def require_token(
 
     try:
         with connection_scope(container.settings) as connection:
-            auth_service(container.settings, connection).verify_token(token)
+            return auth_service(container.settings, connection).verify_token(token)
     except InvalidTokenError as exc:
         raise ApiError(
             status_code=401,

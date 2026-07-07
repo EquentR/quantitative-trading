@@ -66,6 +66,107 @@ def test_protected_endpoint_requires_auth_after_setup(tmp_path) -> None:
     assert response.json()["error"]["code"] == "unauthorized"
 
 
+def test_login_before_setup_returns_setup_required_error(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "api.db")
+    client = TestClient(create_app(settings))
+
+    response = client.post("/api/v1/auth/login", json={"password": "local-password"})
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "auth_setup_required"
+
+
+def test_login_with_wrong_password_returns_unauthorized(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "api.db")
+    client = TestClient(create_app(settings))
+    client.post("/api/v1/auth/setup-password", json={"password": "local-password"})
+
+    response = client.post("/api/v1/auth/login", json={"password": "wrong-password"})
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_setup_password_twice_returns_conflict(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "api.db")
+    client = TestClient(create_app(settings))
+    client.post("/api/v1/auth/setup-password", json={"password": "local-password"})
+
+    response = client.post("/api/v1/auth/setup-password", json={"password": "other-password"})
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "auth_already_configured"
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    [
+        None,
+        "Basic token",
+        "Bearer",
+        "Bearer not-a-token",
+    ],
+)
+def test_me_rejects_missing_or_malformed_authorization(tmp_path, authorization: str | None) -> None:
+    settings = Settings(database_path=tmp_path / "api.db")
+    client = TestClient(create_app(settings))
+    headers = {} if authorization is None else {"Authorization": authorization}
+
+    response = client.get("/api/v1/auth/me", headers=headers)
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+    assert "not-a-token" not in response.text
+
+
+def test_protected_endpoint_rejects_expired_token(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "api.db", api_token_ttl_seconds=60)
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(ApiAuthRepository(connection), token_ttl_seconds=60)
+        service.setup_password("local-password", now=NOW)
+        login = service.login("local-password", now=NOW)
+    client = TestClient(create_app(settings))
+
+    response = client.get(
+        "/api/v1/positions",
+        headers={"Authorization": f"Bearer {login.access_token}"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+def test_logout_is_client_side_acknowledgement(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "api.db")
+    client = TestClient(create_app(settings))
+
+    response = client.post("/api/v1/auth/logout")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_create_app_migrates_once_not_per_request(monkeypatch, tmp_path) -> None:
+    import quantitative_trading.api.dependencies as api_dependencies
+
+    calls = []
+    real_migrate = api_dependencies.migrate
+
+    def counting_migrate(connection):
+        calls.append("migrate")
+        real_migrate(connection)
+
+    monkeypatch.setattr(api_dependencies, "migrate", counting_migrate)
+    settings = Settings(database_path=tmp_path / "api.db")
+
+    client = TestClient(create_app(settings))
+    client.get("/api/v1/service/status")
+    client.get("/api/v1/service/status")
+
+    assert calls == ["migrate"]
+
+
 def test_auth_repository_starts_unconfigured(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "auth.db")
     with connect(settings) as connection:
