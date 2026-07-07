@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime
 
@@ -510,6 +511,159 @@ def test_run_api_service_starts_http_when_startup_result_recording_fails(
     service_app.run_api_service(settings)
 
     assert uvicorn_calls
+
+
+def test_run_api_service_starts_http_when_startup_result_get_or_create_fails(
+    tmp_path,
+    monkeypatch,
+    caplog,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    class CreatedSnapshot:
+        snapshot_id = 42
+
+    class FailingStartupGetOrCreateSchedulerStateRepository:
+        get_or_create_calls = 0
+
+        def __init__(self, connection) -> None:
+            self.repository = SchedulerStateRepository(connection)
+
+        def get_or_create(self, **kwargs):
+            type(self).get_or_create_calls += 1
+            if type(self).get_or_create_calls == 2:
+                raise sqlite3.OperationalError(
+                    "database is locked: /tmp/private/api.db?token=secret"
+                )
+            return self.repository.get_or_create(**kwargs)
+
+        def set_enabled(self, *args, **kwargs):
+            return self.repository.set_enabled(*args, **kwargs)
+
+        def record_result(self, **kwargs):
+            return self.repository.record_result(**kwargs)
+
+    class FakeSchedulerManager:
+        def __init__(self, *, interval_seconds, timezone, job) -> None:
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
+    with connect(settings) as connection:
+        migrate(connection)
+        SchedulerStateRepository(connection).set_enabled(
+            True,
+            interval_seconds=settings.intraday_interval_seconds,
+            run_on_start=True,
+            now=datetime.now(UTC),
+        )
+
+    uvicorn_calls = []
+
+    def fake_uvicorn_run(app, *, host: str, port: int) -> None:
+        uvicorn_calls.append({"app": app, "host": host, "port": port})
+
+    monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
+    monkeypatch.setattr(
+        service_app,
+        "SchedulerStateRepository",
+        FailingStartupGetOrCreateSchedulerStateRepository,
+    )
+    monkeypatch.setattr(
+        service_app,
+        "create_and_save_account_snapshot",
+        lambda received_settings: CreatedSnapshot(),
+    )
+    monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
+
+    with caplog.at_level(logging.WARNING, logger=service_app.LOGGER.name):
+        service_app.run_api_service(settings)
+
+    assert uvicorn_calls
+    assert (
+        FailingStartupGetOrCreateSchedulerStateRepository.get_or_create_calls == 2
+    )
+    assert "startup scheduler result was not recorded" in caplog.text
+    assert "/tmp/private" not in caplog.text
+    assert "secret" not in caplog.text
+
+
+def test_background_snapshot_job_propagates_result_persistence_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    class CreatedSnapshot:
+        snapshot_id = 42
+
+    class FailingBackgroundSchedulerStateRepository:
+        fail_get_or_create = False
+
+        def __init__(self, connection) -> None:
+            self.repository = SchedulerStateRepository(connection)
+
+        def get_or_create(self, **kwargs):
+            if type(self).fail_get_or_create:
+                raise sqlite3.OperationalError(
+                    "database is locked: /tmp/private/api.db?token=secret"
+                )
+            return self.repository.get_or_create(**kwargs)
+
+        def set_enabled(self, *args, **kwargs):
+            return self.repository.set_enabled(*args, **kwargs)
+
+        def record_result(self, **kwargs):
+            return self.repository.record_result(**kwargs)
+
+    class FakeSchedulerManager:
+        def __init__(self, *, interval_seconds, timezone, job) -> None:
+            captured_jobs.append(job)
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
+    captured_jobs = []
+    uvicorn_calls = []
+
+    def fake_uvicorn_run(app, *, host: str, port: int) -> None:
+        uvicorn_calls.append({"app": app, "host": host, "port": port})
+
+    monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
+    monkeypatch.setattr(
+        service_app,
+        "SchedulerStateRepository",
+        FailingBackgroundSchedulerStateRepository,
+    )
+    monkeypatch.setattr(
+        service_app,
+        "create_and_save_account_snapshot",
+        lambda received_settings: CreatedSnapshot(),
+    )
+    monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
+
+    service_app.run_api_service(settings)
+
+    assert uvicorn_calls
+    FailingBackgroundSchedulerStateRepository.fail_get_or_create = True
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        captured_jobs[0]("intraday")
 
 
 @pytest.mark.parametrize(

@@ -32,31 +32,23 @@ def run_api_service(settings: Settings) -> None:
             error = _safe_error_summary(exc)
 
         finished_at = datetime.now(UTC)
-        with connect(settings) as connection:
-            migrate(connection)
-            repository = SchedulerStateRepository(connection)
-            repository.get_or_create(
-                interval_seconds=settings.intraday_interval_seconds,
-                run_on_start=settings.service_run_on_start_when_scheduler_enabled,
-                now=started_at,
+        try:
+            _record_scheduler_result(
+                settings,
+                started_at=started_at,
+                finished_at=finished_at,
+                status=status,
+                reason=reason,
+                error=error,
+                snapshot_id=snapshot_id,
             )
-            try:
-                repository.record_result(
-                    started_at=started_at,
-                    finished_at=finished_at,
-                    status=status,
-                    reason=reason,
-                    error=error,
-                    snapshot_id=snapshot_id,
-                    now=finished_at,
-                )
-            except Exception as exc:
-                if not suppress_record_errors:
-                    raise
-                LOGGER.warning(
-                    "startup scheduler result was not recorded: %s",
-                    _safe_error_summary(exc),
-                )
+        except Exception as exc:
+            if not suppress_record_errors:
+                raise
+            LOGGER.warning(
+                "startup scheduler result was not recorded: %s",
+                _safe_error_summary(exc),
+            )
 
     state = _restore_scheduler_state_from_settings(settings)
 
@@ -87,4 +79,33 @@ def _restore_scheduler_state_from_settings(settings: Settings) -> SchedulerState
             interval_seconds=settings.intraday_interval_seconds,
             run_on_start=settings.service_run_on_start_when_scheduler_enabled,
             now=now,
+        )
+
+
+def _record_scheduler_result(
+    settings: Settings,
+    *,
+    started_at: datetime,
+    finished_at: datetime,
+    status: str,
+    reason: str,
+    error: str | None,
+    snapshot_id: int | None,
+) -> None:
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = SchedulerStateRepository(connection)
+        repository.get_or_create(
+            interval_seconds=settings.intraday_interval_seconds,
+            run_on_start=settings.service_run_on_start_when_scheduler_enabled,
+            now=started_at,
+        )
+        repository.record_result(
+            started_at=started_at,
+            finished_at=finished_at,
+            status=status,
+            reason=reason,
+            error=error,
+            snapshot_id=snapshot_id,
+            now=finished_at,
         )
