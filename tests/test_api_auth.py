@@ -153,6 +153,25 @@ def test_auth_service_stored_password_takes_precedence_over_startup_password(tmp
 
         with pytest.raises(InvalidCredentialsError):
             service.login("startup-password", now=NOW)
+        login = service.login("stored-password", now=NOW)
+
+    assert login.token_type == "bearer"
+
+
+def test_auth_service_login_uses_startup_password_before_setup(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(
+            ApiAuthRepository(connection),
+            token_ttl_seconds=3600,
+            startup_password="startup-password",
+        )
+
+        login = service.login("startup-password", now=NOW)
+        claims = service.verify_token(login.access_token, now=NOW)
+
+    assert claims.user == "local"
 
 
 def test_auth_service_configured_token_secret_is_idempotent(tmp_path) -> None:
