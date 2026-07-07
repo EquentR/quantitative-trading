@@ -15,7 +15,7 @@ from pydantic import ValidationError
 from quantitative_trading.account.service import AccountService
 from quantitative_trading.cash.repository import CashAccountNotInitializedError, CashAccountRepository
 from quantitative_trading.cash.service import CashService, CashTransferError, ReadOnlyCashService
-from quantitative_trading.config import load_settings
+from quantitative_trading.config import Settings, load_settings
 from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import (
     DuplicatePositionError,
@@ -23,7 +23,11 @@ from quantitative_trading.ledger.repository import (
     PositionRepository,
 )
 from quantitative_trading.ledger.service import LedgerService, ReadOnlyLedgerService
-from quantitative_trading.market.providers import DisabledMarketProvider
+from quantitative_trading.market.providers import (
+    AkShareMarketProvider,
+    DisabledMarketProvider,
+    MarketDataProvider,
+)
 from quantitative_trading.runtime.service_runner import DebugServiceRunner
 from quantitative_trading.storage.sqlite import connect, migrate
 
@@ -153,6 +157,17 @@ def _format_money(value: float | None) -> str:
 
 def _cash_cli_error(exc: Exception) -> typer.BadParameter:
     return typer.BadParameter(str(exc))
+
+
+def _market_provider(settings: Settings) -> MarketDataProvider:
+    if not settings.enable_market_fetch:
+        return DisabledMarketProvider()
+
+    provider_name = settings.market_provider.strip().lower()
+    if provider_name == "akshare":
+        return AkShareMarketProvider()
+
+    raise typer.BadParameter(f"unsupported market provider: {settings.market_provider}")
 
 
 @ledger_app.command("add")
@@ -388,11 +403,12 @@ def list_cash_transactions(
 
 @account_app.command("snapshot")
 def account_snapshot(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+    settings = load_settings()
     with _service_scope() as (_, ledger_read_only, _, cash_read_only):
         account_service = AccountService(
             ledger=ledger_read_only,
             cash=cash_read_only,
-            market=DisabledMarketProvider(),
+            market=_market_provider(settings),
         )
         snapshot = account_service.create_snapshot()
         if json_output:
@@ -424,7 +440,7 @@ def run_service(once: Annotated[bool, typer.Option("--once")] = False) -> None:
             account_service = AccountService(
                 ledger=ledger_read_only,
                 cash=cash_read_only,
-                market=DisabledMarketProvider(),
+                market=_market_provider(settings),
             )
             return account_service.create_snapshot()
 

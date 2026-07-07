@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from typer.testing import CliRunner
 
 import quantitative_trading.cli as cli
 from quantitative_trading.cli import app
+from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
 
 
 runner = CliRunner()
@@ -459,7 +461,29 @@ def test_account_snapshot_json_outputs_status(tmp_path) -> None:
     assert payload["warnings"] == ["cash account not initialized"]
 
 
-def test_account_snapshot_with_position_reports_disabled_market_warning(tmp_path) -> None:
+def test_account_snapshot_with_position_uses_configured_akshare_provider(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeAkShareProvider:
+        calls: list[list[str]] = []
+
+        def get_quotes(self, symbols):
+            self.calls.append(list(symbols))
+            return {
+                "600000": QuoteSnapshot(
+                    symbol="600000",
+                    name="Pufa Bank",
+                    current_price=10.5,
+                    change_pct=1.2,
+                    data_time=datetime(2026, 7, 7, 2, 30, tzinfo=UTC),
+                    fetched_at=datetime(2026, 7, 7, 2, 30, 3, tzinfo=UTC),
+                    source="akshare",
+                    status=QuoteStatus.OK,
+                )
+            }
+
+    monkeypatch.setattr(cli, "AkShareMarketProvider", FakeAkShareProvider, raising=False)
     run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
     add_result = run_cli(
         tmp_path,
@@ -479,12 +503,109 @@ def test_account_snapshot_with_position_reports_disabled_market_warning(tmp_path
         "2026-07-06",
     )
 
-    result = run_cli(tmp_path, "account", "snapshot")
+    result = run_cli(tmp_path, "account", "snapshot", "--json")
+
+    assert add_result.exit_code == 0
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "ok"
+    assert payload["market_value"] == 10500
+    assert payload["position_cost"] == 9500
+    assert payload["floating_pnl"] == 1000
+    assert payload["total_assets"] == 60500
+    assert payload["total_pnl"] == 10500
+    assert payload["positions"][0]["current_price"] == 10.5
+    assert FakeAkShareProvider.calls == [["600000"]]
+
+
+def test_account_snapshot_with_market_fetch_disabled_reports_warning(tmp_path) -> None:
+    run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
+    add_result = run_cli(
+        tmp_path,
+        "ledger",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "娴﹀彂閾惰",
+        "--quantity",
+        "1000",
+        "--available-quantity",
+        "800",
+        "--cost-price",
+        "9.5",
+        "--opened-at",
+        "2026-07-06",
+    )
+
+    result = run_cli(
+        tmp_path,
+        "account",
+        "snapshot",
+        env={"QT_ENABLE_MARKET_FETCH": "false"},
+    )
 
     assert add_result.exit_code == 0
     assert result.exit_code == 0
     assert "market_data_unavailable" in result.output
     assert "market fetch disabled" in result.output
+
+
+def test_service_run_once_uses_configured_akshare_provider(monkeypatch, tmp_path) -> None:
+    class FakeAkShareProvider:
+        calls: list[list[str]] = []
+
+        def get_quotes(self, symbols):
+            self.calls.append(list(symbols))
+            return {
+                "600000": QuoteSnapshot(
+                    symbol="600000",
+                    name="Pufa Bank",
+                    current_price=10.5,
+                    change_pct=1.2,
+                    data_time=datetime(2026, 7, 7, 2, 30, tzinfo=UTC),
+                    fetched_at=datetime(2026, 7, 7, 2, 30, 3, tzinfo=UTC),
+                    source="akshare",
+                    status=QuoteStatus.OK,
+                )
+            }
+
+    monkeypatch.setattr(cli, "AkShareMarketProvider", FakeAkShareProvider, raising=False)
+    log_dir = tmp_path / "logs"
+    run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
+    run_cli(
+        tmp_path,
+        "ledger",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "娴﹀彂閾惰",
+        "--quantity",
+        "1000",
+        "--available-quantity",
+        "800",
+        "--cost-price",
+        "9.5",
+        "--opened-at",
+        "2026-07-06",
+    )
+
+    result = run_cli(
+        tmp_path,
+        "service",
+        "run",
+        "--once",
+        env={"QT_LOG_DIR": str(log_dir)},
+    )
+
+    assert result.exit_code == 0
+    assert "debug service started status=ok" in result.output
+    log_path = log_dir / "account-snapshots.jsonl"
+    payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert payload["snapshot"]["status"] == "ok"
+    assert payload["snapshot"]["market_value"] == 10500
+    assert FakeAkShareProvider.calls == [["600000"]]
 
 
 def test_services_closes_connection_when_migrate_fails(monkeypatch) -> None:
