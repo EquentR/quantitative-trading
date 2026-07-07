@@ -239,6 +239,279 @@ def test_run_api_service_records_startup_scheduler_result(tmp_path, monkeypatch)
     assert uvicorn_calls[0]["port"] == 8123
 
 
+def test_run_api_service_reconciles_current_run_on_start_false_before_startup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    class FakeSchedulerManager:
+        def __init__(self, *, interval_seconds, timezone, job) -> None:
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    settings = Settings(
+        database_path=tmp_path / "api.db",
+        enable_market_fetch=False,
+        intraday_interval_seconds=11,
+        service_run_on_start_when_scheduler_enabled=False,
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = SchedulerStateRepository(connection)
+        repository.set_enabled(
+            True,
+            interval_seconds=99,
+            run_on_start=True,
+            now=datetime.now(UTC),
+        )
+        repository.record_result(
+            started_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+            status="success",
+            reason="manual_api",
+            error=None,
+            snapshot_id=12,
+            now=datetime.now(UTC),
+        )
+
+    snapshot_calls = []
+    uvicorn_calls = []
+
+    def fake_create_and_save_account_snapshot(received_settings):
+        snapshot_calls.append(received_settings.database_path)
+
+    def fake_uvicorn_run(app, *, host: str, port: int) -> None:
+        uvicorn_calls.append({"app": app, "host": host, "port": port})
+
+    monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
+    monkeypatch.setattr(
+        service_app,
+        "create_and_save_account_snapshot",
+        fake_create_and_save_account_snapshot,
+    )
+    monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
+
+    service_app.run_api_service(settings)
+
+    with connect(settings) as connection:
+        state = SchedulerStateRepository(connection).get_or_create(
+            interval_seconds=11,
+            run_on_start=False,
+            now=datetime.now(UTC),
+        )
+
+    assert snapshot_calls == []
+    assert uvicorn_calls
+    assert state.enabled is True
+    assert state.interval_seconds == 11
+    assert state.run_on_start is False
+    assert state.last_reason == "manual_api"
+    assert state.last_snapshot_id == 12
+
+
+def test_run_api_service_reconciles_current_run_on_start_true_before_startup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    class CreatedSnapshot:
+        snapshot_id = 24
+
+    class FakeSchedulerManager:
+        def __init__(self, *, interval_seconds, timezone, job) -> None:
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    settings = Settings(
+        database_path=tmp_path / "api.db",
+        enable_market_fetch=False,
+        intraday_interval_seconds=13,
+        service_run_on_start_when_scheduler_enabled=True,
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        SchedulerStateRepository(connection).set_enabled(
+            True,
+            interval_seconds=99,
+            run_on_start=False,
+            now=datetime.now(UTC),
+        )
+
+    snapshot_calls = []
+    uvicorn_calls = []
+
+    def fake_create_and_save_account_snapshot(received_settings):
+        snapshot_calls.append(received_settings.database_path)
+        return CreatedSnapshot()
+
+    def fake_uvicorn_run(app, *, host: str, port: int) -> None:
+        uvicorn_calls.append({"app": app, "host": host, "port": port})
+
+    monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
+    monkeypatch.setattr(
+        service_app,
+        "create_and_save_account_snapshot",
+        fake_create_and_save_account_snapshot,
+    )
+    monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
+
+    service_app.run_api_service(settings)
+
+    with connect(settings) as connection:
+        state = SchedulerStateRepository(connection).get_or_create(
+            interval_seconds=13,
+            run_on_start=True,
+            now=datetime.now(UTC),
+        )
+
+    assert snapshot_calls == [settings.database_path]
+    assert uvicorn_calls
+    assert state.enabled is True
+    assert state.interval_seconds == 13
+    assert state.run_on_start is True
+    assert state.last_status == "success"
+    assert state.last_reason == "startup"
+    assert state.last_snapshot_id == 24
+
+
+def test_run_api_service_runs_startup_snapshot_before_restored_scheduler(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    class CreatedSnapshot:
+        snapshot_id = 42
+
+    class FakeSchedulerManager:
+        def __init__(self, *, interval_seconds, timezone, job) -> None:
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            events.append("scheduler_start")
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
+    with connect(settings) as connection:
+        migrate(connection)
+        SchedulerStateRepository(connection).set_enabled(
+            True,
+            interval_seconds=settings.intraday_interval_seconds,
+            run_on_start=True,
+            now=datetime.now(UTC),
+        )
+
+    events = []
+
+    def fake_create_and_save_account_snapshot(received_settings):
+        events.append("startup_snapshot")
+        return CreatedSnapshot()
+
+    monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
+    monkeypatch.setattr(
+        service_app,
+        "create_and_save_account_snapshot",
+        fake_create_and_save_account_snapshot,
+    )
+    monkeypatch.setattr(service_app.uvicorn, "run", lambda app, *, host, port: None)
+
+    service_app.run_api_service(settings)
+
+    assert events == ["startup_snapshot", "scheduler_start"]
+
+
+def test_run_api_service_starts_http_when_startup_result_recording_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    class CreatedSnapshot:
+        snapshot_id = 42
+
+    class FailingRecordSchedulerStateRepository:
+        def __init__(self, connection) -> None:
+            self.repository = SchedulerStateRepository(connection)
+
+        def get_or_create(self, **kwargs):
+            return self.repository.get_or_create(**kwargs)
+
+        def set_enabled(self, *args, **kwargs):
+            return self.repository.set_enabled(*args, **kwargs)
+
+        def record_result(self, **kwargs):
+            raise sqlite3.OperationalError("database is locked: /tmp/private/api.db")
+
+    class FakeSchedulerManager:
+        def __init__(self, *, interval_seconds, timezone, job) -> None:
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
+    with connect(settings) as connection:
+        migrate(connection)
+        SchedulerStateRepository(connection).set_enabled(
+            True,
+            interval_seconds=settings.intraday_interval_seconds,
+            run_on_start=True,
+            now=datetime.now(UTC),
+        )
+
+    uvicorn_calls = []
+
+    def fake_uvicorn_run(app, *, host: str, port: int) -> None:
+        uvicorn_calls.append({"app": app, "host": host, "port": port})
+
+    monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
+    monkeypatch.setattr(
+        service_app,
+        "SchedulerStateRepository",
+        FailingRecordSchedulerStateRepository,
+    )
+    monkeypatch.setattr(
+        service_app,
+        "create_and_save_account_snapshot",
+        lambda received_settings: CreatedSnapshot(),
+    )
+    monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
+
+    service_app.run_api_service(settings)
+
+    assert uvicorn_calls
+
+
 @pytest.mark.parametrize(
     ("path", "field"),
     [
