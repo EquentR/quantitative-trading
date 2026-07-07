@@ -46,7 +46,16 @@ class AccountService:
         if not positions:
             return self._empty_position_snapshot(cash_account, created_at)
 
-        quotes = self._market.get_quotes([position.symbol for position in positions])
+        try:
+            quotes = self._market.get_quotes([position.symbol for position in positions])
+        except Exception as exc:
+            return self._market_provider_failed_snapshot(
+                cash_account,
+                positions,
+                created_at,
+                exc,
+            )
+
         valuations = [
             self._value_position(position, quotes.get(position.symbol))
             for position in positions
@@ -69,17 +78,26 @@ class AccountService:
                 created_at=created_at,
             )
 
+        if len(usable_valuations) < len(valuations):
+            warnings = [
+                self._coverage_warning(len(usable_valuations), len(valuations)),
+                *self._collect_warnings(valuations),
+            ]
+            return AccountSnapshot(
+                cash_balance=cash_account.cash_balance,
+                net_principal=cash_account.net_principal,
+                available_buying_cash=cash_account.cash_balance,
+                positions=valuations,
+                status=AccountSnapshotStatus.PARTIAL,
+                warnings=warnings,
+                created_at=created_at,
+            )
+
         market_value = sum(valuation.market_value or 0 for valuation in usable_valuations)
         position_cost = sum(valuation.position_cost for valuation in usable_valuations)
         floating_pnl = market_value - position_cost
         total_assets = cash_account.cash_balance + market_value
         total_pnl = total_assets - cash_account.net_principal
-
-        status = (
-            AccountSnapshotStatus.OK
-            if len(usable_valuations) == len(valuations)
-            else AccountSnapshotStatus.PARTIAL
-        )
 
         return AccountSnapshot(
             cash_balance=cash_account.cash_balance,
@@ -91,10 +109,10 @@ class AccountService:
             total_assets=total_assets,
             total_pnl=total_pnl,
             total_pnl_pct=self._ratio_or_none(total_pnl, cash_account.net_principal),
-            position_ratio=0 if total_assets == 0 else market_value / total_assets,
+            position_ratio=self._ratio_or_none(market_value, total_assets),
             available_buying_cash=cash_account.cash_balance,
             positions=valuations,
-            status=status,
+            status=AccountSnapshotStatus.OK,
             warnings=self._collect_warnings(valuations),
             created_at=created_at,
         )
@@ -116,11 +134,38 @@ class AccountService:
             total_assets=total_assets,
             total_pnl=total_pnl,
             total_pnl_pct=self._ratio_or_none(total_pnl, cash_account.net_principal),
-            position_ratio=0,
+            position_ratio=self._ratio_or_none(0, total_assets),
             available_buying_cash=cash_account.cash_balance,
             positions=[],
             status=AccountSnapshotStatus.OK,
             warnings=[],
+            created_at=created_at,
+        )
+
+    def _market_provider_failed_snapshot(
+        self,
+        cash_account: CashAccount,
+        positions: list[Position],
+        created_at: datetime,
+        exc: Exception,
+    ) -> AccountSnapshot:
+        warning = f"market data provider failed: {exc}"
+        valuations = [
+            self._unavailable_position(
+                position,
+                position.quantity * position.cost_price,
+                status=PositionValuationStatus.FAILED,
+                warning=warning,
+            )
+            for position in positions
+        ]
+        return AccountSnapshot(
+            cash_balance=cash_account.cash_balance,
+            net_principal=cash_account.net_principal,
+            available_buying_cash=cash_account.cash_balance,
+            positions=valuations,
+            status=AccountSnapshotStatus.MARKET_DATA_UNAVAILABLE,
+            warnings=self._collect_warnings(valuations),
             created_at=created_at,
         )
 
@@ -218,6 +263,13 @@ class AccountService:
             for valuation in valuations
             if valuation.warning
         ]
+
+    @staticmethod
+    def _coverage_warning(usable_count: int, total_count: int) -> str:
+        return (
+            "account totals unavailable: only "
+            f"{usable_count}/{total_count} positions have usable quotes"
+        )
 
     @staticmethod
     def _ratio_or_none(numerator: float, denominator: float) -> float | None:

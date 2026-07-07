@@ -49,6 +49,11 @@ class ExplodingMarketProvider:
         raise AssertionError("market provider should not be called")
 
 
+class RaisingMarketProvider:
+    def get_quotes(self, symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
+        raise RuntimeError("akshare timeout")
+
+
 def cash_account(
     *,
     cash_balance: float = 50000,
@@ -110,7 +115,7 @@ def service(
     *,
     account: CashAccount | None,
     positions: list[Position] | None = None,
-    market: FakeMarketProvider | ExplodingMarketProvider | None = None,
+    market: FakeMarketProvider | ExplodingMarketProvider | RaisingMarketProvider | None = None,
 ) -> AccountService:
     return AccountService(
         ledger=FakeLedgerService(positions or []),
@@ -155,6 +160,14 @@ def test_empty_positions_with_initialized_cash_returns_zero_position_metrics() -
     assert provider.calls == []
 
 
+def test_empty_positions_with_zero_total_assets_has_no_position_ratio() -> None:
+    snapshot = service(account=cash_account(cash_balance=0, total_transfer_in=0)).create_snapshot()
+
+    assert snapshot.status is AccountSnapshotStatus.OK
+    assert snapshot.total_assets == 0
+    assert snapshot.position_ratio is None
+
+
 def test_single_position_snapshot_uses_ledger_and_quote_formulas() -> None:
     snapshot = service(
         account=cash_account(),
@@ -188,7 +201,21 @@ def test_single_position_snapshot_uses_ledger_and_quote_formulas() -> None:
     assert valuation.status is PositionValuationStatus.OK
 
 
-def test_mixed_usable_and_unavailable_quotes_returns_partial_and_usable_totals() -> None:
+def test_zero_net_principal_has_no_total_pnl_pct() -> None:
+    snapshot = service(
+        account=cash_account(cash_balance=0, total_transfer_in=0),
+        positions=[position()],
+        market=FakeMarketProvider({"600000": quote()}),
+    ).create_snapshot()
+
+    assert snapshot.status is AccountSnapshotStatus.OK
+    assert snapshot.total_assets == 10500
+    assert snapshot.total_pnl == 10500
+    assert snapshot.total_pnl_pct is None
+    assert snapshot.position_ratio == 1
+
+
+def test_mixed_usable_and_unavailable_quotes_returns_partial_without_account_totals() -> None:
     stale_quote = quote("000002", name="万科A", status=QuoteStatus.STALE, warning="quote stale")
     failed_quote = quote(
         "000003",
@@ -216,21 +243,31 @@ def test_mixed_usable_and_unavailable_quotes_returns_partial_and_usable_totals()
     ).create_snapshot()
 
     assert snapshot.status is AccountSnapshotStatus.PARTIAL
-    assert snapshot.market_value == 10500
-    assert snapshot.position_cost == 9500
-    assert snapshot.floating_pnl == 1000
-    assert snapshot.total_assets == 60500
-    assert snapshot.total_pnl == 10500
+    assert snapshot.cash_balance == 50000
+    assert snapshot.net_principal == 50000
+    assert snapshot.available_buying_cash == 50000
+    assert snapshot.market_value is None
+    assert snapshot.position_cost is None
+    assert snapshot.floating_pnl is None
+    assert snapshot.floating_pnl_pct is None
+    assert snapshot.total_assets is None
+    assert snapshot.total_pnl is None
+    assert snapshot.total_pnl_pct is None
+    assert snapshot.position_ratio is None
     assert [valuation.status for valuation in snapshot.positions] == [
         PositionValuationStatus.OK,
         PositionValuationStatus.FAILED,
         PositionValuationStatus.STALE,
         PositionValuationStatus.FAILED,
     ]
+    assert snapshot.positions[0].market_value == 10500
+    assert snapshot.positions[0].position_cost == 9500
+    assert snapshot.positions[0].floating_pnl == 1000
     assert snapshot.positions[2].current_price is None
     assert snapshot.positions[2].market_value is None
     assert snapshot.positions[2].floating_pnl is None
     assert snapshot.positions[2].quote_data_time == NOW
+    assert "account totals unavailable: only 1/4 positions have usable quotes" in snapshot.warnings
     assert any("000001" in warning and "quote unavailable" in warning for warning in snapshot.warnings)
     assert any("000002" in warning and "quote stale" in warning for warning in snapshot.warnings)
     assert any("000003" in warning and "provider failed" in warning for warning in snapshot.warnings)
@@ -262,6 +299,30 @@ def test_all_quotes_unavailable_returns_market_data_unavailable() -> None:
         PositionValuationStatus.FAILED,
         PositionValuationStatus.STALE,
     ]
+
+
+def test_market_provider_exception_returns_market_data_unavailable_snapshot() -> None:
+    snapshot = service(
+        account=cash_account(),
+        positions=[position(), position("000001", name="平安银行")],
+        market=RaisingMarketProvider(),
+    ).create_snapshot()
+
+    assert snapshot.status is AccountSnapshotStatus.MARKET_DATA_UNAVAILABLE
+    assert snapshot.cash_balance == 50000
+    assert snapshot.net_principal == 50000
+    assert snapshot.available_buying_cash == 50000
+    assert snapshot.market_value is None
+    assert snapshot.position_cost is None
+    assert snapshot.floating_pnl is None
+    assert snapshot.total_assets is None
+    assert snapshot.total_pnl is None
+    assert [valuation.status for valuation in snapshot.positions] == [
+        PositionValuationStatus.FAILED,
+        PositionValuationStatus.FAILED,
+    ]
+    assert all("market data provider failed: akshare timeout" == valuation.warning for valuation in snapshot.positions)
+    assert any("akshare timeout" in warning for warning in snapshot.warnings)
 
 
 def test_partial_quote_with_warning_is_still_valued() -> None:

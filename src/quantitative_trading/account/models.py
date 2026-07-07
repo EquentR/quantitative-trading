@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class PositionValuationStatus(StrEnum):
@@ -52,6 +52,29 @@ class PositionValuation(BaseModel):
     def datetimes_must_be_timezone_aware(cls, value: datetime | None, info: Any) -> datetime | None:
         return _require_timezone_aware(value, info.field_name)
 
+    @model_validator(mode="after")
+    def valuation_fields_must_match_status(self) -> "PositionValuation":
+        if self.available_quantity > self.quantity:
+            raise ValueError("available_quantity cannot exceed quantity")
+
+        if self.status is PositionValuationStatus.OK:
+            for field_name in (
+                "current_price",
+                "market_value",
+                "floating_pnl",
+                "quote_data_time",
+                "quote_fetched_at",
+            ):
+                if getattr(self, field_name) is None:
+                    raise ValueError(f"ok valuation requires {field_name}")
+        elif self.status in {
+            PositionValuationStatus.FAILED,
+            PositionValuationStatus.STALE,
+        } and not self.warning:
+            raise ValueError(f"{self.status.value} valuation requires warning")
+
+        return self
+
 
 class AccountSnapshot(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -76,3 +99,20 @@ class AccountSnapshot(BaseModel):
     @classmethod
     def created_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
         return _require_timezone_aware(value, "created_at")
+
+    @model_validator(mode="after")
+    def ok_snapshot_requires_core_totals(self) -> "AccountSnapshot":
+        if self.status is AccountSnapshotStatus.OK:
+            for field_name in (
+                "cash_balance",
+                "net_principal",
+                "market_value",
+                "position_cost",
+                "floating_pnl",
+                "total_assets",
+                "total_pnl",
+                "available_buying_cash",
+            ):
+                if getattr(self, field_name) is None:
+                    raise ValueError(f"ok snapshot requires {field_name}")
+        return self
