@@ -28,6 +28,7 @@ from quantitative_trading.market.providers import (
     DisabledMarketProvider,
     MarketDataProvider,
 )
+from quantitative_trading.runtime.service_app import run_api_service
 from quantitative_trading.runtime.service_runner import DebugServiceRunner
 from quantitative_trading.storage.sqlite import connect, migrate
 
@@ -432,8 +433,15 @@ def check_service() -> None:
         typer.echo(f"当前持仓数量: {len(positions)}")
 
 
-@service_app.command("run", help="Run the debug foreground account snapshot service.")
-def run_service(once: Annotated[bool, typer.Option("--once")] = False) -> None:
+@service_app.command("run", help="Run the unified HTTP API and scheduler service.")
+def run_service() -> None:
+    settings = load_settings()
+    typer.echo(f"api service starting host={settings.api_host} port={settings.api_port}")
+    run_api_service(settings)
+
+
+@service_app.command("debug-run", help="Run the debug foreground account snapshot service.")
+def debug_run_service(once: Annotated[bool, typer.Option("--once")] = False) -> None:
     settings = load_settings()
 
     def snapshot_factory():

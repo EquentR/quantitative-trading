@@ -189,7 +189,38 @@ def test_service_run_command_is_registered(tmp_path) -> None:
     result = run_cli(tmp_path, "service", "run", "--help")
 
     assert result.exit_code == 0
-    assert "debug" in result.output.lower()
+    assert "unified http api" in result.output.lower()
+
+
+def test_service_run_starts_api_service(monkeypatch, tmp_path) -> None:
+    starts = []
+
+    def fake_run_api_service(settings):
+        starts.append(
+            {
+                "host": settings.api_host,
+                "port": settings.api_port,
+                "database_path": str(settings.database_path),
+            }
+        )
+
+    monkeypatch.setattr(cli, "run_api_service", fake_run_api_service)
+
+    result = run_cli(
+        tmp_path,
+        "service",
+        "run",
+        env={"QT_API_HOST": "127.0.0.1", "QT_API_PORT": "8123"},
+    )
+
+    assert result.exit_code == 0
+    assert starts == [
+        {
+            "host": "127.0.0.1",
+            "port": 8123,
+            "database_path": str(tmp_path / "ledger.db"),
+        }
+    ]
 
 
 def test_service_run_once_outputs_status_and_writes_log(tmp_path) -> None:
@@ -198,7 +229,7 @@ def test_service_run_once_outputs_status_and_writes_log(tmp_path) -> None:
     result = run_cli(
         tmp_path,
         "service",
-        "run",
+        "debug-run",
         "--once",
         env={"QT_LOG_DIR": str(log_dir)},
     )
@@ -247,7 +278,7 @@ def test_service_run_polling_passes_interval_timezone_and_uses_snapshot_factory(
     result = run_cli(
         tmp_path,
         "service",
-        "run",
+        "debug-run",
         env={
             "QT_INTRADAY_INTERVAL_SECONDS": "7",
             "QT_TIMEZONE": "Asia/Shanghai",
@@ -594,7 +625,7 @@ def test_service_run_once_uses_configured_akshare_provider(monkeypatch, tmp_path
     result = run_cli(
         tmp_path,
         "service",
-        "run",
+        "debug-run",
         "--once",
         env={"QT_LOG_DIR": str(log_dir)},
     )

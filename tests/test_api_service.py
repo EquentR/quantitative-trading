@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 import pytest
 
 from quantitative_trading.api.app import create_app
 from quantitative_trading.config import Settings
+from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
+from quantitative_trading.storage.sqlite import connect, migrate
 
 
 def authenticated_client(
@@ -120,6 +123,120 @@ def test_scheduler_start_and_stop_persist_state(tmp_path) -> None:
     assert started_status.json()["scheduler_enabled"] is True
     assert stop_response.status_code == 200
     assert stop_response.json()["scheduler_enabled"] is False
+
+
+def test_create_app_restores_enabled_scheduler(tmp_path) -> None:
+    starts = []
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            starts.append("started")
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
+    client = TestClient(create_app(settings, scheduler=FakeScheduler()))
+    client.post("/api/v1/auth/setup-password", json={"password": "local-password"})
+    login = client.post("/api/v1/auth/login", json={"password": "local-password"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    client.post("/api/v1/service/scheduler/start", headers=headers)
+
+    restored_client = TestClient(
+        create_app(settings, scheduler=FakeScheduler(), restore_scheduler=True)
+    )
+    status = restored_client.get("/api/v1/service/status", headers=headers)
+
+    assert starts == ["started", "started"]
+    assert status.json()["scheduler_enabled"] is True
+    assert status.json()["scheduler_running"] is True
+
+
+def test_run_api_service_records_startup_scheduler_result(tmp_path, monkeypatch) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    class CreatedSnapshot:
+        snapshot_id = 42
+
+    class FakeSchedulerManager:
+        def __init__(self, *, interval_seconds, timezone, job) -> None:
+            schedulers.append(
+                {
+                    "interval_seconds": interval_seconds,
+                    "timezone": timezone,
+                    "job": job,
+                }
+            )
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    schedulers = []
+    snapshot_calls = []
+    uvicorn_calls = []
+    settings = Settings(
+        database_path=tmp_path / "api.db",
+        enable_market_fetch=False,
+        intraday_interval_seconds=7,
+        timezone="Asia/Shanghai",
+        api_host="127.0.0.1",
+        api_port=8123,
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        SchedulerStateRepository(connection).set_enabled(
+            True,
+            interval_seconds=7,
+            run_on_start=True,
+            now=datetime.now(UTC),
+        )
+
+    def fake_create_and_save_account_snapshot(received_settings):
+        snapshot_calls.append(received_settings.database_path)
+        return CreatedSnapshot()
+
+    def fake_uvicorn_run(app, *, host: str, port: int) -> None:
+        uvicorn_calls.append({"app": app, "host": host, "port": port})
+
+    monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
+    monkeypatch.setattr(
+        service_app,
+        "create_and_save_account_snapshot",
+        fake_create_and_save_account_snapshot,
+    )
+    monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
+
+    service_app.run_api_service(settings)
+
+    with connect(settings) as connection:
+        state = SchedulerStateRepository(connection).get_or_create(
+            interval_seconds=7,
+            run_on_start=True,
+            now=datetime.now(UTC),
+        )
+
+    assert schedulers[0]["interval_seconds"] == 7
+    assert schedulers[0]["timezone"] == "Asia/Shanghai"
+    assert snapshot_calls == [settings.database_path]
+    assert state.last_status == "success"
+    assert state.last_reason == "startup"
+    assert state.last_snapshot_id == 42
+    assert uvicorn_calls[0]["host"] == "127.0.0.1"
+    assert uvicorn_calls[0]["port"] == 8123
 
 
 @pytest.mark.parametrize(
