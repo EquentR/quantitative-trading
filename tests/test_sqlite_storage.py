@@ -45,80 +45,133 @@ def insert_position(
     )
 
 
-def test_migrate_creates_positions_table(tmp_path) -> None:
-    db_path = tmp_path / "ledger.db"
-    settings = Settings(database_path=db_path)
+def insert_cash_account(
+    connection: sqlite3.Connection,
+    **overrides: object,
+) -> None:
+    data = {
+        "id": 1,
+        "cash_balance": 50000.0,
+        "total_transfer_in": 50000.0,
+        "total_transfer_out": 0.0,
+        "updated_at": "2026-07-07T09:00:00+08:00",
+    }
+    data.update(overrides)
+
+    connection.execute(
+        """
+        INSERT INTO cash_account (
+          id,
+          cash_balance,
+          total_transfer_in,
+          total_transfer_out,
+          updated_at
+        ) VALUES (
+          :id,
+          :cash_balance,
+          :total_transfer_in,
+          :total_transfer_out,
+          :updated_at
+        )
+        """,
+        data,
+    )
+
+
+def insert_cash_transaction(
+    connection: sqlite3.Connection,
+    **overrides: object,
+) -> None:
+    data = {
+        "type": "transfer_in",
+        "amount": 1000.0,
+        "cash_before": 50000.0,
+        "cash_after": 51000.0,
+        "occurred_at": "2026-07-07T09:30:00+08:00",
+    }
+    data.update(overrides)
+
+    columns = list(data)
+    placeholders = [f":{column}" for column in columns]
+    connection.execute(
+        f"""
+        INSERT INTO cash_transactions (
+          {", ".join(columns)}
+        ) VALUES (
+          {", ".join(placeholders)}
+        )
+        """,
+        data,
+    )
+
+
+@pytest.mark.parametrize(
+    ("table_name", "expected_columns"),
+    [
+        (
+            "positions",
+            [
+                "symbol",
+                "name",
+                "quantity",
+                "available_quantity",
+                "cost_price",
+                "opened_at",
+                "updated_at",
+                "note",
+            ],
+        ),
+        (
+            "cash_account",
+            [
+                "id",
+                "cash_balance",
+                "total_transfer_in",
+                "total_transfer_out",
+                "updated_at",
+            ],
+        ),
+        (
+            "cash_transactions",
+            [
+                "id",
+                "type",
+                "amount",
+                "cash_before",
+                "cash_after",
+                "occurred_at",
+                "note",
+            ],
+        ),
+        (
+            "account_snapshots",
+            [
+                "id",
+                "status",
+                "created_at",
+                "cash_account_updated_at",
+                "ledger_max_updated_at",
+                "market_value",
+                "total_assets",
+                "total_pnl",
+                "position_ratio",
+                "payload_json",
+            ],
+        ),
+    ],
+)
+def test_migrate_creates_expected_table_columns(
+    tmp_path,
+    table_name: str,
+    expected_columns: list[str],
+) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
 
     with connect(settings) as connection:
         migrate(connection)
-        columns = connection.execute("PRAGMA table_info(positions)").fetchall()
+        columns = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
 
-    column_names = [column["name"] for column in columns]
-    assert column_names == [
-        "symbol",
-        "name",
-        "quantity",
-        "available_quantity",
-        "cost_price",
-        "opened_at",
-        "updated_at",
-        "note",
-    ]
-
-
-def test_migrate_creates_cash_account_table(tmp_path) -> None:
-    settings = Settings(database_path=tmp_path / "account.db")
-
-    with connect(settings) as connection:
-        migrate(connection)
-        columns = connection.execute("PRAGMA table_info(cash_account)").fetchall()
-
-    assert [column["name"] for column in columns] == [
-        "id",
-        "cash_balance",
-        "total_transfer_in",
-        "total_transfer_out",
-        "updated_at",
-    ]
-
-
-def test_migrate_creates_cash_transactions_table(tmp_path) -> None:
-    settings = Settings(database_path=tmp_path / "account.db")
-
-    with connect(settings) as connection:
-        migrate(connection)
-        columns = connection.execute("PRAGMA table_info(cash_transactions)").fetchall()
-
-    assert [column["name"] for column in columns] == [
-        "id",
-        "type",
-        "amount",
-        "cash_before",
-        "cash_after",
-        "occurred_at",
-        "note",
-    ]
-
-
-def test_migrate_creates_account_snapshots_table(tmp_path) -> None:
-    settings = Settings(database_path=tmp_path / "account.db")
-
-    with connect(settings) as connection:
-        migrate(connection)
-        columns = connection.execute("PRAGMA table_info(account_snapshots)").fetchall()
-
-    assert [column["name"] for column in columns] == [
-        "id",
-        "status",
-        "created_at",
-        "cash_account_updated_at",
-        "ledger_max_updated_at",
-        "market_value",
-        "total_assets",
-        "total_pnl",
-        "position_ratio",
-        "payload_json",
-    ]
+    assert [column["name"] for column in columns] == expected_columns
 
 
 def test_connection_enforces_foreign_keys(tmp_path) -> None:
@@ -176,6 +229,92 @@ def test_positions_default_note_to_empty_string(tmp_path) -> None:
         row = connection.execute(
             "SELECT note FROM positions WHERE symbol = ?",
             ("600000",),
+        ).fetchone()
+
+    assert row["note"] == ""
+
+
+def test_cash_account_rejects_non_singleton_id(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_cash_account(connection, id=2)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cash_balance", -1.0),
+        ("total_transfer_in", -1.0),
+        ("total_transfer_out", -1.0),
+    ],
+)
+def test_cash_account_rejects_negative_amounts(
+    tmp_path,
+    field: str,
+    value: float,
+) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_cash_account(connection, **{field: value})
+
+
+def test_cash_account_rejects_transfer_out_above_transfer_in(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_cash_account(
+                connection,
+                cash_balance=0.0,
+                total_transfer_in=1000.0,
+                total_transfer_out=1000.01,
+            )
+
+
+def test_cash_transactions_reject_invalid_type(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_cash_transaction(connection, type="dividend")
+
+
+@pytest.mark.parametrize("amount", [0.0, -1.0])
+def test_cash_transactions_reject_non_positive_amount(
+    tmp_path,
+    amount: float,
+) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_cash_transaction(connection, amount=amount)
+
+
+def test_cash_transactions_default_note_to_empty_string(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        insert_cash_transaction(connection)
+
+        row = connection.execute(
+            "SELECT note FROM cash_transactions WHERE id = ?",
+            (1,),
         ).fetchone()
 
     assert row["note"] == ""

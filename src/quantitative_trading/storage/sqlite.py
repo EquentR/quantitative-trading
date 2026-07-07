@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from quantitative_trading.config import Settings
 
 
-SCHEMA_SQL = """
+POSITIONS_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS positions (
   symbol TEXT PRIMARY KEY NOT NULL,
   name TEXT NOT NULL,
@@ -20,7 +20,10 @@ CREATE TABLE IF NOT EXISTS positions (
   CHECK (symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'),
   CHECK (available_quantity <= quantity)
 );
+"""
 
+
+CASH_ACCOUNT_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS cash_account (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   cash_balance REAL NOT NULL CHECK (cash_balance >= 0),
@@ -29,7 +32,10 @@ CREATE TABLE IF NOT EXISTS cash_account (
   updated_at TEXT NOT NULL,
   CHECK (total_transfer_in >= total_transfer_out)
 );
+"""
 
+
+CASH_TRANSACTIONS_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS cash_transactions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   type TEXT NOT NULL,
@@ -40,7 +46,10 @@ CREATE TABLE IF NOT EXISTS cash_transactions (
   note TEXT NOT NULL DEFAULT '',
   CHECK (type IN ('initial_deposit', 'transfer_in', 'transfer_out', 'cash_adjustment'))
 );
+"""
 
+
+ACCOUNT_SNAPSHOTS_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS account_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   status TEXT NOT NULL,
@@ -54,6 +63,16 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
   payload_json TEXT NOT NULL
 );
 """
+
+
+SCHEMA_STATEMENTS = [
+    POSITIONS_SCHEMA_SQL,
+    CASH_ACCOUNT_SCHEMA_SQL,
+    CASH_TRANSACTIONS_SCHEMA_SQL,
+    ACCOUNT_SNAPSHOTS_SCHEMA_SQL,
+]
+
+SCHEMA_SQL = "\n\n".join(SCHEMA_STATEMENTS)
 
 
 @contextmanager
