@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,7 +21,16 @@ class Settings(BaseSettings):
     api_access_password: str | None = Field(default=None)
     api_token_secret: str | None = Field(default=None)
     api_token_ttl_seconds: int = Field(default=3600, ge=60)
+    # 调度恢复后是否立即跑一次快照，避免重启后长时间等到下一个轮询周期。
     service_run_on_start_when_scheduler_enabled: bool = Field(default=True)
+
+    @field_validator("api_access_password", "api_token_secret", mode="before")
+    @classmethod
+    def _blank_secret_to_none(cls, value: object) -> object:
+        # .env.example 使用空占位符；空字符串应视为未配置，不能变成空密码。
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
 
 
 def load_settings() -> Settings:

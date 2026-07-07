@@ -13,6 +13,12 @@ RUNTIME_ENV_NAMES = (
     "QT_INTRADAY_INTERVAL_SECONDS",
     "QT_TIMEZONE",
     "QT_ENABLE_MARKET_FETCH",
+    "QT_API_HOST",
+    "QT_API_PORT",
+    "QT_API_ACCESS_PASSWORD",
+    "QT_API_TOKEN_SECRET",
+    "QT_API_TOKEN_TTL_SECONDS",
+    "QT_SERVICE_RUN_ON_START_WHEN_SCHEDULER_ENABLED",
 )
 
 
@@ -115,7 +121,9 @@ def test_load_settings_rejects_non_positive_interval_environment(monkeypatch) ->
         load_settings()
 
 
-def test_api_settings_have_safe_defaults() -> None:
+def test_api_settings_have_safe_defaults(monkeypatch) -> None:
+    clear_runtime_environment(monkeypatch)
+
     settings = Settings()
 
     assert settings.api_host == "127.0.0.1"
@@ -127,6 +135,7 @@ def test_api_settings_have_safe_defaults() -> None:
 
 
 def test_api_settings_can_be_loaded_from_qt_environment(monkeypatch) -> None:
+    clear_runtime_environment(monkeypatch)
     monkeypatch.setenv("QT_API_HOST", "0.0.0.0")
     monkeypatch.setenv("QT_API_PORT", "9000")
     monkeypatch.setenv("QT_API_ACCESS_PASSWORD", "local-dev-password")
@@ -142,3 +151,23 @@ def test_api_settings_can_be_loaded_from_qt_environment(monkeypatch) -> None:
     assert settings.api_token_secret == "local-dev-secret"
     assert settings.api_token_ttl_seconds == 120
     assert settings.service_run_on_start_when_scheduler_enabled is False
+
+
+def test_api_secret_settings_treat_empty_environment_as_unset(monkeypatch) -> None:
+    clear_runtime_environment(monkeypatch)
+    monkeypatch.setenv("QT_API_ACCESS_PASSWORD", "")
+    monkeypatch.setenv("QT_API_TOKEN_SECRET", "")
+
+    settings = Settings()
+
+    assert settings.api_access_password is None
+    assert settings.api_token_secret is None
+
+
+@pytest.mark.parametrize("raw_port", ["0", "65536"])
+def test_api_settings_reject_invalid_port_environment(monkeypatch, raw_port: str) -> None:
+    clear_runtime_environment(monkeypatch)
+    monkeypatch.setenv("QT_API_PORT", raw_port)
+
+    with pytest.raises(ValidationError):
+        load_settings()
