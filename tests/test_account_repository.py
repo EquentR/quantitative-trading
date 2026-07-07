@@ -15,6 +15,7 @@ from quantitative_trading.storage.sqlite import connect, migrate
 
 
 NOW = datetime(2026, 7, 7, 2, 0, tzinfo=UTC)
+EARLIER = datetime(2026, 7, 7, 1, 0, tzinfo=UTC)
 LATER = datetime(2026, 7, 7, 3, 0, tzinfo=UTC)
 
 
@@ -134,11 +135,11 @@ def test_save_then_latest_reads_back_snapshot_from_id_one(
     assert latest == snapshot
 
 
-def test_multiple_saves_latest_returns_last_snapshot(
+def test_multiple_saves_latest_returns_highest_id_when_created_at_is_earlier(
     repository: AccountSnapshotRepository,
 ) -> None:
     first = valued_snapshot()
-    second = valued_snapshot(created_at=LATER, total_assets=61000)
+    second = valued_snapshot(created_at=EARLIER, total_assets=61000)
 
     first_id = repository.save(
         first,
@@ -189,6 +190,49 @@ def test_save_persists_metadata_columns_as_iso_strings_and_allows_none(
     row = persisted_rows(repository)[0]
     assert row["cash_account_updated_at"] == NOW.isoformat()
     assert row["ledger_max_updated_at"] is None
+
+
+def test_save_persists_summary_columns_and_payload_in_committed_row(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+    snapshot = valued_snapshot()
+
+    with connect(settings) as connection:
+        migrate(connection)
+        saved_id = AccountSnapshotRepository(connection).save(
+            snapshot,
+            cash_account_updated_at=LATER,
+            ledger_max_updated_at=NOW,
+        )
+
+    with connect(settings) as connection:
+        row = connection.execute(
+            """
+            SELECT
+              status,
+              created_at,
+              cash_account_updated_at,
+              ledger_max_updated_at,
+              market_value,
+              total_assets,
+              total_pnl,
+              position_ratio,
+              payload_json
+            FROM account_snapshots
+            WHERE id = ?
+            """,
+            (saved_id,),
+        ).fetchone()
+
+    assert row is not None
+    assert row["status"] == snapshot.status.value
+    assert row["created_at"] == snapshot.created_at.isoformat()
+    assert row["cash_account_updated_at"] == LATER.isoformat()
+    assert row["ledger_max_updated_at"] == NOW.isoformat()
+    assert row["market_value"] == snapshot.market_value
+    assert row["total_assets"] == snapshot.total_assets
+    assert row["total_pnl"] == snapshot.total_pnl
+    assert row["position_ratio"] == snapshot.position_ratio
+    assert row["payload_json"] == snapshot.model_dump_json()
 
 
 def test_payload_json_is_internal_account_snapshot_json_without_raw_akshare_fields(
