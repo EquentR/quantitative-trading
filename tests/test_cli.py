@@ -210,6 +210,56 @@ def test_service_run_once_outputs_status_and_writes_log(tmp_path) -> None:
     assert payload["snapshot"]["warnings"] == ["cash account not initialized"]
 
 
+def test_service_run_polling_passes_interval_timezone_and_uses_snapshot_factory(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    starts = []
+    reasons = []
+    factory_statuses = []
+
+    class FakeDebugServiceRunner:
+        def __init__(self, *, snapshot_factory, account_service=None, log_dir=None) -> None:
+            assert account_service is None
+            self.snapshot_factory = snapshot_factory
+            self.log_dir = log_dir
+
+        def run_once(self, *, reason: str):
+            reasons.append(reason)
+            snapshot = self.snapshot_factory()
+            factory_statuses.append(snapshot.status.value)
+            return snapshot
+
+        def start(self, *, interval_seconds: int, timezone: str) -> None:
+            starts.append(
+                {
+                    "interval_seconds": interval_seconds,
+                    "timezone": timezone,
+                }
+            )
+            snapshot = self.snapshot_factory()
+            factory_statuses.append(snapshot.status.value)
+
+    monkeypatch.setattr(cli, "DebugServiceRunner", FakeDebugServiceRunner)
+
+    result = run_cli(
+        tmp_path,
+        "service",
+        "run",
+        env={
+            "QT_INTRADAY_INTERVAL_SECONDS": "7",
+            "QT_TIMEZONE": "Asia/Shanghai",
+        },
+    )
+
+    assert result.exit_code == 0
+    assert "debug service started status=cash_not_initialized" in result.output
+    assert "debug service polling interval=7s timezone=Asia/Shanghai" in result.output
+    assert reasons == ["startup"]
+    assert factory_statuses == ["cash_not_initialized", "cash_not_initialized"]
+    assert starts == [{"interval_seconds": 7, "timezone": "Asia/Shanghai"}]
+
+
 def test_cash_init_show_and_transfer_commands(tmp_path) -> None:
     init_result = run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
     show_result = run_cli(tmp_path, "cash", "show")

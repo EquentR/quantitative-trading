@@ -418,23 +418,27 @@ def check_service() -> None:
 @service_app.command("run", help="Run the debug foreground account snapshot service.")
 def run_service(once: Annotated[bool, typer.Option("--once")] = False) -> None:
     settings = load_settings()
-    with _service_scope() as (_, ledger_read_only, _, cash_read_only):
-        account_service = AccountService(
-            ledger=ledger_read_only,
-            cash=cash_read_only,
-            market=DisabledMarketProvider(),
-        )
-        runner = DebugServiceRunner(account_service=account_service, log_dir=settings.log_dir)
-        snapshot = runner.run_once("startup")
-        typer.echo(f"debug service started status={snapshot.status.value}")
-        if once:
-            return
-        typer.echo(
-            "debug service polling "
-            f"interval={settings.intraday_interval_seconds}s "
-            f"timezone={settings.timezone}"
-        )
-        runner.start(
-            interval_seconds=settings.intraday_interval_seconds,
-            timezone=settings.timezone,
-        )
+
+    def snapshot_factory():
+        with _service_scope() as (_, ledger_read_only, _, cash_read_only):
+            account_service = AccountService(
+                ledger=ledger_read_only,
+                cash=cash_read_only,
+                market=DisabledMarketProvider(),
+            )
+            return account_service.create_snapshot()
+
+    runner = DebugServiceRunner(snapshot_factory=snapshot_factory, log_dir=settings.log_dir)
+    snapshot = runner.run_once(reason="startup")
+    typer.echo(f"debug service started status={snapshot.status.value}")
+    if once:
+        return
+    typer.echo(
+        "debug service polling "
+        f"interval={settings.intraday_interval_seconds}s "
+        f"timezone={settings.timezone}"
+    )
+    runner.start(
+        interval_seconds=settings.intraday_interval_seconds,
+        timezone=settings.timezone,
+    )
