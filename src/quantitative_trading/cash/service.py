@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 from quantitative_trading.cash.models import CashAccount, CashTransaction, CashTransactionType
 from quantitative_trading.cash.repository import (
+    CashAccountAlreadyInitializedError,
     CashAccountNotInitializedError,
     CashAccountRepository,
 )
@@ -60,7 +61,10 @@ class CashService(ReadOnlyCashService):
     ) -> CashAccount:
         _require_positive_cash(cash)
         occurred_at = _operation_time(now)
-        return self._repository.initialize(cash, now=occurred_at, note=note)
+        try:
+            return self._repository.initialize(cash, now=occurred_at, note=note)
+        except CashAccountAlreadyInitializedError as exc:
+            raise CashTransferError("cash account already initialized") from exc
 
     def transfer_in(
         self,

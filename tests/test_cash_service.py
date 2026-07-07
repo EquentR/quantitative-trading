@@ -67,6 +67,23 @@ def test_cash_service_rejects_initialize_naive_now_without_writing(
     assert read_only.list_transactions() == []
 
 
+def test_cash_service_rejects_duplicate_initialize_without_changing_state(
+    service: CashService,
+    read_only: ReadOnlyCashService,
+) -> None:
+    original = service.initialize(50000, now=fixed_now(), note="initial principal")
+
+    with pytest.raises(CashTransferError, match="account already initialized"):
+        service.initialize(1000, now=later_now(), note="duplicate initial principal")
+
+    assert service.get_account() == original
+    transactions = read_only.list_transactions()
+    assert len(transactions) == 1
+    assert transactions[0].type is CashTransactionType.INITIAL_DEPOSIT
+    assert transactions[0].amount == 50000
+    assert transactions[0].note == "initial principal"
+
+
 def test_cash_service_transfer_in_increases_cash_and_principal(
     service: CashService,
     read_only: ReadOnlyCashService,
