@@ -10,6 +10,17 @@ from pydantic import ValidationError
 from quantitative_trading.ledger.models import Position, PositionInput
 
 
+POSITION_CSV_COLUMNS = [
+    "symbol",
+    "name",
+    "quantity",
+    "available_quantity",
+    "cost_price",
+    "opened_at",
+    "note",
+]
+
+
 class DuplicatePositionError(ValueError):
     pass
 
@@ -177,6 +188,9 @@ class PositionRepository:
         seen_symbols: dict[str, int] = {}
         with path.open(newline="", encoding="utf-8") as file:
             reader = csv.DictReader(file)
+            if reader.fieldnames != POSITION_CSV_COLUMNS:
+                expected = ",".join(POSITION_CSV_COLUMNS)
+                raise ValueError(f"CSV header must exactly match: {expected}")
             for row_number, row in enumerate(reader, start=2):
                 try:
                     position = PositionInput.model_validate(row)

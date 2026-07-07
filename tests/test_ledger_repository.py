@@ -58,6 +58,13 @@ def write_positions_csv(path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def write_csv_text(path, header: list[str], row: list[str]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(header)
+        writer.writerow(row)
+
+
 def test_repository_adds_and_gets_position(repository: PositionRepository) -> None:
     repository.add(valid_input(), now=fixed_now())
 
@@ -245,6 +252,58 @@ def test_repository_import_csv_rejects_duplicate_symbols_before_writing(
     )
 
     with pytest.raises(ValueError, match="duplicate symbol 600001.*row 3"):
+        repository.import_csv(csv_path, now=fixed_now())
+
+    positions = repository.list()
+    assert [position.symbol for position in positions] == ["600010"]
+    assert positions[0].note == "首批台账"
+
+
+@pytest.mark.parametrize(
+    ("header", "row"),
+    [
+        (
+            [
+                "symbol",
+                "name",
+                "quantity",
+                "available_quantity",
+                "cost_price",
+                "opened_at",
+                "note",
+                "extra",
+            ],
+            ["600001", "邯郸钢铁", "100", "100", "8.8", "2026-07-06", "extra header", "x"],
+        ),
+        (
+            ["symbol", "name", "quantity", "available_quantity", "cost_price", "opened_at"],
+            ["600001", "邯郸钢铁", "100", "100", "8.8", "2026-07-06"],
+        ),
+        (
+            [
+                "name",
+                "symbol",
+                "quantity",
+                "available_quantity",
+                "cost_price",
+                "opened_at",
+                "note",
+            ],
+            ["邯郸钢铁", "600001", "100", "100", "8.8", "2026-07-06", "reordered"],
+        ),
+    ],
+)
+def test_repository_import_csv_rejects_non_exact_headers_before_writing(
+    tmp_path,
+    repository: PositionRepository,
+    header: list[str],
+    row: list[str],
+) -> None:
+    repository.add(valid_input("600010"), now=fixed_now())
+    csv_path = tmp_path / "positions.csv"
+    write_csv_text(csv_path, header, row)
+
+    with pytest.raises(ValueError, match="CSV header must exactly match"):
         repository.import_csv(csv_path, now=fixed_now())
 
     positions = repository.list()

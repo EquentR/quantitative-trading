@@ -3,10 +3,11 @@ from __future__ import annotations
 import csv
 from datetime import date
 from io import StringIO
-from pathlib import Path
+from pathlib import Path as FilePath
 from tempfile import NamedTemporaryFile
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Path as ApiPath, Response, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from quantitative_trading.api.dependencies import (
@@ -20,6 +21,7 @@ from quantitative_trading.ledger.models import Position, PositionInput
 from quantitative_trading.ledger.repository import (
     DuplicatePositionError,
     MissingPositionError,
+    POSITION_CSV_COLUMNS,
     PositionRepository,
 )
 from quantitative_trading.ledger.service import LedgerService
@@ -31,15 +33,7 @@ router = APIRouter(
     dependencies=[Depends(require_token)],
 )
 
-CSV_COLUMNS = [
-    "symbol",
-    "name",
-    "quantity",
-    "available_quantity",
-    "cost_price",
-    "opened_at",
-    "note",
-]
+PositionSymbolPath = Annotated[str, ApiPath(pattern=r"^\d{6}$")]
 
 
 class ImportPositionsRequest(BaseModel):
@@ -148,7 +142,7 @@ async def import_positions_csv(
             temp_file.flush()
             with connection_scope(container.settings) as connection:
                 service = LedgerService(PositionRepository(connection))
-                return service.import_csv(Path(temp_file.name))
+                return service.import_csv(FilePath(temp_file.name))
     except ValueError as exc:
         raise _validation_error(
             "request validation failed",
@@ -163,7 +157,7 @@ def export_positions_csv(container: ApiContainer = Depends(get_container)) -> Re
         positions = service.list_positions()
 
     output = StringIO()
-    writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS, lineterminator="\n")
+    writer = csv.DictWriter(output, fieldnames=POSITION_CSV_COLUMNS, lineterminator="\n")
     writer.writeheader()
     for position in positions:
         writer.writerow(
@@ -182,7 +176,7 @@ def export_positions_csv(container: ApiContainer = Depends(get_container)) -> Re
 
 @router.get("/{symbol}", response_model=Position)
 def get_position(
-    symbol: str,
+    symbol: PositionSymbolPath,
     container: ApiContainer = Depends(get_container),
 ) -> Position:
     with connection_scope(container.settings) as connection:
@@ -195,7 +189,7 @@ def get_position(
 
 @router.put("/{symbol}", response_model=Position)
 def update_position(
-    symbol: str,
+    symbol: PositionSymbolPath,
     payload: UpdatePositionRequest,
     container: ApiContainer = Depends(get_container),
 ) -> Position:
@@ -210,7 +204,7 @@ def update_position(
 
 @router.delete("/{symbol}", status_code=204)
 def delete_position(
-    symbol: str,
+    symbol: PositionSymbolPath,
     container: ApiContainer = Depends(get_container),
 ) -> Response:
     try:

@@ -86,6 +86,17 @@ def test_position_detail_missing_returns_uniform_error(tmp_path) -> None:
     assert response.json()["error"]["code"] == "position_not_found"
 
 
+def test_get_invalid_path_symbol_returns_validation_error(tmp_path) -> None:
+    client, headers = authenticated_client(tmp_path)
+
+    response = client.get("/api/v1/positions/invalid", headers=headers)
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    assert body["error"]["details"]["errors"][0]["loc"] == ["path", "symbol"]
+
+
 def test_positions_json_import_is_atomic(tmp_path) -> None:
     client, headers = authenticated_client(tmp_path)
 
@@ -123,6 +134,23 @@ def test_positions_csv_import_and_export(tmp_path) -> None:
     assert rows[0]["cost_price"] == "10"
 
 
+def test_positions_csv_import_bad_header_returns_validation_error(tmp_path) -> None:
+    client, headers = authenticated_client(tmp_path)
+    csv_text = (
+        "symbol,name,quantity,available_quantity,cost_price,opened_at,note,extra\n"
+        "600000,浦发银行,1000,800,9.5,2026-07-06,extra header,x\n"
+    )
+
+    response = client.post(
+        "/api/v1/positions/import-csv",
+        files={"file": ("positions.csv", csv_text, "text/csv")},
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
 def test_positions_requires_authentication_after_setup(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
     client = TestClient(create_app(settings))
@@ -157,6 +185,23 @@ def test_update_path_body_symbol_mismatch_returns_validation_error(tmp_path) -> 
     assert response.json()["error"]["code"] == "validation_error"
 
 
+def test_update_invalid_path_symbol_returns_validation_error(tmp_path) -> None:
+    client, headers = authenticated_client(tmp_path)
+    update_payload = position_payload()
+    update_payload.pop("symbol")
+
+    response = client.put(
+        "/api/v1/positions/invalid",
+        json=update_payload,
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    assert body["error"]["details"]["errors"][0]["loc"] == ["path", "symbol"]
+
+
 def test_delete_missing_position_returns_not_found(tmp_path) -> None:
     client, headers = authenticated_client(tmp_path)
 
@@ -164,6 +209,17 @@ def test_delete_missing_position_returns_not_found(tmp_path) -> None:
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "position_not_found"
+
+
+def test_delete_invalid_path_symbol_returns_validation_error(tmp_path) -> None:
+    client, headers = authenticated_client(tmp_path)
+
+    response = client.delete("/api/v1/positions/invalid", headers=headers)
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    assert body["error"]["details"]["errors"][0]["loc"] == ["path", "symbol"]
 
 
 def test_positions_json_import_failure_preserves_existing_positions(tmp_path) -> None:
