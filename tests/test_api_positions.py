@@ -56,6 +56,27 @@ def test_positions_crud(tmp_path) -> None:
     assert empty_response.json() == []
 
 
+def test_update_uses_path_symbol_when_body_symbol_is_omitted(tmp_path) -> None:
+    client, headers = authenticated_client(tmp_path)
+    client.post("/api/v1/positions", json=position_payload(), headers=headers)
+    update_payload = position_payload()
+    update_payload.pop("symbol")
+    update_payload["quantity"] = 1200
+    update_payload["available_quantity"] = 900
+
+    update_response = client.put(
+        "/api/v1/positions/600000",
+        json=update_payload,
+        headers=headers,
+    )
+    detail_response = client.get("/api/v1/positions/600000", headers=headers)
+
+    assert update_response.status_code == 200
+    assert update_response.json()["symbol"] == "600000"
+    assert update_response.json()["quantity"] == 1200
+    assert detail_response.json()["available_quantity"] == 900
+
+
 def test_position_detail_missing_returns_uniform_error(tmp_path) -> None:
     client, headers = authenticated_client(tmp_path)
 
@@ -82,7 +103,7 @@ def test_positions_csv_import_and_export(tmp_path) -> None:
     client, headers = authenticated_client(tmp_path)
     csv_text = (
         "symbol,name,quantity,available_quantity,cost_price,opened_at,note\n"
-        "600000,浦发银行,1000,800,9.5,2026-07-06,first lot\n"
+        "600000,浦发银行,1000,800,10.0,2026-07-06,first lot\n"
     )
 
     import_response = client.post(
@@ -99,6 +120,7 @@ def test_positions_csv_import_and_export(tmp_path) -> None:
     rows = list(reader)
     assert rows[0]["symbol"] == "600000"
     assert rows[0]["name"] == "浦发银行"
+    assert rows[0]["cost_price"] == "10"
 
 
 def test_positions_requires_authentication_after_setup(tmp_path) -> None:

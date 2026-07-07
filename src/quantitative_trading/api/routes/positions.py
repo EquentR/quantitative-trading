@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import csv
+from datetime import date
 from io import StringIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from fastapi import APIRouter, Depends, File, Response, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from quantitative_trading.api.dependencies import (
     ApiContainer,
@@ -45,6 +46,18 @@ class ImportPositionsRequest(BaseModel):
     positions: list[PositionInput]
 
 
+class UpdatePositionRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    symbol: str | None = Field(default=None, pattern=r"^\d{6}$")
+    name: str = Field(min_length=1)
+    quantity: int = Field(ge=0)
+    available_quantity: int = Field(ge=0)
+    cost_price: float = Field(gt=0)
+    opened_at: date
+    note: str = ""
+
+
 def _position_not_found(symbol: str) -> ApiError:
     return ApiError(
         status_code=404,
@@ -61,6 +74,24 @@ def _validation_error(message: str, *, details: dict[str, object] | None = None)
         message=message,
         details=details,
     )
+
+
+def _position_input_from_update(symbol: str, payload: UpdatePositionRequest) -> PositionInput:
+    if payload.symbol is not None and symbol != payload.symbol:
+        raise _validation_error(
+            "path symbol must match body symbol",
+            details={"path_symbol": symbol, "body_symbol": payload.symbol},
+        )
+
+    data = payload.model_dump()
+    data["symbol"] = symbol
+    try:
+        return PositionInput.model_validate(data)
+    except ValidationError as exc:
+        raise _validation_error(
+            "request validation failed",
+            details={"errors": exc.errors(include_context=False)},
+        ) from exc
 
 
 @router.get("", response_model=list[Position])
@@ -141,7 +172,7 @@ def export_positions_csv(container: ApiContainer = Depends(get_container)) -> Re
                 "name": position.name,
                 "quantity": position.quantity,
                 "available_quantity": position.available_quantity,
-                "cost_price": position.cost_price,
+                "cost_price": f"{position.cost_price:g}",
                 "opened_at": position.opened_at.isoformat(),
                 "note": position.note,
             }
@@ -165,18 +196,14 @@ def get_position(
 @router.put("/{symbol}", response_model=Position)
 def update_position(
     symbol: str,
-    payload: PositionInput,
+    payload: UpdatePositionRequest,
     container: ApiContainer = Depends(get_container),
 ) -> Position:
-    if symbol != payload.symbol:
-        raise _validation_error(
-            "path symbol must match body symbol",
-            details={"path_symbol": symbol, "body_symbol": payload.symbol},
-        )
+    position = _position_input_from_update(symbol, payload)
     try:
         with connection_scope(container.settings) as connection:
             service = LedgerService(PositionRepository(connection))
-            return service.update_position(payload)
+            return service.update_position(position)
     except MissingPositionError as exc:
         raise _position_not_found(symbol) from exc
 
