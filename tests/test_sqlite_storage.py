@@ -66,6 +66,61 @@ def test_migrate_creates_positions_table(tmp_path) -> None:
     ]
 
 
+def test_migrate_creates_cash_account_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        columns = connection.execute("PRAGMA table_info(cash_account)").fetchall()
+
+    assert [column["name"] for column in columns] == [
+        "id",
+        "cash_balance",
+        "total_transfer_in",
+        "total_transfer_out",
+        "updated_at",
+    ]
+
+
+def test_migrate_creates_cash_transactions_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        columns = connection.execute("PRAGMA table_info(cash_transactions)").fetchall()
+
+    assert [column["name"] for column in columns] == [
+        "id",
+        "type",
+        "amount",
+        "cash_before",
+        "cash_after",
+        "occurred_at",
+        "note",
+    ]
+
+
+def test_migrate_creates_account_snapshots_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        columns = connection.execute("PRAGMA table_info(account_snapshots)").fetchall()
+
+    assert [column["name"] for column in columns] == [
+        "id",
+        "status",
+        "created_at",
+        "cash_account_updated_at",
+        "ledger_max_updated_at",
+        "market_value",
+        "total_assets",
+        "total_pnl",
+        "position_ratio",
+        "payload_json",
+    ]
+
+
 def test_connection_enforces_foreign_keys(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "ledger.db")
 
