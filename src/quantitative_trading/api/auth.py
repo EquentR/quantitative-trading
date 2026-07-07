@@ -76,7 +76,7 @@ class AuthService:
     def setup_password(self, password: str, *, now: datetime | None = None) -> None:
         saved_at = _aware_now(now)
         state = self._repository.get()
-        if state.password_hash is not None:
+        if state.password_hash is not None or self._startup_password is not None:
             raise AuthAlreadyConfiguredError("api password already configured")
         self._repository.save_password_hash(_hash_password(password), now=saved_at)
 

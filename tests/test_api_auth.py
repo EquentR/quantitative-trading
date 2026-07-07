@@ -29,6 +29,35 @@ def test_auth_status_reports_setup_required_without_password(tmp_path) -> None:
     assert response.json()["auth_status"] == "setup_required"
 
 
+def test_startup_password_blocks_public_setup_takeover(tmp_path) -> None:
+    settings = Settings(
+        database_path=tmp_path / "api.db",
+        api_access_password="startup-password",
+    )
+    client = TestClient(create_app(settings))
+
+    status_response = client.get("/api/v1/service/status")
+    setup_response = client.post(
+        "/api/v1/auth/setup-password",
+        json={"password": "attacker-password"},
+    )
+    startup_login_response = client.post(
+        "/api/v1/auth/login",
+        json={"password": "startup-password"},
+    )
+    attacker_login_response = client.post(
+        "/api/v1/auth/login",
+        json={"password": "attacker-password"},
+    )
+
+    assert status_response.status_code == 200
+    assert status_response.json()["auth_status"] == "configured"
+    assert setup_response.status_code == 409
+    assert setup_response.json()["error"]["code"] == "auth_already_configured"
+    assert startup_login_response.status_code == 200
+    assert attacker_login_response.status_code == 401
+
+
 def test_setup_password_then_login_and_me(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "api.db")
     client = TestClient(create_app(settings))
@@ -294,18 +323,35 @@ def test_auth_service_stored_password_takes_precedence_over_startup_password(tmp
     with connect(settings) as connection:
         migrate(connection)
         repository = ApiAuthRepository(connection)
+        AuthService(
+            repository,
+            token_ttl_seconds=3600,
+        ).setup_password("stored-password", now=NOW)
         service = AuthService(
             repository,
             token_ttl_seconds=3600,
             startup_password="startup-password",
         )
-        service.setup_password("stored-password", now=NOW)
 
         with pytest.raises(InvalidCredentialsError):
             service.login("startup-password", now=NOW)
         login = service.login("stored-password", now=NOW)
 
     assert login.token_type == "bearer"
+
+
+def test_auth_service_startup_password_blocks_anonymous_setup(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuthService(
+            ApiAuthRepository(connection),
+            token_ttl_seconds=3600,
+            startup_password="startup-password",
+        )
+
+        with pytest.raises(AuthAlreadyConfiguredError):
+            service.setup_password("attacker-password", now=NOW)
 
 
 def test_auth_service_login_uses_startup_password_before_setup(tmp_path) -> None:

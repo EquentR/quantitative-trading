@@ -54,6 +54,13 @@ class RaisingMarketProvider:
         raise RuntimeError("akshare timeout")
 
 
+class SensitiveRaisingMarketProvider:
+    def get_quotes(self, symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
+        raise RuntimeError(
+            "fetch failed token=supersecret Authorization: Bearer abc path=/tmp/private.db"
+        )
+
+
 def cash_account(
     *,
     cash_balance: float = 50000,
@@ -323,6 +330,23 @@ def test_market_provider_exception_returns_market_data_unavailable_snapshot() ->
     ]
     assert all("market data provider failed: akshare timeout" == valuation.warning for valuation in snapshot.positions)
     assert any("akshare timeout" in warning for warning in snapshot.warnings)
+
+
+def test_market_provider_exception_warning_redacts_sensitive_values() -> None:
+    snapshot = service(
+        account=cash_account(),
+        positions=[position()],
+        market=SensitiveRaisingMarketProvider(),
+    ).create_snapshot()
+
+    warnings = [*snapshot.warnings, snapshot.positions[0].warning or ""]
+
+    assert snapshot.status is AccountSnapshotStatus.MARKET_DATA_UNAVAILABLE
+    assert all("market data provider failed" in warning for warning in warnings)
+    assert all("fetch failed" in warning for warning in warnings)
+    assert all("supersecret" not in warning for warning in warnings)
+    assert all("Bearer abc" not in warning for warning in warnings)
+    assert all("/tmp/private.db" not in warning for warning in warnings)
 
 
 def test_partial_quote_with_warning_is_still_valued() -> None:

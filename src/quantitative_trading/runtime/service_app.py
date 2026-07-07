@@ -6,10 +6,10 @@ import logging
 import uvicorn
 
 from quantitative_trading.api.app import create_app
-from quantitative_trading.api.routes.service import _safe_error_summary
 from quantitative_trading.config import Settings
 from quantitative_trading.runtime.account_snapshot_job import create_and_save_account_snapshot
 from quantitative_trading.runtime.scheduler import SchedulerManager
+from quantitative_trading.sanitization import safe_error_summary
 from quantitative_trading.storage.scheduler_state import SchedulerState
 from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
 from quantitative_trading.storage.sqlite import connect, migrate
@@ -29,7 +29,7 @@ def run_api_service(settings: Settings) -> None:
             snapshot_id = created.snapshot_id
         except Exception as exc:
             status = "failed"
-            error = _safe_error_summary(exc)
+            error = safe_error_summary(exc)
 
         finished_at = datetime.now(UTC)
         try:
@@ -47,7 +47,7 @@ def run_api_service(settings: Settings) -> None:
                 raise
             LOGGER.warning(
                 "startup scheduler result was not recorded: %s",
-                _safe_error_summary(exc),
+                safe_error_summary(exc),
             )
 
     state = _restore_scheduler_state_from_settings(settings)

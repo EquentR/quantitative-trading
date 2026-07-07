@@ -15,6 +15,7 @@ from quantitative_trading.ledger.models import Position
 from quantitative_trading.ledger.service import ReadOnlyLedgerService
 from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
 from quantitative_trading.market.providers import MarketDataProvider
+from quantitative_trading.sanitization import safe_error_summary
 
 
 class AccountService:
@@ -149,7 +150,7 @@ class AccountService:
         created_at: datetime,
         exc: Exception,
     ) -> AccountSnapshot:
-        warning = f"market data provider failed: {exc}"
+        warning = f"market data provider failed: {safe_error_summary(exc)}"
         valuations = [
             self._unavailable_position(
                 position,

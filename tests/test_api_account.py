@@ -35,6 +35,16 @@ class RaisingMarketProvider:
         raise RuntimeError("fake provider unavailable")
 
 
+class SensitiveRaisingMarketProvider:
+    calls: list[list[str]] = []
+
+    def get_quotes(self, symbols):
+        self.calls.append(list(symbols))
+        raise RuntimeError(
+            "fetch failed token=supersecret Authorization: Bearer abc path=/tmp/private.db"
+        )
+
+
 def authenticated_client(tmp_path, monkeypatch) -> tuple[TestClient, dict[str, str]]:
     import quantitative_trading.api.routes.account as account_routes
 
@@ -163,6 +173,45 @@ def test_market_provider_failure_persists_unavailable_snapshot(tmp_path, monkeyp
     assert latest_response.status_code == 200
     assert latest_response.json()["status"] == "market_data_unavailable"
     assert RaisingMarketProvider.calls == [["600000"]]
+
+
+def test_market_provider_failure_warnings_are_sanitized_in_persisted_snapshot(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.api.routes.account as account_routes
+
+    monkeypatch.setattr(
+        account_routes,
+        "market_provider_from_settings",
+        lambda settings: SensitiveRaisingMarketProvider(),
+    )
+    SensitiveRaisingMarketProvider.calls = []
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=True)
+    client = TestClient(create_app(settings))
+    client.post("/api/v1/auth/setup-password", json={"password": "local-password"})
+    login = client.post("/api/v1/auth/login", json={"password": "local-password"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    seed_cash_and_position(client, headers)
+
+    create_response = client.post("/api/v1/account/snapshots", headers=headers)
+    latest_response = client.get("/api/v1/account/snapshots/latest", headers=headers)
+
+    assert create_response.status_code == 201
+    assert latest_response.status_code == 200
+    assert create_response.json()["snapshot"]["status"] == "market_data_unavailable"
+    assert latest_response.json()["status"] == "market_data_unavailable"
+    assert "market data provider failed" in create_response.json()["snapshot"]["warnings"][0]
+    assert "fetch failed" in create_response.json()["snapshot"]["warnings"][0]
+    assert "market data provider failed" in latest_response.json()["warnings"][0]
+    assert "fetch failed" in latest_response.json()["warnings"][0]
+    assert "supersecret" not in create_response.text
+    assert "Bearer abc" not in create_response.text
+    assert "/tmp/private.db" not in create_response.text
+    assert "supersecret" not in latest_response.text
+    assert "Bearer abc" not in latest_response.text
+    assert "/tmp/private.db" not in latest_response.text
+    assert SensitiveRaisingMarketProvider.calls == [["600000"]]
 
 
 def test_unsupported_market_provider_returns_uniform_validation_error(tmp_path) -> None:

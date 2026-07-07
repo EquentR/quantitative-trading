@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import sqlite3
 from datetime import UTC, datetime
 
@@ -17,14 +16,11 @@ from quantitative_trading.api.dependencies import (
 )
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.runtime.account_snapshot_job import create_and_save_account_snapshot
+from quantitative_trading.sanitization import safe_error_summary as _safe_error_summary
 from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
 
 
 router = APIRouter(prefix="/service", tags=["service"])
-_SENSITIVE_ERROR_KEY = (
-    r"(?:[A-Za-z0-9]+[_-])*(?:token|password|secret|cookie|api[_-]?key|apikey)"
-    r"(?:[_-][A-Za-z0-9]+)*"
-)
 
 
 @router.get("/status")
@@ -192,42 +188,6 @@ def _scheduler_next_run_time(scheduler: object | None) -> object | None:
     if callable(value):
         value = value()
     return value
-
-
-def _safe_error_summary(exc: Exception) -> str:
-    summary = str(exc).strip() or exc.__class__.__name__
-    summary = re.sub(
-        r"(?i)\bAuthorization\s*:\s*Bearer\s+[^\s,;]+",
-        "Authorization: Bearer [redacted]",
-        summary,
-    )
-    summary = re.sub(
-        r"(?i)\b([a-z][a-z0-9+.-]*://)([^/\s:@]+):([^@\s/]+)@",
-        r"\1[redacted]@",
-        summary,
-    )
-    summary = re.sub(
-        rf"(?i)([?&](?:{_SENSITIVE_ERROR_KEY})=)[^&#\s]+",
-        r"\1[redacted]",
-        summary,
-    )
-    summary = re.sub(
-        rf"(?i)\b({_SENSITIVE_ERROR_KEY})\b\s*=\s*[^\s,;&]+",
-        r"\1=[redacted]",
-        summary,
-    )
-    summary = re.sub(
-        rf"(?i)\b({_SENSITIVE_ERROR_KEY})\b\s*:\s*[^\s,;&]+",
-        r"\1: [redacted]",
-        summary,
-    )
-    summary = re.sub(
-        rf"(?i)\b({_SENSITIVE_ERROR_KEY})\b\s+(?!\[redacted\])[^\s,;&]+",
-        r"\1 [redacted]",
-        summary,
-    )
-    summary = re.sub(r"(?<!\w)/(?:[^/\s]+/)*[^/\s]+", "[path]", summary)
-    return summary[:300]
 
 
 def _scheduler_control_failed() -> ApiError:
