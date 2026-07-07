@@ -13,11 +13,13 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+  "pandas>=2,<3",
   "pytest>=8,<9",
 ]
 
 [project.optional-dependencies]
 dev = [
+  "pandas>=2,<3",
   "pytest>=8,<9",
 ]
 
