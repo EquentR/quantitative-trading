@@ -139,6 +139,45 @@ def test_auth_service_rejects_expired_token(tmp_path) -> None:
             service.verify_token(login.access_token, now=NOW + timedelta(seconds=61))
 
 
+def test_auth_service_stored_password_takes_precedence_over_startup_password(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = ApiAuthRepository(connection)
+        service = AuthService(
+            repository,
+            token_ttl_seconds=3600,
+            startup_password="startup-password",
+        )
+        service.setup_password("stored-password", now=NOW)
+
+        with pytest.raises(InvalidCredentialsError):
+            service.login("startup-password", now=NOW)
+
+
+def test_auth_service_configured_token_secret_is_idempotent(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "auth.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = ApiAuthRepository(connection)
+
+        AuthService(
+            repository,
+            token_ttl_seconds=3600,
+            configured_token_secret="configured-secret",
+        )
+        initial = repository.get()
+        AuthService(
+            repository,
+            token_ttl_seconds=3600,
+            configured_token_secret="configured-secret",
+        )
+        loaded = repository.get()
+
+    assert loaded.token_secret == "configured-secret"
+    assert loaded.updated_at == initial.updated_at
+
+
 def test_auth_service_setup_stores_password_hash_not_plaintext(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "auth.db")
     with connect(settings) as connection:

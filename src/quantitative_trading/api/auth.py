@@ -59,7 +59,9 @@ class AuthService:
         self._repository = repository
         self._token_ttl_seconds = token_ttl_seconds
         self._startup_password = startup_password
-        if configured_token_secret is not None:
+        state = self._repository.get()
+        if configured_token_secret is not None and state.token_secret != configured_token_secret:
+            # 配置 secret 只用于启动期同步；值未变化时不写库，避免按请求构造 service 刷新状态时间。
             self._repository.save_token_secret(
                 configured_token_secret,
                 now=datetime.now(UTC),
@@ -85,6 +87,7 @@ class AuthService:
             raise AuthSetupRequiredError("api password setup required")
 
         if state.password_hash is not None:
+            # 一旦用户设置了持久化密码，启动密码只保留为首次 setup 前的引导口令。
             password_is_valid = _verify_password(password, state.password_hash)
         else:
             password_is_valid = hmac.compare_digest(password, self._startup_password or "")
