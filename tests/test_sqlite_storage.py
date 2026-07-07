@@ -105,6 +105,40 @@ def insert_cash_transaction(
     )
 
 
+def insert_account_snapshot(
+    connection: sqlite3.Connection,
+    omitted: set[str] | None = None,
+    **overrides: object,
+) -> None:
+    data = {
+        "status": "ok",
+        "created_at": "2026-07-07T15:05:00+08:00",
+        "cash_account_updated_at": "2026-07-07T09:00:00+08:00",
+        "ledger_max_updated_at": "2026-07-07T15:00:00+08:00",
+        "market_value": 25000.0,
+        "total_assets": 75000.0,
+        "total_pnl": 1000.0,
+        "position_ratio": 0.33,
+        "payload_json": "{}",
+    }
+    data.update(overrides)
+    for field in omitted or set():
+        data.pop(field)
+
+    columns = list(data)
+    placeholders = [f":{column}" for column in columns]
+    connection.execute(
+        f"""
+        INSERT INTO account_snapshots (
+          {", ".join(columns)}
+        ) VALUES (
+          {", ".join(placeholders)}
+        )
+        """,
+        data,
+    )
+
+
 @pytest.mark.parametrize(
     ("table_name", "expected_columns"),
     [
@@ -305,6 +339,27 @@ def test_cash_transactions_reject_non_positive_amount(
             insert_cash_transaction(connection, amount=amount)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cash_before", -1.0),
+        ("cash_after", -1.0),
+    ],
+)
+def test_cash_transactions_reject_negative_balances(
+    tmp_path,
+    field: str,
+    value: float,
+) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_cash_transaction(connection, **{field: value})
+
+
 def test_cash_transactions_default_note_to_empty_string(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "account.db")
 
@@ -318,3 +373,47 @@ def test_cash_transactions_default_note_to_empty_string(tmp_path) -> None:
         ).fetchone()
 
     assert row["note"] == ""
+
+
+@pytest.mark.parametrize("field", ["status", "created_at", "payload_json"])
+def test_account_snapshots_reject_missing_required_fields(
+    tmp_path,
+    field: str,
+) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_account_snapshot(connection, omitted={field})
+
+
+@pytest.mark.parametrize("field", ["status", "created_at", "payload_json"])
+def test_account_snapshots_reject_null_required_fields(
+    tmp_path,
+    field: str,
+) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_account_snapshot(connection, **{field: None})
+
+
+def test_account_snapshots_accept_valid_snapshot(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        insert_account_snapshot(connection)
+
+        row = connection.execute(
+            "SELECT status, payload_json FROM account_snapshots WHERE id = ?",
+            (1,),
+        ).fetchone()
+
+    assert row["status"] == "ok"
+    assert row["payload_json"] == "{}"
