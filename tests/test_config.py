@@ -113,3 +113,32 @@ def test_load_settings_rejects_non_positive_interval_environment(monkeypatch) ->
 
     with pytest.raises(ValidationError):
         load_settings()
+
+
+def test_api_settings_have_safe_defaults() -> None:
+    settings = Settings()
+
+    assert settings.api_host == "127.0.0.1"
+    assert settings.api_port == 8000
+    assert settings.api_access_password is None
+    assert settings.api_token_secret is None
+    assert settings.api_token_ttl_seconds == 3600
+    assert settings.service_run_on_start_when_scheduler_enabled is True
+
+
+def test_api_settings_can_be_loaded_from_qt_environment(monkeypatch) -> None:
+    monkeypatch.setenv("QT_API_HOST", "0.0.0.0")
+    monkeypatch.setenv("QT_API_PORT", "9000")
+    monkeypatch.setenv("QT_API_ACCESS_PASSWORD", "local-dev-password")
+    monkeypatch.setenv("QT_API_TOKEN_SECRET", "local-dev-secret")
+    monkeypatch.setenv("QT_API_TOKEN_TTL_SECONDS", "120")
+    monkeypatch.setenv("QT_SERVICE_RUN_ON_START_WHEN_SCHEDULER_ENABLED", "false")
+
+    settings = Settings()
+
+    assert settings.api_host == "0.0.0.0"
+    assert settings.api_port == 9000
+    assert settings.api_access_password == "local-dev-password"
+    assert settings.api_token_secret == "local-dev-secret"
+    assert settings.api_token_ttl_seconds == 120
+    assert settings.service_run_on_start_when_scheduler_enabled is False
