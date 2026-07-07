@@ -46,11 +46,12 @@ def run_api_service(settings: Settings) -> None:
             if not suppress_record_errors:
                 raise
             LOGGER.warning(
-                "startup scheduler result was not recorded: %s",
+                "startup scheduler result was not recorded for snapshot_id=%s: %s",
+                snapshot_id,
                 safe_error_summary(exc),
             )
 
-    state = _restore_scheduler_state_from_settings(settings)
+    state = _sync_scheduler_config_to_state(settings)
 
     scheduler = SchedulerManager(
         interval_seconds=settings.intraday_interval_seconds,
@@ -64,7 +65,7 @@ def run_api_service(settings: Settings) -> None:
     uvicorn.run(app, host=settings.api_host, port=settings.api_port)
 
 
-def _restore_scheduler_state_from_settings(settings: Settings) -> SchedulerState:
+def _sync_scheduler_config_to_state(settings: Settings) -> SchedulerState:
     now = datetime.now(UTC)
     with connect(settings) as connection:
         migrate(connection)

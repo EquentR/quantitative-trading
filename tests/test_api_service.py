@@ -592,6 +592,7 @@ def test_run_api_service_starts_http_when_startup_result_get_or_create_fails(
         FailingStartupGetOrCreateSchedulerStateRepository.get_or_create_calls == 2
     )
     assert "startup scheduler result was not recorded" in caplog.text
+    assert "snapshot_id=42" in caplog.text
     assert "/tmp/private" not in caplog.text
     assert "secret" not in caplog.text
 
