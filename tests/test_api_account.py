@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
@@ -162,3 +163,74 @@ def test_market_provider_failure_persists_unavailable_snapshot(tmp_path, monkeyp
     assert latest_response.status_code == 200
     assert latest_response.json()["status"] == "market_data_unavailable"
     assert RaisingMarketProvider.calls == [["600000"]]
+
+
+def test_unsupported_market_provider_returns_uniform_validation_error(tmp_path) -> None:
+    settings = Settings(
+        database_path=tmp_path / "api.db",
+        enable_market_fetch=True,
+        market_provider="bad",
+    )
+    client = TestClient(create_app(settings))
+    client.post("/api/v1/auth/setup-password", json={"password": "local-password"})
+    login = client.post("/api/v1/auth/login", json={"password": "local-password"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    response = client.post("/api/v1/account/snapshots", headers=headers)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert response.json()["error"]["message"] == "unsupported market provider"
+    assert response.json()["error"]["details"] == {"market_provider": "bad"}
+
+
+def test_latest_snapshot_storage_error_returns_uniform_internal_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.api.routes.account as account_routes
+
+    class BrokenSnapshotRepository:
+        def __init__(self, connection) -> None:
+            pass
+
+        def latest(self):
+            raise sqlite3.OperationalError("database disk image is malformed")
+
+    monkeypatch.setattr(
+        account_routes,
+        "AccountSnapshotRepository",
+        BrokenSnapshotRepository,
+    )
+    client, headers = authenticated_client(tmp_path, monkeypatch)
+
+    response = client.get("/api/v1/account/snapshots/latest", headers=headers)
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert response.json()["error"]["message"] == "account snapshot storage failed"
+    assert "database disk image" not in response.text
+
+
+def test_create_snapshot_storage_error_returns_uniform_internal_error(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.api.routes.account as account_routes
+
+    def failing_create_snapshot(settings, *, market_provider_factory):
+        raise sqlite3.OperationalError("database is locked: /tmp/private.db")
+
+    monkeypatch.setattr(
+        account_routes,
+        "create_and_save_account_snapshot",
+        failing_create_snapshot,
+    )
+    client, headers = authenticated_client(tmp_path, monkeypatch)
+
+    response = client.post("/api/v1/account/snapshots", headers=headers)
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert response.json()["error"]["message"] == "account snapshot storage failed"
+    assert "/tmp/private.db" not in response.text

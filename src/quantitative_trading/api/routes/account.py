@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from quantitative_trading.account.models import AccountSnapshot
 from quantitative_trading.account.repository import AccountSnapshotRepository
@@ -15,7 +16,9 @@ from quantitative_trading.api.dependencies import (
 )
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.runtime.account_snapshot_job import (
+    AccountSnapshotStorageError,
     CreatedSnapshot,
+    UnsupportedMarketProviderError,
     create_and_save_account_snapshot,
     market_provider_from_settings,
 )
@@ -41,6 +44,23 @@ def _snapshot_not_found() -> ApiError:
     )
 
 
+def _snapshot_storage_failed() -> ApiError:
+    return ApiError(
+        status_code=500,
+        code="internal_error",
+        message="account snapshot storage failed",
+    )
+
+
+def _unsupported_market_provider(exc: UnsupportedMarketProviderError) -> ApiError:
+    return ApiError(
+        status_code=422,
+        code="validation_error",
+        message="unsupported market provider",
+        details={"market_provider": exc.provider},
+    )
+
+
 def _created_snapshot_response(created: CreatedSnapshot) -> CreatedSnapshotResponse:
     return CreatedSnapshotResponse(
         snapshot_id=created.snapshot_id,
@@ -49,12 +69,25 @@ def _created_snapshot_response(created: CreatedSnapshot) -> CreatedSnapshotRespo
 
 
 def _create_snapshot(container: ApiContainer) -> CreatedSnapshotResponse:
-    return _created_snapshot_response(
-        create_and_save_account_snapshot(
-            container.settings,
-            market_provider_factory=market_provider_from_settings,
+    try:
+        return _created_snapshot_response(
+            create_and_save_account_snapshot(
+                container.settings,
+                market_provider_factory=market_provider_from_settings,
+            )
         )
-    )
+    except UnsupportedMarketProviderError as exc:
+        raise _unsupported_market_provider(exc) from exc
+    except (AccountSnapshotStorageError, sqlite3.Error, ValidationError) as exc:
+        raise _snapshot_storage_failed() from exc
+
+
+def _latest_snapshot(container: ApiContainer) -> AccountSnapshot | None:
+    try:
+        with connection_scope(container.settings) as connection:
+            return AccountSnapshotRepository(connection).latest()
+    except (sqlite3.Error, ValidationError) as exc:
+        raise _snapshot_storage_failed() from exc
 
 
 @router.get("/snapshot", response_model=AccountSnapshot | CreatedSnapshotResponse)
@@ -65,9 +98,7 @@ def get_account_snapshot(
     if fresh:
         return _create_snapshot(container)
 
-    with connection_scope(container.settings) as connection:
-        snapshot = AccountSnapshotRepository(connection).latest()
-
+    snapshot = _latest_snapshot(container)
     if snapshot is None:
         raise _snapshot_not_found()
     return snapshot
@@ -84,9 +115,7 @@ def create_account_snapshot(
 def get_latest_account_snapshot(
     container: ApiContainer = Depends(get_container),
 ) -> AccountSnapshot:
-    with connection_scope(container.settings) as connection:
-        snapshot = AccountSnapshotRepository(connection).latest()
-
+    snapshot = _latest_snapshot(container)
     if snapshot is None:
         raise _snapshot_not_found()
     return snapshot
