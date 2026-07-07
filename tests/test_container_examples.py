@@ -1,6 +1,17 @@
 from pathlib import Path
 
 
+def parse_env_example() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in Path(".env.example").read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, value = stripped.split("=", maxsplit=1)
+        values[key] = value
+    return values
+
+
 def test_dockerfile_installs_project_and_uses_qt_entrypoint() -> None:
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
 
@@ -38,9 +49,10 @@ def test_bash_backend_script_bootstraps_environment_and_runs_service_check() -> 
 
 def test_env_example_contains_api_placeholders_only() -> None:
     text = Path(".env.example").read_text(encoding="utf-8")
+    values = parse_env_example()
 
-    assert "QT_API_HOST=127.0.0.1" in text
-    assert "QT_API_ACCESS_PASSWORD=" in text
-    assert "QT_API_TOKEN_SECRET=" in text
+    assert values["QT_API_HOST"] == "127.0.0.1"
+    assert values["QT_API_ACCESS_PASSWORD"] == ""
+    assert values["QT_API_TOKEN_SECRET"] == ""
     assert "QT_SERVICE_RUN_ON_START_WHEN_SCHEDULER_ENABLED=true" in text
     assert "local-password" not in text

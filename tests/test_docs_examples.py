@@ -54,9 +54,24 @@ def test_api_docs_document_auth_and_error_contract() -> None:
 
     assert "POST /api/v1/auth/setup-password" in text
     assert "POST /api/v1/auth/login" in text
+    assert (
+        "`GET /api/v1/service/status` 未携带令牌时只返回 "
+        '`{"auth_status": "setup_required"}` 或 `{"auth_status": "configured"}`'
+    ) in text
+    assert "`POST /api/v1/auth/login` 在密码未设置前返回 `auth_setup_required`" in text
+    assert "`GET /api/v1/auth/me` 必须携带 `Authorization: Bearer <access_token>`" in text
+    assert "缺失、格式错误或无效 token 均返回 `unauthorized`" in text
+    assert "`POST /api/v1/auth/logout` 不做服务端 token 撤销" in text
+    assert "客户端应丢弃本地 token" in text
     assert '"error"' in text
     assert "auth_setup_required" in text
     assert "Authorization: Bearer" in text
+    assert "GET /api/v1/account/snapshot?fresh=true" in text
+    assert "生成并保存新的账户快照" in text
+    assert (
+        "业务接口不可用，并返回 `auth_status=setup_required` 或统一错误码 "
+        "`auth_setup_required`"
+    ) not in text
 
 
 def test_project_docs_mention_http_api_without_frontend_scope() -> None:
