@@ -24,6 +24,7 @@ from quantitative_trading.ledger.repository import (
 )
 from quantitative_trading.ledger.service import LedgerService, ReadOnlyLedgerService
 from quantitative_trading.market.providers import DisabledMarketProvider
+from quantitative_trading.runtime.service_runner import DebugServiceRunner
 from quantitative_trading.storage.sqlite import connect, migrate
 
 
@@ -412,3 +413,28 @@ def check_service() -> None:
         positions = [] if read_only is None else read_only.list_positions()
         typer.echo("服务检查通过")
         typer.echo(f"当前持仓数量: {len(positions)}")
+
+
+@service_app.command("run", help="Run the debug foreground account snapshot service.")
+def run_service(once: Annotated[bool, typer.Option("--once")] = False) -> None:
+    settings = load_settings()
+    with _service_scope() as (_, ledger_read_only, _, cash_read_only):
+        account_service = AccountService(
+            ledger=ledger_read_only,
+            cash=cash_read_only,
+            market=DisabledMarketProvider(),
+        )
+        runner = DebugServiceRunner(account_service=account_service, log_dir=settings.log_dir)
+        snapshot = runner.run_once("startup")
+        typer.echo(f"debug service started status={snapshot.status.value}")
+        if once:
+            return
+        typer.echo(
+            "debug service polling "
+            f"interval={settings.intraday_interval_seconds}s "
+            f"timezone={settings.timezone}"
+        )
+        runner.start(
+            interval_seconds=settings.intraday_interval_seconds,
+            timezone=settings.timezone,
+        )

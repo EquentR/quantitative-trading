@@ -12,9 +12,12 @@ from quantitative_trading.cli import app
 runner = CliRunner()
 
 
-def run_cli(tmp_path: Path, *args: str):
+def run_cli(tmp_path: Path, *args: str, env: dict[str, str] | None = None):
     db_path = tmp_path / "ledger.db"
-    return runner.invoke(app, [*args], env={"QT_DATABASE_PATH": str(db_path)})
+    cli_env = {"QT_DATABASE_PATH": str(db_path)}
+    if env is not None:
+        cli_env.update(env)
+    return runner.invoke(app, [*args], env=cli_env)
 
 
 def test_ledger_add_and_list(tmp_path) -> None:
@@ -178,6 +181,33 @@ def test_service_check_reads_existing_ledger_without_writing(tmp_path) -> None:
     assert result.exit_code == 0
     assert "服务检查通过" in result.output
     assert "当前持仓数量: 1" in result.output
+
+
+def test_service_run_command_is_registered(tmp_path) -> None:
+    result = run_cli(tmp_path, "service", "run", "--help")
+
+    assert result.exit_code == 0
+    assert "debug" in result.output.lower()
+
+
+def test_service_run_once_outputs_status_and_writes_log(tmp_path) -> None:
+    log_dir = tmp_path / "logs"
+
+    result = run_cli(
+        tmp_path,
+        "service",
+        "run",
+        "--once",
+        env={"QT_LOG_DIR": str(log_dir)},
+    )
+
+    assert result.exit_code == 0
+    assert "status=cash_not_initialized" in result.output
+    log_path = log_dir / "account-snapshots.jsonl"
+    payload = json.loads(log_path.read_text(encoding="utf-8"))
+    assert payload["reason"] == "startup"
+    assert payload["snapshot"]["status"] == "cash_not_initialized"
+    assert payload["snapshot"]["warnings"] == ["cash account not initialized"]
 
 
 def test_cash_init_show_and_transfer_commands(tmp_path) -> None:
