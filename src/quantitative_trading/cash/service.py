@@ -17,6 +17,23 @@ def current_time() -> datetime:
     return datetime.now(UTC)
 
 
+def _operation_time(now: datetime | None) -> datetime:
+    value = now or current_time()
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise CashTransferError("now must be timezone-aware")
+    return value
+
+
+def _require_positive_amount(amount: float) -> None:
+    if amount <= 0:
+        raise CashTransferError("amount must be positive")
+
+
+def _require_non_negative_cash(cash: float) -> None:
+    if cash < 0:
+        raise CashTransferError("cash must be non-negative")
+
+
 class ReadOnlyCashService:
     def __init__(self, repository: CashAccountRepository) -> None:
         self._repository = repository
@@ -46,6 +63,8 @@ class CashService(ReadOnlyCashService):
         note: str = "",
     ) -> CashAccount:
         account = self._require_account()
+        _require_positive_amount(amount)
+        occurred_at = _operation_time(now)
         cash_after = account.cash_balance + amount
         return self._repository.save_state_with_transaction(
             cash_balance=cash_after,
@@ -55,7 +74,7 @@ class CashService(ReadOnlyCashService):
             amount=amount,
             cash_before=account.cash_balance,
             cash_after=cash_after,
-            now=now or current_time(),
+            now=occurred_at,
             note=note,
         )
 
@@ -67,11 +86,13 @@ class CashService(ReadOnlyCashService):
         note: str = "",
     ) -> CashAccount:
         account = self._require_account()
+        _require_positive_amount(amount)
         if amount > account.cash_balance:
             raise CashTransferError("transfer-out amount cannot exceed cash balance")
         if amount > account.net_principal:
             raise CashTransferError("transfer-out amount cannot exceed net principal")
 
+        occurred_at = _operation_time(now)
         cash_after = account.cash_balance - amount
         return self._repository.save_state_with_transaction(
             cash_balance=cash_after,
@@ -81,7 +102,7 @@ class CashService(ReadOnlyCashService):
             amount=amount,
             cash_before=account.cash_balance,
             cash_after=cash_after,
-            now=now or current_time(),
+            now=occurred_at,
             note=note,
         )
 
@@ -92,14 +113,16 @@ class CashService(ReadOnlyCashService):
         now: datetime | None = None,
         note: str,
     ) -> CashAccount:
+        account = self._require_account()
+        _require_non_negative_cash(cash)
         if not note.strip():
             raise CashTransferError("cash adjustment note is required")
 
-        account = self._require_account()
         amount = abs(cash - account.cash_balance)
         if amount == 0:
             raise CashTransferError("cash adjustment must change cash balance")
 
+        occurred_at = _operation_time(now)
         return self._repository.save_state_with_transaction(
             cash_balance=cash,
             total_transfer_in=account.total_transfer_in,
@@ -108,7 +131,7 @@ class CashService(ReadOnlyCashService):
             amount=amount,
             cash_before=account.cash_balance,
             cash_after=cash,
-            now=now or current_time(),
+            now=occurred_at,
             note=note,
         )
 

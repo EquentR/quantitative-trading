@@ -39,6 +39,10 @@ def later_now() -> datetime:
     return datetime(2026, 7, 7, 10, 0, tzinfo=UTC)
 
 
+def naive_now() -> datetime:
+    return datetime(2026, 7, 7, 10, 0)
+
+
 def test_cash_service_transfer_in_increases_cash_and_principal(
     service: CashService,
     read_only: ReadOnlyCashService,
@@ -59,6 +63,34 @@ def test_cash_service_transfer_in_increases_cash_and_principal(
     assert transactions[-1].note == "bank transfer in"
 
 
+@pytest.mark.parametrize("amount", [0, -1])
+def test_cash_service_rejects_non_positive_transfer_in_amount(
+    service: CashService,
+    read_only: ReadOnlyCashService,
+    amount: float,
+) -> None:
+    original = service.initialize(50000, now=fixed_now(), note="initial principal")
+
+    with pytest.raises(CashTransferError, match="amount must be positive"):
+        service.transfer_in(amount, now=later_now(), note="bad transfer in")
+
+    assert service.get_account() == original
+    assert len(read_only.list_transactions()) == 1
+
+
+def test_cash_service_rejects_transfer_in_naive_now(
+    service: CashService,
+    read_only: ReadOnlyCashService,
+) -> None:
+    original = service.initialize(50000, now=fixed_now(), note="initial principal")
+
+    with pytest.raises(CashTransferError, match="now must be timezone-aware"):
+        service.transfer_in(1000, now=naive_now(), note="bank transfer in")
+
+    assert service.get_account() == original
+    assert len(read_only.list_transactions()) == 1
+
+
 def test_cash_service_transfer_out_decreases_cash_and_principal(
     service: CashService,
     read_only: ReadOnlyCashService,
@@ -77,6 +109,21 @@ def test_cash_service_transfer_out_decreases_cash_and_principal(
     assert transactions[-1].cash_before == 50000
     assert transactions[-1].cash_after == 45000
     assert transactions[-1].note == "bank transfer out"
+
+
+@pytest.mark.parametrize("amount", [0, -1])
+def test_cash_service_rejects_non_positive_transfer_out_amount(
+    service: CashService,
+    read_only: ReadOnlyCashService,
+    amount: float,
+) -> None:
+    original = service.initialize(50000, now=fixed_now(), note="initial principal")
+
+    with pytest.raises(CashTransferError, match="amount must be positive"):
+        service.transfer_out(amount, now=later_now(), note="bad transfer out")
+
+    assert service.get_account() == original
+    assert len(read_only.list_transactions()) == 1
 
 
 def test_cash_service_rejects_transfer_out_above_cash(
@@ -126,6 +173,19 @@ def test_cash_service_adjust_changes_only_cash(
     assert transactions[-1].note == "manual broker correction"
 
 
+def test_cash_service_rejects_negative_adjustment_cash(
+    service: CashService,
+    read_only: ReadOnlyCashService,
+) -> None:
+    original = service.initialize(50000, now=fixed_now(), note="initial principal")
+
+    with pytest.raises(CashTransferError, match="cash must be non-negative"):
+        service.adjust_cash(-1, now=later_now(), note="manual broker correction")
+
+    assert service.get_account() == original
+    assert len(read_only.list_transactions()) == 1
+
+
 @pytest.mark.parametrize("note", ["", "   "])
 def test_cash_service_requires_adjustment_note(
     service: CashService,
@@ -137,6 +197,13 @@ def test_cash_service_requires_adjustment_note(
         service.adjust_cash(49000, now=later_now(), note=note)
 
     assert service.get_account() == original
+
+
+def test_cash_service_adjustment_requires_account_before_note_validation(
+    service: CashService,
+) -> None:
+    with pytest.raises(CashAccountNotInitializedError):
+        service.adjust_cash(1000, now=fixed_now(), note="   ")
 
 
 def test_cash_service_rejects_no_op_adjustment(
