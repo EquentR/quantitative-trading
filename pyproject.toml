@@ -7,10 +7,11 @@ dependencies = [
   "akshare>=1.15,<2",
   "apscheduler>=3.10,<4",
   "pydantic>=2.7,<3",
+  "pydantic-settings>=2.3,<3",
   "typer>=0.12,<1",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
   "pytest>=8,<9",
 ]

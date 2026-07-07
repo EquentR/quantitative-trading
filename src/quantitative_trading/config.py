@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="QT_")
 
-
-class Settings(BaseModel):
     database_path: Path = Field(default=Path("data/quant_trading.db"))
     log_dir: Path = Field(default=Path("data/logs"))
     market_provider: str = Field(default="akshare")
@@ -23,11 +18,4 @@ class Settings(BaseModel):
 
 
 def load_settings() -> Settings:
-    return Settings(
-        database_path=Path(os.environ.get("QT_DATABASE_PATH", "data/quant_trading.db")),
-        log_dir=Path(os.environ.get("QT_LOG_DIR", "data/logs")),
-        market_provider=os.environ.get("QT_MARKET_PROVIDER", "akshare"),
-        intraday_interval_seconds=int(os.environ.get("QT_INTRADAY_INTERVAL_SECONDS", "180")),
-        timezone=os.environ.get("QT_TIMEZONE", "Asia/Shanghai"),
-        enable_market_fetch=_env_bool("QT_ENABLE_MARKET_FETCH", True),
-    )
+    return Settings()
