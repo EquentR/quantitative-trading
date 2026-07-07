@@ -260,7 +260,8 @@ def import_positions(path: Annotated[Path, typer.Argument()]) -> None:
         try:
             positions = service.import_csv(path)
         except (OSError, ValueError) as exc:
-            raise typer.BadParameter(f"导入持仓失败: {exc}") from exc
+            # Rich 错误面板会截断很长的临时路径，先输出文件名便于用户和测试定位。
+            raise typer.BadParameter(f"导入持仓失败 {path.name}: {exc}") from exc
         typer.echo(f"已导入 {len(positions)} 条持仓")
 
 
