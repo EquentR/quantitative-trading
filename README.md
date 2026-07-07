@@ -26,7 +26,7 @@ python -m venv .venv
 ./.venv/bin/python -m pytest -q
 ```
 
-安装时会下载运行依赖 `pydantic`、`typer`，以及开发测试依赖 `pytest`。
+安装时会下载运行依赖 `pydantic`、`typer`、`AkShare`、`APScheduler`，以及开发测试依赖 `pytest`、`pandas`。
 
 ## Bash 启动后端
 
@@ -64,10 +64,41 @@ qt ledger add --symbol 600000 --name 浦发银行 --quantity 1000 --available-qu
 qt ledger list
 ```
 
+## 资金账户与账户估值
+
+手动资金账户是现金余额、净本金和可用买入资金的权威来源。模拟银证转入、银证转出和现金校准都需要通过 CLI 记录，后台服务只读取资金账户并生成账户估值快照。
+
+初始化资金账户：
+
+```bash
+qt cash init --cash 50000 --note 初始本金
+```
+
+模拟银证转账和现金校准：
+
+```bash
+qt cash transfer-in --amount 10000 --note 银证转入
+qt cash transfer-out --amount 5000 --note 银证转出
+qt cash adjust --cash 48000 --note 手动校准券商可用资金
+```
+
+查看资金账户和账户估值：
+
+```bash
+qt cash show
+qt account snapshot
+```
+
 后台服务检查：
 
 ```bash
 qt service check
+```
+
+调试版后台服务单次运行：
+
+```bash
+qt service run --once
 ```
 
 ## Docker 示例
