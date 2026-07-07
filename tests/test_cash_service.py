@@ -43,6 +43,30 @@ def naive_now() -> datetime:
     return datetime(2026, 7, 7, 10, 0)
 
 
+@pytest.mark.parametrize("cash", [0, -1])
+def test_cash_service_rejects_non_positive_initial_cash_without_writing(
+    service: CashService,
+    read_only: ReadOnlyCashService,
+    cash: float,
+) -> None:
+    with pytest.raises(CashTransferError, match="cash must be positive"):
+        service.initialize(cash, now=fixed_now(), note="bad initial principal")
+
+    assert service.get_account() is None
+    assert read_only.list_transactions() == []
+
+
+def test_cash_service_rejects_initialize_naive_now_without_writing(
+    service: CashService,
+    read_only: ReadOnlyCashService,
+) -> None:
+    with pytest.raises(CashTransferError, match="now must be timezone-aware"):
+        service.initialize(50000, now=naive_now(), note="initial principal")
+
+    assert service.get_account() is None
+    assert read_only.list_transactions() == []
+
+
 def test_cash_service_transfer_in_increases_cash_and_principal(
     service: CashService,
     read_only: ReadOnlyCashService,

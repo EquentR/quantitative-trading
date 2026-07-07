@@ -29,6 +29,11 @@ def _require_positive_amount(amount: float) -> None:
         raise CashTransferError("amount must be positive")
 
 
+def _require_positive_cash(cash: float) -> None:
+    if cash <= 0:
+        raise CashTransferError("cash must be positive")
+
+
 def _require_non_negative_cash(cash: float) -> None:
     if cash < 0:
         raise CashTransferError("cash must be non-negative")
@@ -53,7 +58,9 @@ class CashService(ReadOnlyCashService):
         now: datetime | None = None,
         note: str = "",
     ) -> CashAccount:
-        return self._repository.initialize(cash, now=now or current_time(), note=note)
+        _require_positive_cash(cash)
+        occurred_at = _operation_time(now)
+        return self._repository.initialize(cash, now=occurred_at, note=note)
 
     def transfer_in(
         self,
