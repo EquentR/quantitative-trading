@@ -65,11 +65,40 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
 """
 
 
+API_AUTH_STATE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS api_auth_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  password_hash TEXT,
+  token_secret TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+"""
+
+
+SCHEDULER_STATE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS scheduler_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+  interval_seconds INTEGER NOT NULL CHECK (interval_seconds >= 1),
+  run_on_start INTEGER NOT NULL CHECK (run_on_start IN (0, 1)),
+  last_started_at TEXT,
+  last_finished_at TEXT,
+  last_status TEXT,
+  last_reason TEXT,
+  last_error TEXT,
+  last_snapshot_id INTEGER,
+  updated_at TEXT NOT NULL
+);
+"""
+
+
 SCHEMA_STATEMENTS = [
     POSITIONS_SCHEMA_SQL,
     CASH_ACCOUNT_SCHEMA_SQL,
     CASH_TRANSACTIONS_SCHEMA_SQL,
     ACCOUNT_SNAPSHOTS_SCHEMA_SQL,
+    API_AUTH_STATE_SCHEMA_SQL,
+    SCHEDULER_STATE_SCHEMA_SQL,
 ]
 
 SCHEMA_SQL = "\n\n".join(SCHEMA_STATEMENTS)

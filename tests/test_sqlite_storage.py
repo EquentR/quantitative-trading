@@ -450,3 +450,27 @@ def test_account_snapshots_accept_valid_snapshot(tmp_path) -> None:
 
     assert row["status"] == "ok"
     assert row["payload_json"] == "{}"
+
+
+def test_migrate_creates_api_auth_state_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'api_auth_state'"
+        ).fetchone()
+
+    assert row is not None
+
+
+def test_migrate_creates_scheduler_state_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'scheduler_state'"
+        ).fetchone()
+
+    assert row is not None
