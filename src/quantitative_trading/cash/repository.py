@@ -36,24 +36,24 @@ class CashAccountRepository:
         return CashAccount.model_validate(dict(row))
 
     def initialize(self, cash: float, *, now: datetime, note: str) -> CashAccount:
-        if self.get() is not None:
-            raise CashAccountAlreadyInitializedError("cash account already initialized")
+        def operation() -> CashAccount:
+            if self.get() is not None:
+                raise CashAccountAlreadyInitializedError("cash account already initialized")
 
-        account = self._build_account(
-            cash_balance=cash,
-            total_transfer_in=cash,
-            total_transfer_out=0,
-            updated_at=now,
-        )
-        transaction = self._build_transaction(
-            transaction_type=CashTransactionType.INITIAL_DEPOSIT,
-            amount=cash,
-            cash_before=0,
-            cash_after=cash,
-            occurred_at=now,
-            note=note,
-        )
-        with self.connection:
+            account = self._build_account(
+                cash_balance=cash,
+                total_transfer_in=cash,
+                total_transfer_out=0,
+                updated_at=now,
+            )
+            transaction = self._build_transaction(
+                transaction_type=CashTransactionType.INITIAL_DEPOSIT,
+                amount=cash,
+                cash_before=0,
+                cash_after=cash,
+                occurred_at=now,
+                note=note,
+            )
             self.connection.execute(
                 """
                 INSERT INTO cash_account (
@@ -78,10 +78,12 @@ class CashAccountRepository:
             )
             self._insert_transaction(transaction)
 
-        persisted = self.get()
-        if persisted is None:
-            raise CashAccountNotInitializedError("cash account not initialized")
-        return persisted
+            persisted = self.get()
+            if persisted is None:
+                raise CashAccountNotInitializedError("cash account not initialized")
+            return persisted
+
+        return self._with_immediate_transaction(operation)
 
     def save_state_with_transaction(
         self,

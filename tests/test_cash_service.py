@@ -90,6 +90,78 @@ def test_cash_service_rejects_duplicate_initialize_without_changing_state(
     assert transactions[0].note == "initial principal"
 
 
+def test_cash_service_initialize_checks_duplicate_after_waiting_for_write_lock(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+    with connect(settings) as connection:
+        migrate(connection)
+
+    with connect(settings) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute(
+            """
+            INSERT INTO cash_account (
+              id,
+              cash_balance,
+              total_transfer_in,
+              total_transfer_out,
+              updated_at
+            ) VALUES (1, ?, ?, 0, ?)
+            """,
+            (50000, 50000, fixed_now().isoformat()),
+        )
+        blocker.execute(
+            """
+            INSERT INTO cash_transactions (
+              type,
+              amount,
+              cash_before,
+              cash_after,
+              occurred_at,
+              note
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                CashTransactionType.INITIAL_DEPOSIT.value,
+                50000,
+                0,
+                50000,
+                fixed_now().isoformat(),
+                "blocker initial principal",
+            ),
+        )
+        worker_started = Event()
+
+        def initialize_after_blocker() -> None:
+            worker_started.set()
+            with connect(settings) as worker:
+                service = CashService(CashAccountRepository(worker))
+                service.initialize(1000, now=later_now(), note="worker initial principal")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(initialize_after_blocker)
+            assert worker_started.wait(timeout=1)
+            with pytest.raises(TimeoutError):
+                future.result(timeout=0.2)
+
+            blocker.commit()
+            with pytest.raises(CashTransferError, match="cash account already initialized"):
+                future.result(timeout=2)
+
+    with connect(settings) as connection:
+        repository = CashAccountRepository(connection)
+        account = repository.get()
+        transactions = repository.list_transactions(limit=10)
+
+    assert account is not None
+    assert account.cash_balance == 50000
+    assert account.total_transfer_in == 50000
+    assert [(item.note, item.cash_before, item.cash_after) for item in transactions] == [
+        ("blocker initial principal", 0, 50000),
+    ]
+
+
 def test_cash_service_transfer_in_increases_cash_and_principal(
     service: CashService,
     read_only: ReadOnlyCashService,
