@@ -234,6 +234,8 @@ def test_positions_reject_invalid_symbol(tmp_path, symbol: str) -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("quantity", -1),
+        ("available_quantity", -1),
         ("available_quantity", 1001),
         ("cost_price", 0),
         ("cost_price", -1.0),
@@ -251,6 +253,17 @@ def test_positions_enforce_quantity_and_cost_constraints(
 
         with pytest.raises(sqlite3.IntegrityError):
             insert_position(connection, **{field: value})
+
+
+@pytest.mark.parametrize("field", ["name", "opened_at", "updated_at"])
+def test_positions_reject_null_required_fields(tmp_path, field: str) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_position(connection, **{field: None})
 
 
 def test_positions_default_note_to_empty_string(tmp_path) -> None:
@@ -298,6 +311,16 @@ def test_cash_account_rejects_negative_amounts(
 
         with pytest.raises(sqlite3.IntegrityError):
             insert_cash_account(connection, **{field: value})
+
+
+def test_cash_account_rejects_null_updated_at(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_cash_account(connection, updated_at=None)
 
 
 def test_cash_account_rejects_transfer_out_above_transfer_in(tmp_path) -> None:
@@ -358,6 +381,16 @@ def test_cash_transactions_reject_negative_balances(
 
         with pytest.raises(sqlite3.IntegrityError):
             insert_cash_transaction(connection, **{field: value})
+
+
+def test_cash_transactions_reject_null_occurred_at(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_cash_transaction(connection, occurred_at=None)
 
 
 def test_cash_transactions_default_note_to_empty_string(tmp_path) -> None:
