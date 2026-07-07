@@ -41,6 +41,8 @@ def redact_sensitive_text(text: str) -> str:
         r"\1 [redacted]",
         summary,
     )
+    summary = re.sub(r"(?i)\b[A-Z]:\\(?:[^\\\s]+\\)*[^\\\s]+", "[path]", summary)
+    summary = re.sub(r"\\\\[^\\\s]+\\[^\\\s]+(?:\\[^\\\s]+)*", "[path]", summary)
     summary = re.sub(r"(?<!\w)/(?:[^/\s]+/)*[^/\s]+", "[path]", summary)
     return summary[:300]
 

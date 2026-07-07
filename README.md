@@ -26,7 +26,7 @@ python -m venv .venv
 ./.venv/bin/python -m pytest -q
 ```
 
-安装时会下载运行依赖 `pydantic`、`typer`、`AkShare`、`APScheduler`，以及开发测试依赖 `pytest`、`pandas`。
+安装时会下载 `pyproject.toml` 中声明的运行依赖和开发测试依赖。
 
 ## Bash 启动后端
 

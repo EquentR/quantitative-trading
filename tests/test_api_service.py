@@ -988,6 +988,8 @@ def test_run_once_state_record_failure_returns_uniform_internal_error(
         ("api-key=hyphen-key-123", ["hyphen-key-123"]),
         ("https://user:pass@example.com/path", ["user:pass"]),
         ("failed at /tmp/private/vendor.py", ["/tmp/private/vendor.py"]),
+        (r"failed at C:\Users\alice\private.db", [r"C:\Users\alice\private.db"]),
+        (r"failed at \\server\share\private.db", [r"\\server\share\private.db"]),
     ],
 )
 def test_safe_error_summary_redacts_sensitive_values(raw, forbidden) -> None:
