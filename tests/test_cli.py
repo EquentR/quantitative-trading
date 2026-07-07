@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 import quantitative_trading.cli as cli
@@ -217,11 +218,41 @@ def test_cash_show_json_outputs_account_model(tmp_path) -> None:
     assert payload["net_principal"] == 50000
 
 
+def test_cash_show_json_reports_not_initialized_as_json(tmp_path) -> None:
+    result = run_cli(tmp_path, "cash", "show", "--json")
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload == {
+        "status": "cash_not_initialized",
+        "warning": "cash account not initialized",
+    }
+
+
 def test_cash_show_reports_not_initialized(tmp_path) -> None:
     result = run_cli(tmp_path, "cash", "show")
 
     assert result.exit_code == 0
     assert "cash account not initialized" in result.output
+
+
+def test_cash_init_rejects_duplicate_initialization_without_traceback(tmp_path) -> None:
+    first_result = run_cli(tmp_path, "cash", "init", "--cash", "1000", "--note", "initial principal")
+
+    second_result = run_cli(
+        tmp_path,
+        "cash",
+        "init",
+        "--cash",
+        "1000",
+        "--note",
+        "duplicate principal",
+    )
+
+    assert first_result.exit_code == 0
+    assert second_result.exit_code != 0
+    assert "already initialized" in second_result.output
+    assert "Traceback" not in second_result.output
 
 
 def test_cash_transfer_out_rejects_excess_cash(tmp_path) -> None:
@@ -239,6 +270,33 @@ def test_cash_transfer_out_rejects_excess_cash(tmp_path) -> None:
 
     assert result.exit_code != 0
     assert "cannot exceed cash balance" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cash_transfer_out_rejects_amount_above_net_principal_after_adjustment(tmp_path) -> None:
+    run_cli(tmp_path, "cash", "init", "--cash", "1000", "--note", "initial principal")
+    run_cli(
+        tmp_path,
+        "cash",
+        "adjust",
+        "--cash",
+        "1500",
+        "--note",
+        "manual broker correction",
+    )
+
+    result = run_cli(
+        tmp_path,
+        "cash",
+        "transfer-out",
+        "--amount",
+        "1200",
+        "--note",
+        "above principal",
+    )
+
+    assert result.exit_code != 0
+    assert "cannot exceed net principal" in result.output
     assert "Traceback" not in result.output
 
 
@@ -280,8 +338,29 @@ def test_cash_transactions_lists_recent_cash_events(tmp_path) -> None:
     assert result.exit_code == 0
     assert "initial_deposit" in result.output
     assert "transfer_in" in result.output
-    assert "50000.00" in result.output
-    assert "60000.00" in result.output
+    assert "cash_before=0.00" in result.output
+    assert "cash_after=50000.00" in result.output
+    assert "cash_before=50000.00" in result.output
+    assert "cash_after=60000.00" in result.output
+
+
+def test_cash_transactions_limit_uses_repository_order(tmp_path) -> None:
+    run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
+    run_cli(tmp_path, "cash", "transfer-in", "--amount", "1000", "--note", "bank transfer in")
+    run_cli(tmp_path, "cash", "adjust", "--cash", "52000", "--note", "manual broker correction")
+    run_cli(tmp_path, "cash", "transfer-out", "--amount", "500", "--note", "bank transfer out")
+
+    result = run_cli(tmp_path, "cash", "transactions", "--limit", "2")
+
+    assert result.exit_code == 0
+    lines = result.output.strip().splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("initial_deposit ")
+    assert "cash_before=0.00" in lines[0]
+    assert "cash_after=50000.00" in lines[0]
+    assert lines[1].startswith("transfer_in ")
+    assert "cash_before=50000.00" in lines[1]
+    assert "cash_after=51000.00" in lines[1]
 
 
 def test_account_snapshot_reports_cash_not_initialized(tmp_path) -> None:
@@ -298,6 +377,34 @@ def test_account_snapshot_json_outputs_status(tmp_path) -> None:
     payload = json.loads(result.output)
     assert payload["status"] == "cash_not_initialized"
     assert payload["warnings"] == ["cash account not initialized"]
+
+
+def test_account_snapshot_with_position_reports_disabled_market_warning(tmp_path) -> None:
+    run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
+    add_result = run_cli(
+        tmp_path,
+        "ledger",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "娴﹀彂閾惰",
+        "--quantity",
+        "1000",
+        "--available-quantity",
+        "800",
+        "--cost-price",
+        "9.5",
+        "--opened-at",
+        "2026-07-06",
+    )
+
+    result = run_cli(tmp_path, "account", "snapshot")
+
+    assert add_result.exit_code == 0
+    assert result.exit_code == 0
+    assert "market_data_unavailable" in result.output
+    assert "market fetch disabled" in result.output
 
 
 def test_services_closes_connection_when_migrate_fails(monkeypatch) -> None:
@@ -330,3 +437,31 @@ def test_services_closes_connection_when_migrate_fails(monkeypatch) -> None:
 
     assert connection_cm.exited is True
     assert connection_cm.exit_args[0] is RuntimeError
+
+
+def test_cash_command_cleanup_receives_bad_parameter_exception(monkeypatch) -> None:
+    class FakeConnectionManager:
+        def __init__(self) -> None:
+            self.exit_args = None
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            self.exit_args = (exc_type, exc, tb)
+            return False
+
+    class FakeCashService:
+        def transfer_out(self, amount: float, *, note: str):
+            raise cli.CashTransferError("transfer-out amount cannot exceed cash balance")
+
+    connection_cm = FakeConnectionManager()
+
+    def fake_services():
+        return connection_cm, object(), object(), FakeCashService(), object()
+
+    monkeypatch.setattr(cli, "_services", fake_services)
+
+    result = runner.invoke(app, ["cash", "transfer-out", "--amount", "1"])
+
+    assert result.exit_code != 0
+    assert "cannot exceed cash balance" in result.output
+    assert connection_cm.exit_args is not None
+    assert connection_cm.exit_args[0] is typer.BadParameter

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import sqlite3
 import sys
 from collections.abc import Iterator
@@ -96,6 +97,27 @@ def _read_only_services() -> tuple[Any | None, ReadOnlyLedgerService | None]:
         raise
 
 
+@contextmanager
+def _service_scope() -> Iterator[
+    tuple[LedgerService, ReadOnlyLedgerService, CashService, ReadOnlyCashService]
+]:
+    connection_cm, ledger_service, ledger_read_only, cash_service, cash_read_only = _services()
+    try:
+        yield ledger_service, ledger_read_only, cash_service, cash_read_only
+    finally:
+        connection_cm.__exit__(*sys.exc_info())
+
+
+@contextmanager
+def _read_only_service_scope() -> Iterator[ReadOnlyLedgerService | None]:
+    connection_cm, read_only = _read_only_services()
+    try:
+        yield read_only
+    finally:
+        if connection_cm is not None:
+            connection_cm.__exit__(*sys.exc_info())
+
+
 def _position_input(
     *,
     symbol: str,
@@ -142,23 +164,21 @@ def add_position(
     opened_at: Annotated[str, typer.Option("--opened-at")],
     note: Annotated[str, typer.Option("--note")] = "",
 ) -> None:
-    connection_cm, service, _, _, _ = _services()
-    try:
-        position = _position_input(
-            symbol=symbol,
-            name=name,
-            quantity=quantity,
-            available_quantity=available_quantity,
-            cost_price=cost_price,
-            opened_at=opened_at,
-            note=note,
-        )
-        service.add_position(position)
-        typer.echo(f"已新增持仓 {position.symbol} {position.name}")
-    except DuplicatePositionError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    finally:
-        connection_cm.__exit__(None, None, None)
+    with _service_scope() as (service, _, _, _):
+        try:
+            position = _position_input(
+                symbol=symbol,
+                name=name,
+                quantity=quantity,
+                available_quantity=available_quantity,
+                cost_price=cost_price,
+                opened_at=opened_at,
+                note=note,
+            )
+            service.add_position(position)
+            typer.echo(f"已新增持仓 {position.symbol} {position.name}")
+        except DuplicatePositionError as exc:
+            raise typer.BadParameter(str(exc)) from exc
 
 
 @ledger_app.command("update")
@@ -171,41 +191,36 @@ def update_position(
     opened_at: Annotated[str, typer.Option("--opened-at")],
     note: Annotated[str, typer.Option("--note")] = "",
 ) -> None:
-    connection_cm, service, _, _, _ = _services()
-    try:
-        position = _position_input(
-            symbol=symbol,
-            name=name,
-            quantity=quantity,
-            available_quantity=available_quantity,
-            cost_price=cost_price,
-            opened_at=opened_at,
-            note=note,
-        )
-        service.update_position(position)
-        typer.echo(f"已更新持仓 {position.symbol}")
-    except MissingPositionError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    finally:
-        connection_cm.__exit__(None, None, None)
+    with _service_scope() as (service, _, _, _):
+        try:
+            position = _position_input(
+                symbol=symbol,
+                name=name,
+                quantity=quantity,
+                available_quantity=available_quantity,
+                cost_price=cost_price,
+                opened_at=opened_at,
+                note=note,
+            )
+            service.update_position(position)
+            typer.echo(f"已更新持仓 {position.symbol}")
+        except MissingPositionError as exc:
+            raise typer.BadParameter(str(exc)) from exc
 
 
 @ledger_app.command("remove")
 def remove_position(symbol: Annotated[str, typer.Argument()]) -> None:
-    connection_cm, service, _, _, _ = _services()
-    try:
-        service.remove_position(symbol)
-        typer.echo(f"已删除持仓 {symbol}")
-    except MissingPositionError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    finally:
-        connection_cm.__exit__(None, None, None)
+    with _service_scope() as (service, _, _, _):
+        try:
+            service.remove_position(symbol)
+            typer.echo(f"已删除持仓 {symbol}")
+        except MissingPositionError as exc:
+            raise typer.BadParameter(str(exc)) from exc
 
 
 @ledger_app.command("list")
 def list_positions() -> None:
-    connection_cm, _, read_only, _, _ = _services()
-    try:
+    with _service_scope() as (_, read_only, _, _):
         positions = read_only.list_positions()
         if not positions:
             typer.echo("暂无持仓")
@@ -221,27 +236,21 @@ def list_positions() -> None:
                     f"更新={position.updated_at.isoformat()}"
                 )
             )
-    finally:
-        connection_cm.__exit__(None, None, None)
 
 
 @ledger_app.command("import")
 def import_positions(path: Annotated[Path, typer.Argument()]) -> None:
-    connection_cm, service, _, _, _ = _services()
-    try:
+    with _service_scope() as (service, _, _, _):
         try:
             positions = service.import_csv(path)
         except (OSError, ValueError) as exc:
             raise typer.BadParameter(f"导入持仓失败: {exc}") from exc
         typer.echo(f"已导入 {len(positions)} 条持仓")
-    finally:
-        connection_cm.__exit__(None, None, None)
 
 
 @ledger_app.command("export")
 def export_positions() -> None:
-    connection_cm, _, read_only, _, _ = _services()
-    try:
+    with _service_scope() as (_, read_only, _, _):
         writer = csv.writer(sys.stdout, lineterminator="\n")
         writer.writerow(
             [
@@ -266,8 +275,6 @@ def export_positions() -> None:
                     position.note,
                 ]
             )
-    finally:
-        connection_cm.__exit__(None, None, None)
 
 
 @cash_app.command("init")
@@ -275,8 +282,7 @@ def init_cash(
     cash: Annotated[float, typer.Option("--cash")],
     note: Annotated[str, typer.Option("--note")] = "initial principal",
 ) -> None:
-    connection_cm, _, _, cash_service, _ = _services()
-    try:
+    with _service_scope() as (_, _, cash_service, _):
         try:
             account = cash_service.initialize(cash, note=note)
         except CashTransferError as exc:
@@ -286,16 +292,23 @@ def init_cash(
             f"cash_balance={account.cash_balance:.2f} "
             f"net_principal={account.net_principal:.2f}"
         )
-    finally:
-        connection_cm.__exit__(None, None, None)
 
 
 @cash_app.command("show")
 def show_cash(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
-    connection_cm, _, _, _, cash_read_only = _services()
-    try:
+    with _service_scope() as (_, _, _, cash_read_only):
         account = cash_read_only.get_account()
         if account is None:
+            if json_output:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "status": "cash_not_initialized",
+                            "warning": "cash account not initialized",
+                        }
+                    )
+                )
+                return
             typer.echo("cash account not initialized")
             return
         if json_output:
@@ -308,8 +321,6 @@ def show_cash(json_output: Annotated[bool, typer.Option("--json")] = False) -> N
             f"net_principal={account.net_principal:.2f} "
             f"updated_at={account.updated_at.isoformat()}"
         )
-    finally:
-        connection_cm.__exit__(None, None, None)
 
 
 @cash_app.command("transfer-in")
@@ -317,15 +328,12 @@ def transfer_in(
     amount: Annotated[float, typer.Option("--amount")],
     note: Annotated[str, typer.Option("--note")] = "",
 ) -> None:
-    connection_cm, _, _, cash_service, _ = _services()
-    try:
+    with _service_scope() as (_, _, cash_service, _):
         try:
             account = cash_service.transfer_in(amount, note=note)
         except (CashAccountNotInitializedError, CashTransferError) as exc:
             raise _cash_cli_error(exc) from exc
         typer.echo(f"transfer_in={amount:.2f} cash_balance={account.cash_balance:.2f}")
-    finally:
-        connection_cm.__exit__(None, None, None)
 
 
 @cash_app.command("transfer-out")
@@ -333,15 +341,12 @@ def transfer_out(
     amount: Annotated[float, typer.Option("--amount")],
     note: Annotated[str, typer.Option("--note")] = "",
 ) -> None:
-    connection_cm, _, _, cash_service, _ = _services()
-    try:
+    with _service_scope() as (_, _, cash_service, _):
         try:
             account = cash_service.transfer_out(amount, note=note)
         except (CashAccountNotInitializedError, CashTransferError) as exc:
             raise _cash_cli_error(exc) from exc
         typer.echo(f"transfer_out={amount:.2f} cash_balance={account.cash_balance:.2f}")
-    finally:
-        connection_cm.__exit__(None, None, None)
 
 
 @cash_app.command("adjust")
@@ -349,8 +354,7 @@ def adjust_cash(
     cash: Annotated[float, typer.Option("--cash")],
     note: Annotated[str, typer.Option("--note")],
 ) -> None:
-    connection_cm, _, _, cash_service, _ = _services()
-    try:
+    with _service_scope() as (_, _, cash_service, _):
         try:
             account = cash_service.adjust_cash(cash, note=note)
         except (CashAccountNotInitializedError, CashTransferError) as exc:
@@ -359,16 +363,13 @@ def adjust_cash(
             f"cash_adjustment cash_balance={account.cash_balance:.2f} "
             f"net_principal={account.net_principal:.2f}"
         )
-    finally:
-        connection_cm.__exit__(None, None, None)
 
 
 @cash_app.command("transactions")
 def list_cash_transactions(
     limit: Annotated[int, typer.Option("--limit", min=1)] = 20,
 ) -> None:
-    connection_cm, _, _, _, cash_read_only = _services()
-    try:
+    with _service_scope() as (_, _, _, cash_read_only):
         transactions = cash_read_only.list_transactions(limit=limit)
         if not transactions:
             typer.echo("no cash transactions")
@@ -377,18 +378,16 @@ def list_cash_transactions(
             typer.echo(
                 f"{transaction.type.value} "
                 f"amount={transaction.amount:.2f} "
+                f"cash_before={transaction.cash_before:.2f} "
                 f"cash_after={transaction.cash_after:.2f} "
                 f"occurred_at={transaction.occurred_at.isoformat()} "
                 f"note={transaction.note}"
             )
-    finally:
-        connection_cm.__exit__(None, None, None)
 
 
 @account_app.command("snapshot")
 def account_snapshot(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
-    connection_cm, _, ledger_read_only, _, cash_read_only = _services()
-    try:
+    with _service_scope() as (_, ledger_read_only, _, cash_read_only):
         account_service = AccountService(
             ledger=ledger_read_only,
             cash=cash_read_only,
@@ -405,17 +404,11 @@ def account_snapshot(json_output: Annotated[bool, typer.Option("--json")] = Fals
         )
         for warning in snapshot.warnings:
             typer.echo(f"warning={warning}")
-    finally:
-        connection_cm.__exit__(None, None, None)
 
 
 @service_app.command("check")
 def check_service() -> None:
-    connection_cm, read_only = _read_only_services()
-    try:
+    with _read_only_service_scope() as read_only:
         positions = [] if read_only is None else read_only.list_positions()
         typer.echo("服务检查通过")
         typer.echo(f"当前持仓数量: {len(positions)}")
-    finally:
-        if connection_cm is not None:
-            connection_cm.__exit__(None, None, None)
