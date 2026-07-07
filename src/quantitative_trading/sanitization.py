@@ -9,8 +9,8 @@ _SENSITIVE_ERROR_KEY = (
 )
 
 
-def safe_error_summary(exc: Exception) -> str:
-    summary = str(exc).strip() or exc.__class__.__name__
+def redact_sensitive_text(text: str) -> str:
+    summary = text.strip()
     summary = re.sub(
         r"(?i)\bAuthorization\s*:\s*Bearer\s+[^\s,;]+",
         "Authorization: Bearer [redacted]",
@@ -43,3 +43,8 @@ def safe_error_summary(exc: Exception) -> str:
     )
     summary = re.sub(r"(?<!\w)/(?:[^/\s]+/)*[^/\s]+", "[path]", summary)
     return summary[:300]
+
+
+def safe_error_summary(exc: Exception) -> str:
+    summary = str(exc).strip() or exc.__class__.__name__
+    return redact_sensitive_text(summary) or exc.__class__.__name__[:300]

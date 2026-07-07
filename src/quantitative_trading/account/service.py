@@ -15,7 +15,7 @@ from quantitative_trading.ledger.models import Position
 from quantitative_trading.ledger.service import ReadOnlyLedgerService
 from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
 from quantitative_trading.market.providers import MarketDataProvider
-from quantitative_trading.sanitization import safe_error_summary
+from quantitative_trading.sanitization import redact_sensitive_text, safe_error_summary
 
 
 class AccountService:
@@ -219,7 +219,7 @@ class AccountService:
             quote_data_time=quote.data_time,
             quote_fetched_at=quote.fetched_at,
             status=PositionValuationStatus.OK,
-            warning=quote.warning,
+            warning=self._quote_warning(quote),
         )
 
     def _unavailable_position(
@@ -248,14 +248,20 @@ class AccountService:
     @staticmethod
     def _failed_warning(quote: QuoteSnapshot) -> str:
         if quote.warning:
-            return f"quote unavailable: {quote.warning}"
+            return f"quote unavailable: {redact_sensitive_text(quote.warning)}"
         return "quote unavailable"
 
     @staticmethod
     def _stale_warning(quote: QuoteSnapshot) -> str:
         if quote.warning:
-            return f"quote stale/unavailable: {quote.warning}"
+            return f"quote stale/unavailable: {redact_sensitive_text(quote.warning)}"
         return "quote stale/unavailable"
+
+    @staticmethod
+    def _quote_warning(quote: QuoteSnapshot) -> str:
+        if not quote.warning:
+            return ""
+        return redact_sensitive_text(quote.warning)
 
     @staticmethod
     def _collect_warnings(valuations: list[PositionValuation]) -> list[str]:

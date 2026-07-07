@@ -349,6 +349,32 @@ def test_market_provider_exception_warning_redacts_sensitive_values() -> None:
     assert all("/tmp/private.db" not in warning for warning in warnings)
 
 
+def test_quote_warning_redacts_sensitive_values() -> None:
+    snapshot = service(
+        account=cash_account(),
+        positions=[position()],
+        market=FakeMarketProvider(
+            {
+                "600000": quote(
+                    status=QuoteStatus.FAILED,
+                    warning=(
+                        "provider returned token=supersecret Authorization: Bearer abc "
+                        "at /tmp/private.db"
+                    ),
+                )
+            }
+        ),
+    ).create_snapshot()
+
+    warnings = [*snapshot.warnings, snapshot.positions[0].warning or ""]
+
+    assert snapshot.status is AccountSnapshotStatus.MARKET_DATA_UNAVAILABLE
+    assert all("provider returned" in warning for warning in warnings)
+    assert all("supersecret" not in warning for warning in warnings)
+    assert all("Bearer abc" not in warning for warning in warnings)
+    assert all("/tmp/private.db" not in warning for warning in warnings)
+
+
 def test_partial_quote_with_warning_is_still_valued() -> None:
     snapshot = service(
         account=cash_account(),

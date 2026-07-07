@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from quantitative_trading.api.errors import ApiError, install_error_handlers
 
@@ -97,3 +97,39 @@ def test_validation_error_does_not_echo_sensitive_input() -> None:
 
     assert response.status_code == 422
     assert "plain-password" not in response.text
+
+
+def test_validation_error_redacts_sensitive_text_from_model_level_input() -> None:
+    app = FastAPI()
+    install_error_handlers(app)
+
+    class PositionPayload(BaseModel):
+        symbol: str
+        quantity: int
+        available_quantity: int
+        note: str
+
+        @model_validator(mode="after")
+        def available_quantity_cannot_exceed_quantity(self) -> "PositionPayload":
+            if self.available_quantity > self.quantity:
+                raise ValueError("available_quantity cannot exceed quantity")
+            return self
+
+    @app.post("/position")
+    def position(payload: PositionPayload):
+        return payload
+
+    response = TestClient(app).post(
+        "/position",
+        json={
+            "symbol": "600000",
+            "quantity": 100,
+            "available_quantity": 200,
+            "note": "manual note token=supersecret Authorization: Bearer abc at /tmp/private.db",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "supersecret" not in response.text
+    assert "Bearer abc" not in response.text
+    assert "/tmp/private.db" not in response.text

@@ -8,6 +8,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
+from quantitative_trading.sanitization import redact_sensitive_text
+
 
 SENSITIVE_DETAIL_KEYS = frozenset(
     {
@@ -86,9 +88,7 @@ def _sanitize_validation_errors(errors: list[dict[str, Any]]) -> list[dict[str, 
     sanitized_errors: list[dict[str, Any]] = []
     for error in errors:
         sanitized = dict(error)
-        location = sanitized.get("loc")
-        if _location_contains_sensitive_key(location):
-            sanitized.pop("input", None)
+        sanitized.pop("input", None)
         sanitized_errors.append(_sanitize_details(sanitized))
     return sanitized_errors
 
@@ -104,13 +104,9 @@ def _sanitize_details(value: Any, *, current_key: str | None = None) -> Any:
         }
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
         return [_sanitize_details(item, current_key=current_key) for item in value]
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
     return value
-
-
-def _location_contains_sensitive_key(location: object) -> bool:
-    if not isinstance(location, Sequence) or isinstance(location, str | bytes | bytearray):
-        return False
-    return any(_is_sensitive_key(str(part)) for part in location)
 
 
 def _is_sensitive_key(key: str) -> bool:
