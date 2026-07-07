@@ -8,6 +8,13 @@ from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
 
 
 class MarketDataProvider(Protocol):
+    """Boundary for market quote adapters.
+
+    Providers may return a sparse mapping: if a requested symbol is absent,
+    that quote is unavailable. Providers may also return a FAILED
+    QuoteSnapshot when they can report an explicit per-symbol failure.
+    """
+
     def get_quotes(self, symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
         ...
 

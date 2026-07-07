@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class QuoteStatus(StrEnum):
@@ -22,15 +22,15 @@ def _must_be_timezone_aware(value: datetime | None) -> datetime | None:
 
 
 class QuoteSnapshot(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     symbol: str = Field(pattern=r"^\d{6}$")
     name: str = ""
-    current_price: float | None = Field(default=None, gt=0)
-    change_pct: float | None = None
+    current_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    change_pct: float | None = Field(default=None, allow_inf_nan=False)
     data_time: datetime | None = None
     fetched_at: datetime
-    source: str
+    source: str = Field(min_length=1)
     status: QuoteStatus
     warning: str = ""
 
@@ -38,3 +38,19 @@ class QuoteSnapshot(BaseModel):
     @classmethod
     def datetimes_must_be_timezone_aware(cls, value: datetime | None) -> datetime | None:
         return _must_be_timezone_aware(value)
+
+    @model_validator(mode="after")
+    def status_fields_must_match_quote_contract(self) -> "QuoteSnapshot":
+        if self.status is QuoteStatus.OK:
+            if self.current_price is None:
+                raise ValueError("ok quote requires current_price")
+            if self.data_time is None:
+                raise ValueError("ok quote requires data_time")
+        elif self.status is QuoteStatus.PARTIAL:
+            if self.current_price is None:
+                raise ValueError("partial quote requires current_price")
+            if not self.warning:
+                raise ValueError("partial quote requires warning")
+        elif self.status in {QuoteStatus.FAILED, QuoteStatus.STALE} and not self.warning:
+            raise ValueError(f"{self.status.value} quote requires warning")
+        return self
