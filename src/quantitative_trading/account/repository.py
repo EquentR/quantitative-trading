@@ -69,6 +69,19 @@ class AccountSnapshotRepository:
             return None
         return AccountSnapshot.model_validate_json(row["payload_json"])
 
+    def get(self, snapshot_id: int) -> AccountSnapshot | None:
+        row = self.connection.execute(
+            """
+            SELECT payload_json
+            FROM account_snapshots
+            WHERE id = ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return AccountSnapshot.model_validate_json(row["payload_json"])
+
     @staticmethod
     def _isoformat_or_none(value: datetime | None) -> str | None:
         if value is None:

@@ -250,3 +250,20 @@ def test_payload_json_is_internal_account_snapshot_json_without_raw_akshare_fiel
     assert AccountSnapshot.model_validate_json(payload_json) == snapshot
     for raw_field_name in ("最新价", "涨跌幅", "代码"):
         assert raw_field_name not in payload_json
+
+
+def test_get_returns_snapshot_by_id(repository: AccountSnapshotRepository) -> None:
+    snapshot = valued_snapshot()
+    saved_id = repository.save(
+        snapshot,
+        cash_account_updated_at=NOW,
+        ledger_max_updated_at=NOW,
+    )
+
+    loaded = repository.get(saved_id)
+
+    assert loaded == snapshot
+
+
+def test_get_returns_none_for_missing_id(repository: AccountSnapshotRepository) -> None:
+    assert repository.get(999) is None
