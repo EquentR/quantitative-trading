@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Personal A-share short-term quantitative decision support system."
 requires-python = ">=3.11"
 dependencies = [
+  "akshare>=1.15,<2",
+  "apscheduler>=3.10,<4",
   "pydantic>=2.7,<3",
   "typer>=0.12,<1",
 ]
