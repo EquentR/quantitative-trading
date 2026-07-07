@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from quantitative_trading.cash.models import CashAccount, CashTransaction, CashTransactionType
+from quantitative_trading.cash.models import CashAccount, CashTransaction
 from quantitative_trading.cash.repository import (
     CashAccountAlreadyInitializedError,
-    CashAccountNotInitializedError,
+    CashAccountInvalidTransferError,
     CashAccountRepository,
 )
 
@@ -73,21 +73,9 @@ class CashService(ReadOnlyCashService):
         now: datetime | None = None,
         note: str = "",
     ) -> CashAccount:
-        account = self._require_account()
         _require_positive_amount(amount)
         occurred_at = _operation_time(now)
-        cash_after = account.cash_balance + amount
-        return self._repository.save_state_with_transaction(
-            cash_balance=cash_after,
-            total_transfer_in=account.total_transfer_in + amount,
-            total_transfer_out=account.total_transfer_out,
-            transaction_type=CashTransactionType.TRANSFER_IN,
-            amount=amount,
-            cash_before=account.cash_balance,
-            cash_after=cash_after,
-            now=occurred_at,
-            note=note,
-        )
+        return self._repository.transfer_in(amount, now=occurred_at, note=note)
 
     def transfer_out(
         self,
@@ -96,26 +84,12 @@ class CashService(ReadOnlyCashService):
         now: datetime | None = None,
         note: str = "",
     ) -> CashAccount:
-        account = self._require_account()
         _require_positive_amount(amount)
-        if amount > account.cash_balance:
-            raise CashTransferError("transfer-out amount cannot exceed cash balance")
-        if amount > account.net_principal:
-            raise CashTransferError("transfer-out amount cannot exceed net principal")
-
         occurred_at = _operation_time(now)
-        cash_after = account.cash_balance - amount
-        return self._repository.save_state_with_transaction(
-            cash_balance=cash_after,
-            total_transfer_in=account.total_transfer_in,
-            total_transfer_out=account.total_transfer_out + amount,
-            transaction_type=CashTransactionType.TRANSFER_OUT,
-            amount=amount,
-            cash_before=account.cash_balance,
-            cash_after=cash_after,
-            now=occurred_at,
-            note=note,
-        )
+        try:
+            return self._repository.transfer_out(amount, now=occurred_at, note=note)
+        except CashAccountInvalidTransferError as exc:
+            raise CashTransferError(str(exc)) from exc
 
     def adjust_cash(
         self,
@@ -124,30 +98,9 @@ class CashService(ReadOnlyCashService):
         now: datetime | None = None,
         note: str,
     ) -> CashAccount:
-        account = self._require_account()
         _require_non_negative_cash(cash)
-        if not note.strip():
-            raise CashTransferError("cash adjustment note is required")
-
-        amount = abs(cash - account.cash_balance)
-        if amount == 0:
-            raise CashTransferError("cash adjustment must change cash balance")
-
         occurred_at = _operation_time(now)
-        return self._repository.save_state_with_transaction(
-            cash_balance=cash,
-            total_transfer_in=account.total_transfer_in,
-            total_transfer_out=account.total_transfer_out,
-            transaction_type=CashTransactionType.CASH_ADJUSTMENT,
-            amount=amount,
-            cash_before=account.cash_balance,
-            cash_after=cash,
-            now=occurred_at,
-            note=note,
-        )
-
-    def _require_account(self) -> CashAccount:
-        account = self.get_account()
-        if account is None:
-            raise CashAccountNotInitializedError("cash account not initialized")
-        return account
+        try:
+            return self._repository.adjust_cash(cash, now=occurred_at, note=note)
+        except CashAccountInvalidTransferError as exc:
+            raise CashTransferError(str(exc)) from exc

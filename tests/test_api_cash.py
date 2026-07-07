@@ -72,6 +72,19 @@ def test_cash_transfer_out_rejects_excess_cash(tmp_path) -> None:
     assert response.json()["error"]["code"] == "cash_transfer_invalid"
 
 
+def test_cash_transfer_before_initialization_returns_not_found(tmp_path) -> None:
+    client, headers = authenticated_client(tmp_path)
+
+    response = client.post(
+        "/api/v1/cash/transfers",
+        json={"type": "transfer_in", "amount": 1000, "note": "bank transfer in"},
+        headers=headers,
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "cash_account_not_initialized"
+
+
 def test_cash_adjustment_requires_note(tmp_path) -> None:
     client, headers = authenticated_client(tmp_path)
     client.post(
@@ -88,6 +101,19 @@ def test_cash_adjustment_requires_note(tmp_path) -> None:
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "cash_transfer_invalid"
+
+
+def test_cash_adjustment_before_initialization_returns_not_found(tmp_path) -> None:
+    client, headers = authenticated_client(tmp_path)
+
+    response = client.post(
+        "/api/v1/cash/adjustments",
+        json={"cash": 900, "note": "manual broker correction"},
+        headers=headers,
+    )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "cash_account_not_initialized"
 
 
 def test_cash_endpoints_require_authentication_after_setup(tmp_path) -> None:

@@ -99,7 +99,9 @@ def create_cash_transfer(
             if payload.type == "transfer_in":
                 return service.transfer_in(payload.amount, note=payload.note)
             return service.transfer_out(payload.amount, note=payload.note)
-    except (CashAccountNotInitializedError, CashTransferError) as exc:
+    except CashAccountNotInitializedError as exc:
+        raise _account_not_initialized() from exc
+    except CashTransferError as exc:
         raise _cash_transfer_invalid(str(exc)) from exc
 
 
@@ -112,7 +114,9 @@ def adjust_cash_account(
         with connection_scope(container.settings) as connection:
             service = CashService(CashAccountRepository(connection))
             return service.adjust_cash(payload.cash, note=payload.note)
-    except (CashAccountNotInitializedError, CashTransferError) as exc:
+    except CashAccountNotInitializedError as exc:
+        raise _account_not_initialized() from exc
+    except CashTransferError as exc:
         raise _cash_transfer_invalid(str(exc)) from exc
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime
 
 from quantitative_trading.cash.models import CashAccount, CashTransaction, CashTransactionType
@@ -11,6 +12,10 @@ class CashAccountAlreadyInitializedError(ValueError):
 
 
 class CashAccountNotInitializedError(ValueError):
+    pass
+
+
+class CashAccountInvalidTransferError(ValueError):
     pass
 
 
@@ -137,6 +142,78 @@ class CashAccountRepository:
             raise CashAccountNotInitializedError("cash account not initialized")
         return persisted
 
+    def transfer_in(self, amount: float, *, now: datetime, note: str) -> CashAccount:
+        def operation() -> CashAccount:
+            current = self._require_current_account()
+            cash_after = current.cash_balance + amount
+            return self._save_validated_state_with_transaction(
+                current=current,
+                cash_balance=cash_after,
+                total_transfer_in=current.total_transfer_in + amount,
+                total_transfer_out=current.total_transfer_out,
+                transaction_type=CashTransactionType.TRANSFER_IN,
+                amount=amount,
+                cash_before=current.cash_balance,
+                cash_after=cash_after,
+                now=now,
+                note=note,
+            )
+
+        return self._with_immediate_transaction(operation)
+
+    def transfer_out(self, amount: float, *, now: datetime, note: str) -> CashAccount:
+        def operation() -> CashAccount:
+            current = self._require_current_account()
+            if amount > current.cash_balance:
+                raise CashAccountInvalidTransferError(
+                    "transfer-out amount cannot exceed cash balance"
+                )
+            if amount > current.net_principal:
+                raise CashAccountInvalidTransferError(
+                    "transfer-out amount cannot exceed net principal"
+                )
+
+            cash_after = current.cash_balance - amount
+            return self._save_validated_state_with_transaction(
+                current=current,
+                cash_balance=cash_after,
+                total_transfer_in=current.total_transfer_in,
+                total_transfer_out=current.total_transfer_out + amount,
+                transaction_type=CashTransactionType.TRANSFER_OUT,
+                amount=amount,
+                cash_before=current.cash_balance,
+                cash_after=cash_after,
+                now=now,
+                note=note,
+            )
+
+        return self._with_immediate_transaction(operation)
+
+    def adjust_cash(self, cash: float, *, now: datetime, note: str) -> CashAccount:
+        def operation() -> CashAccount:
+            current = self._require_current_account()
+            if not note.strip():
+                raise CashAccountInvalidTransferError("cash adjustment note is required")
+
+            amount = abs(cash - current.cash_balance)
+            if amount == 0:
+                raise CashAccountInvalidTransferError("cash adjustment must change cash balance")
+
+            return self._save_validated_state_with_transaction(
+                current=current,
+                cash_balance=cash,
+                total_transfer_in=current.total_transfer_in,
+                total_transfer_out=current.total_transfer_out,
+                transaction_type=CashTransactionType.CASH_ADJUSTMENT,
+                amount=amount,
+                cash_before=current.cash_balance,
+                cash_after=cash,
+                now=now,
+                note=note,
+            )
+
+        return self._with_immediate_transaction(operation)
+
     def list_transactions(self, *, limit: int = 20) -> list[CashTransaction]:
         if limit <= 0:
             raise ValueError("limit must be positive")
@@ -150,6 +227,77 @@ class CashAccountRepository:
             (limit,),
         ).fetchall()
         return [CashTransaction.model_validate(dict(row)) for row in rows]
+
+    def _with_immediate_transaction(self, operation: Callable[[], CashAccount]) -> CashAccount:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            account = operation()
+        except Exception:
+            self.connection.rollback()
+            raise
+        self.connection.commit()
+        return account
+
+    def _require_current_account(self) -> CashAccount:
+        current = self.get()
+        if current is None:
+            raise CashAccountNotInitializedError("cash account not initialized")
+        return current
+
+    def _save_validated_state_with_transaction(
+        self,
+        *,
+        current: CashAccount,
+        cash_balance: float,
+        total_transfer_in: float,
+        total_transfer_out: float,
+        transaction_type: CashTransactionType,
+        amount: float,
+        cash_before: float,
+        cash_after: float,
+        now: datetime,
+        note: str,
+    ) -> CashAccount:
+        account = self._build_account(
+            cash_balance=cash_balance,
+            total_transfer_in=total_transfer_in,
+            total_transfer_out=total_transfer_out,
+            updated_at=now,
+        )
+        transaction = self._build_transaction(
+            transaction_type=transaction_type,
+            amount=amount,
+            cash_before=cash_before,
+            cash_after=cash_after,
+            occurred_at=now,
+            note=note,
+        )
+        self._validate_transition(current=current, account=account, transaction=transaction)
+        cursor = self.connection.execute(
+            """
+            UPDATE cash_account
+            SET
+              cash_balance = ?,
+              total_transfer_in = ?,
+              total_transfer_out = ?,
+              updated_at = ?
+            WHERE id = 1
+            """,
+            (
+                account.cash_balance,
+                account.total_transfer_in,
+                account.total_transfer_out,
+                account.updated_at.isoformat(),
+            ),
+        )
+        if cursor.rowcount == 0:
+            raise CashAccountNotInitializedError("cash account not initialized")
+        self._insert_transaction(transaction)
+
+        persisted = self.get()
+        if persisted is None:
+            raise CashAccountNotInitializedError("cash account not initialized")
+        return persisted
 
     def _build_account(
         self,

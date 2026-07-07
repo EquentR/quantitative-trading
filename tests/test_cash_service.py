@@ -1,5 +1,7 @@
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime
+from threading import Event
 
 import pytest
 
@@ -37,6 +39,10 @@ def fixed_now() -> datetime:
 
 def later_now() -> datetime:
     return datetime(2026, 7, 7, 10, 0, tzinfo=UTC)
+
+
+def latest_now() -> datetime:
+    return datetime(2026, 7, 7, 11, 0, tzinfo=UTC)
 
 
 def naive_now() -> datetime:
@@ -102,6 +108,78 @@ def test_cash_service_transfer_in_increases_cash_and_principal(
     assert transactions[-1].cash_before == 50000
     assert transactions[-1].cash_after == 60000
     assert transactions[-1].note == "bank transfer in"
+
+
+def test_cash_service_transfer_in_reads_account_after_waiting_for_write_lock(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "account.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        CashService(CashAccountRepository(connection)).initialize(
+            50000,
+            now=fixed_now(),
+            note="initial principal",
+        )
+
+    with connect(settings) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute(
+            """
+            UPDATE cash_account
+            SET cash_balance = ?, total_transfer_in = ?, updated_at = ?
+            WHERE id = 1
+            """,
+            (51000, 51000, later_now().isoformat()),
+        )
+        blocker.execute(
+            """
+            INSERT INTO cash_transactions (
+              type,
+              amount,
+              cash_before,
+              cash_after,
+              occurred_at,
+              note
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                CashTransactionType.TRANSFER_IN.value,
+                1000,
+                50000,
+                51000,
+                later_now().isoformat(),
+                "first",
+            ),
+        )
+        worker_started = Event()
+
+        def transfer_after_blocker() -> None:
+            worker_started.set()
+            with connect(settings) as worker:
+                service = CashService(CashAccountRepository(worker))
+                service.transfer_in(1000, now=latest_now(), note="second")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(transfer_after_blocker)
+            assert worker_started.wait(timeout=1)
+            with pytest.raises(TimeoutError):
+                future.result(timeout=0.2)
+
+            blocker.commit()
+            future.result(timeout=2)
+
+    with connect(settings) as connection:
+        repository = CashAccountRepository(connection)
+        account = repository.get()
+        transactions = repository.list_transactions(limit=10)
+
+    assert account is not None
+    assert account.cash_balance == 52000
+    assert account.total_transfer_in == 52000
+    assert [(item.note, item.cash_before, item.cash_after) for item in transactions] == [
+        ("initial principal", 0, 50000),
+        ("first", 50000, 51000),
+        ("second", 51000, 52000),
+    ]
 
 
 @pytest.mark.parametrize("amount", [0, -1])
