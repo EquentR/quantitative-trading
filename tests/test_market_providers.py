@@ -127,6 +127,104 @@ def test_akshare_provider_wraps_fetch_failure_for_all_requested_symbols() -> Non
         assert "service unavailable" in quote.warning
 
 
+class EmptyInputAkShare:
+    calls = 0
+
+    @classmethod
+    def stock_zh_a_spot_em(cls):
+        cls.calls += 1
+        return pd.DataFrame()
+
+
+def test_akshare_provider_returns_empty_mapping_without_fetch_for_empty_symbol_list() -> None:
+    provider = AkShareMarketProvider(
+        akshare_module=EmptyInputAkShare,
+        now=lambda: datetime(2026, 7, 7, 2, 30, tzinfo=UTC),
+    )
+
+    assert provider.get_quotes([]) == {}
+    assert EmptyInputAkShare.calls == 0
+
+
+class MissingNameAkShare:
+    @staticmethod
+    def stock_zh_a_spot_em():
+        return pd.DataFrame(
+            [
+                {"代码": "600000", "最新价": 10.5, "涨跌幅": 1.2},
+                {"代码": "000001", "名称": "  ", "最新价": 12.3, "涨跌幅": -0.5},
+            ]
+        )
+
+
+def test_akshare_provider_returns_partial_quote_when_name_is_missing_or_blank() -> None:
+    fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
+    provider = AkShareMarketProvider(akshare_module=MissingNameAkShare, now=lambda: fetched_at)
+
+    quotes = provider.get_quotes(["600000", "000001"])
+
+    for symbol in ("600000", "000001"):
+        assert quotes[symbol].status is QuoteStatus.PARTIAL
+        assert quotes[symbol].name == ""
+        assert quotes[symbol].current_price in {10.5, 12.3}
+        assert quotes[symbol].change_pct in {1.2, -0.5}
+        assert quotes[symbol].data_time == fetched_at
+        assert quotes[symbol].fetched_at == fetched_at
+        assert quotes[symbol].source == "akshare"
+        assert "名称" in quotes[symbol].warning
+
+
+class MissingChangePctAkShare:
+    @staticmethod
+    def stock_zh_a_spot_em():
+        return pd.DataFrame(
+            [
+                {"代码": "600000", "名称": "浦发银行", "最新价": 10.5},
+                {"代码": "000001", "名称": "平安银行", "最新价": 12.3, "涨跌幅": "not a number"},
+            ]
+        )
+
+
+def test_akshare_provider_returns_partial_quote_when_change_pct_is_missing_or_bad() -> None:
+    fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
+    provider = AkShareMarketProvider(akshare_module=MissingChangePctAkShare, now=lambda: fetched_at)
+
+    quotes = provider.get_quotes(["600000", "000001"])
+
+    for symbol in ("600000", "000001"):
+        assert quotes[symbol].status is QuoteStatus.PARTIAL
+        assert quotes[symbol].name in {"浦发银行", "平安银行"}
+        assert quotes[symbol].current_price in {10.5, 12.3}
+        assert quotes[symbol].change_pct is None
+        assert quotes[symbol].data_time == fetched_at
+        assert quotes[symbol].fetched_at == fetched_at
+        assert quotes[symbol].source == "akshare"
+        assert "涨跌幅" in quotes[symbol].warning
+
+
+class BadOptionalFieldsAkShare:
+    @staticmethod
+    def stock_zh_a_spot_em():
+        return pd.DataFrame(
+            [{"代码": "600000", "名称": None, "最新价": 10.5, "涨跌幅": float("inf")}]
+        )
+
+
+def test_akshare_provider_combines_partial_warnings_when_name_and_change_pct_are_bad() -> None:
+    fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
+    provider = AkShareMarketProvider(akshare_module=BadOptionalFieldsAkShare, now=lambda: fetched_at)
+
+    quote = provider.get_quotes(["600000"])["600000"]
+
+    assert quote.status is QuoteStatus.PARTIAL
+    assert quote.name == ""
+    assert quote.current_price == 10.5
+    assert quote.change_pct is None
+    assert quote.data_time == fetched_at
+    assert "名称" in quote.warning
+    assert "涨跌幅" in quote.warning
+
+
 class MixedQualityAkShare:
     @staticmethod
     def stock_zh_a_spot_em():

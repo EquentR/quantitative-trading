@@ -50,6 +50,9 @@ class AkShareMarketProvider:
         self._now = now or (lambda: datetime.now(UTC))
 
     def get_quotes(self, symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
+        if not symbols:
+            return {}
+
         fetched_at = self._now()
         if fetched_at.tzinfo is None or fetched_at.utcoffset() is None:
             raise ValueError("akshare quote fetched_at must be timezone-aware")
@@ -94,25 +97,38 @@ class AkShareMarketProvider:
 
         try:
             row = rows.iloc[0]
-            name = _required_text(row, AKSHARE_NAME_FIELD)
             current_price = _required_float(row, AKSHARE_PRICE_FIELD, positive=True)
-            change_pct = _required_float(row, AKSHARE_CHANGE_PCT_FIELD, positive=False)
-            return QuoteSnapshot(
-                symbol=symbol,
-                name=name,
-                current_price=current_price,
-                change_pct=change_pct,
-                data_time=fetched_at,
-                fetched_at=fetched_at,
-                source="akshare",
-                status=QuoteStatus.OK,
-            )
         except Exception as exc:
             return self._failed_quote(
                 symbol=symbol,
                 fetched_at=fetched_at,
                 warning=f"akshare quote mapping failed: {exc}",
             )
+
+        warnings: list[str] = []
+        name = ""
+        try:
+            name = _required_text(row, AKSHARE_NAME_FIELD)
+        except Exception as exc:
+            warnings.append(f"{AKSHARE_NAME_FIELD} missing or unavailable: {exc}")
+
+        change_pct: float | None = None
+        try:
+            change_pct = _required_float(row, AKSHARE_CHANGE_PCT_FIELD, positive=False)
+        except Exception as exc:
+            warnings.append(f"{AKSHARE_CHANGE_PCT_FIELD} unavailable: {exc}")
+
+        return QuoteSnapshot(
+            symbol=symbol,
+            name=name,
+            current_price=current_price,
+            change_pct=change_pct,
+            data_time=fetched_at,
+            fetched_at=fetched_at,
+            source="akshare",
+            status=QuoteStatus.PARTIAL if warnings else QuoteStatus.OK,
+            warning="; ".join(warnings),
+        )
 
     def _failed_quote(self, *, symbol: str, fetched_at: datetime, warning: str) -> QuoteSnapshot:
         return QuoteSnapshot(
