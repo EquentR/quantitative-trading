@@ -32,5 +32,13 @@ class LedgerService(ReadOnlyLedgerService):
     def remove_position(self, symbol: str) -> None:
         self._repository.remove(symbol)
 
+    def replace_positions(
+        self,
+        positions: list[PositionInput],
+        *,
+        now: datetime | None = None,
+    ) -> list[Position]:
+        return self._repository.replace_all(positions, now=now or current_time())
+
     def import_csv(self, path: Path, *, now: datetime | None = None) -> list[Position]:
         return self._repository.import_csv(path, now=now or current_time())

@@ -128,10 +128,17 @@ class PositionRepository:
         ).fetchall()
         return [self._from_row(row) for row in rows]
 
-    def import_csv(self, path: Path, *, now: datetime) -> list[Position]:
-        positions = self._read_csv_positions(path)
-        persisted = [self._with_updated_at(position, now) for position in positions]
+    def replace_all(self, positions: list[PositionInput], *, now: datetime) -> list[Position]:
+        validated = [PositionInput.model_validate(position) for position in positions]
+        seen_symbols: set[str] = set()
+        for position in validated:
+            if position.symbol in seen_symbols:
+                raise ValueError(f"duplicate symbol {position.symbol}")
+            seen_symbols.add(position.symbol)
 
+        persisted = [self._with_updated_at(position, now) for position in validated]
+
+        # JSON/CSV 导入都是手动持仓台账的全量替换；先完成校验，再在单个事务中整体删除和写入。
         with self.connection:
             self.connection.execute("DELETE FROM positions")
             self.connection.executemany(
@@ -160,6 +167,10 @@ class PositionRepository:
             )
 
         return self.list()
+
+    def import_csv(self, path: Path, *, now: datetime) -> list[Position]:
+        positions = self._read_csv_positions(path)
+        return self.replace_all(positions, now=now)
 
     def _read_csv_positions(self, path: Path) -> list[PositionInput]:
         positions: list[PositionInput] = []
