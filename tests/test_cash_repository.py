@@ -41,6 +41,34 @@ def current_transaction_notes(repository: CashAccountRepository) -> list[str]:
     return [row["note"] for row in rows]
 
 
+def valid_transfer_in_values() -> dict[str, object]:
+    return {
+        "cash_balance": 51000,
+        "total_transfer_in": 51000,
+        "total_transfer_out": 0,
+        "transaction_type": CashTransactionType.TRANSFER_IN,
+        "amount": 1000,
+        "cash_before": 50000,
+        "cash_after": 51000,
+        "now": fixed_now(),
+        "note": "bank transfer in",
+    }
+
+
+def assert_rejects_transition_without_changing_state(
+    repository: CashAccountRepository,
+    values: dict[str, object],
+) -> None:
+    original_account = repository.get()
+    original_transactions = repository.list_transactions()
+
+    with pytest.raises(ValueError):
+        repository.save_state_with_transaction(**values)
+
+    assert repository.get() == original_account
+    assert repository.list_transactions() == original_transactions
+
+
 def test_repository_get_returns_none_before_initialization(
     repository: CashAccountRepository,
 ) -> None:
@@ -127,6 +155,111 @@ def test_repository_saves_new_state_and_transaction(
     assert transactions[1].cash_before == 50000
     assert transactions[1].cash_after == 51000
     assert transactions[1].note == "bank transfer in"
+
+
+def test_repository_rejects_cash_after_mismatch_without_changing_existing_state(
+    repository: CashAccountRepository,
+) -> None:
+    repository.initialize(50000, now=fixed_now(), note="initial principal")
+    values = valid_transfer_in_values()
+    values["cash_after"] = 99999
+
+    assert_rejects_transition_without_changing_state(repository, values)
+
+
+def test_repository_rejects_cash_before_mismatch_without_changing_existing_state(
+    repository: CashAccountRepository,
+) -> None:
+    repository.initialize(50000, now=fixed_now(), note="initial principal")
+    values = valid_transfer_in_values()
+    values["cash_before"] = 49000
+
+    assert_rejects_transition_without_changing_state(repository, values)
+
+
+def test_repository_rejects_amount_delta_mismatch_without_changing_existing_state(
+    repository: CashAccountRepository,
+) -> None:
+    repository.initialize(50000, now=fixed_now(), note="initial principal")
+    values = valid_transfer_in_values()
+    values["amount"] = 999
+
+    assert_rejects_transition_without_changing_state(repository, values)
+
+
+def test_repository_rejects_bad_transfer_in_total_without_changing_existing_state(
+    repository: CashAccountRepository,
+) -> None:
+    repository.initialize(50000, now=fixed_now(), note="initial principal")
+    values = valid_transfer_in_values()
+    values["total_transfer_in"] = 50000
+
+    assert_rejects_transition_without_changing_state(repository, values)
+
+
+def test_repository_rejects_bad_transfer_out_total_without_changing_existing_state(
+    repository: CashAccountRepository,
+) -> None:
+    repository.initialize(50000, now=fixed_now(), note="initial principal")
+    values = {
+        "cash_balance": 49000,
+        "total_transfer_in": 50000,
+        "total_transfer_out": 0,
+        "transaction_type": CashTransactionType.TRANSFER_OUT,
+        "amount": 1000,
+        "cash_before": 50000,
+        "cash_after": 49000,
+        "now": fixed_now(),
+        "note": "bank transfer out",
+    }
+
+    assert_rejects_transition_without_changing_state(repository, values)
+
+
+def test_repository_allows_cash_adjustment_without_changing_transfer_totals(
+    repository: CashAccountRepository,
+) -> None:
+    repository.initialize(50000, now=fixed_now(), note="initial principal")
+
+    account = repository.save_state_with_transaction(
+        cash_balance=49500,
+        total_transfer_in=50000,
+        total_transfer_out=0,
+        transaction_type=CashTransactionType.CASH_ADJUSTMENT,
+        amount=500,
+        cash_before=50000,
+        cash_after=49500,
+        now=fixed_now(),
+        note="manual broker correction",
+    )
+
+    transactions = repository.list_transactions()
+    assert account.cash_balance == 49500
+    assert account.total_transfer_in == 50000
+    assert account.total_transfer_out == 0
+    assert transactions[1].type is CashTransactionType.CASH_ADJUSTMENT
+    assert transactions[1].amount == 500
+    assert transactions[1].cash_before == 50000
+    assert transactions[1].cash_after == 49500
+
+
+def test_repository_rejects_initial_deposit_save_without_changing_existing_state(
+    repository: CashAccountRepository,
+) -> None:
+    repository.initialize(50000, now=fixed_now(), note="initial principal")
+    values = {
+        "cash_balance": 51000,
+        "total_transfer_in": 51000,
+        "total_transfer_out": 0,
+        "transaction_type": CashTransactionType.INITIAL_DEPOSIT,
+        "amount": 1000,
+        "cash_before": 50000,
+        "cash_after": 51000,
+        "now": fixed_now(),
+        "note": "bad deposit",
+    }
+
+    assert_rejects_transition_without_changing_state(repository, values)
 
 
 def test_repository_rejects_naive_save_time_without_changing_existing_state(
