@@ -17,6 +17,7 @@ from quantitative_trading.storage.sqlite import connect, migrate
 @dataclass(frozen=True)
 class ApiContainer:
     settings: Settings
+    scheduler: object | None = None
 
 
 def get_container() -> ApiContainer:

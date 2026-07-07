@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import re
+import sqlite3
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends
+from pydantic import ValidationError
 
 from quantitative_trading.api.dependencies import (
     ApiContainer,
     auth_service,
     connection_scope,
     get_container,
+    require_token,
 )
+from quantitative_trading.api.errors import ApiError
+from quantitative_trading.runtime.account_snapshot_job import create_and_save_account_snapshot
+from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
 
 
 router = APIRouter(prefix="/service", tags=["service"])
@@ -15,13 +24,132 @@ router = APIRouter(prefix="/service", tags=["service"])
 
 @router.get("/status")
 def status(container: ApiContainer = Depends(get_container)) -> dict[str, object]:
+    return _status_payload(container)
+
+
+@router.post("/scheduler/start", dependencies=[Depends(require_token)])
+def start_scheduler(container: ApiContainer = Depends(get_container)) -> dict[str, object]:
+    _set_scheduler_enabled(container, enabled=True)
+    if container.scheduler is not None:
+        container.scheduler.start()
+    return _status_payload(container)
+
+
+@router.post("/scheduler/stop", dependencies=[Depends(require_token)])
+def stop_scheduler(container: ApiContainer = Depends(get_container)) -> dict[str, object]:
+    _set_scheduler_enabled(container, enabled=False)
+    if container.scheduler is not None:
+        container.scheduler.stop()
+    return _status_payload(container)
+
+
+@router.post("/run-once", dependencies=[Depends(require_token)])
+def run_once(container: ApiContainer = Depends(get_container)) -> dict[str, object]:
+    # 手动触发只写账户快照和调度状态，不修改现金账户或手动持仓台账。
+    started_at = datetime.now(UTC)
+    snapshot_id: int | None = None
+    status_value = "success"
+    error: str | None = None
+
+    try:
+        created = create_and_save_account_snapshot(container.settings)
+        snapshot_id = created.snapshot_id
+    except Exception as exc:
+        status_value = "failed"
+        error = _safe_error_summary(exc)
+
+    finished_at = datetime.now(UTC)
     with connection_scope(container.settings) as connection:
-        current_auth_status = auth_service(container.settings, connection).status()
+        repository = SchedulerStateRepository(connection)
+        repository.get_or_create(
+            interval_seconds=container.settings.intraday_interval_seconds,
+            run_on_start=container.settings.service_run_on_start_when_scheduler_enabled,
+            now=started_at,
+        )
+        repository.record_result(
+            started_at=started_at,
+            finished_at=finished_at,
+            status=status_value,
+            reason="manual_api",
+            error=error,
+            snapshot_id=snapshot_id,
+            now=finished_at,
+        )
+    return _status_payload(container)
+
+
+def _status_payload(container: ApiContainer) -> dict[str, object]:
+    now = datetime.now(UTC)
+    try:
+        with connection_scope(container.settings) as connection:
+            current_auth_status = auth_service(container.settings, connection).status()
+            scheduler_state = SchedulerStateRepository(connection).get_or_create(
+                interval_seconds=container.settings.intraday_interval_seconds,
+                run_on_start=container.settings.service_run_on_start_when_scheduler_enabled,
+                now=now,
+            )
+    except (sqlite3.Error, ValidationError) as exc:
+        raise _service_state_failed() from exc
+
     return {
         "auth_status": current_auth_status,
-        "scheduler_enabled": False,
-        "scheduler_running": False,
-        "next_run_time": None,
-        "last_status": None,
-        "last_error": None,
+        "scheduler_enabled": scheduler_state.enabled,
+        "scheduler_running": _scheduler_running(container.scheduler),
+        "interval_seconds": scheduler_state.interval_seconds,
+        "timezone": container.settings.timezone,
+        "run_on_start": scheduler_state.run_on_start,
+        "next_run_time": _scheduler_next_run_time(container.scheduler),
+        "last_started_at": scheduler_state.last_started_at,
+        "last_finished_at": scheduler_state.last_finished_at,
+        "last_status": scheduler_state.last_status,
+        "last_reason": scheduler_state.last_reason,
+        "last_error": scheduler_state.last_error,
+        "last_snapshot_id": scheduler_state.last_snapshot_id,
     }
+
+
+def _set_scheduler_enabled(container: ApiContainer, *, enabled: bool) -> None:
+    now = datetime.now(UTC)
+    try:
+        with connection_scope(container.settings) as connection:
+            SchedulerStateRepository(connection).set_enabled(
+                enabled,
+                interval_seconds=container.settings.intraday_interval_seconds,
+                run_on_start=container.settings.service_run_on_start_when_scheduler_enabled,
+                now=now,
+            )
+    except (sqlite3.Error, ValidationError) as exc:
+        raise _service_state_failed() from exc
+
+
+def _scheduler_running(scheduler: object | None) -> bool:
+    if scheduler is None:
+        return False
+    value = getattr(scheduler, "is_running", False)
+    if callable(value):
+        value = value()
+    return bool(value)
+
+
+def _scheduler_next_run_time(scheduler: object | None) -> object | None:
+    if scheduler is None:
+        return None
+    value = getattr(scheduler, "next_run_time", None)
+    if callable(value):
+        value = value()
+    return value
+
+
+def _safe_error_summary(exc: Exception) -> str:
+    summary = str(exc).strip() or exc.__class__.__name__
+    summary = re.sub(r"(?i)\b(token|password|secret|cookie|api[_-]?key)=\S+", r"\1=[redacted]", summary)
+    summary = re.sub(r"(?<!\w)/(?:[^/\s]+/)*[^/\s]+", "[path]", summary)
+    return summary[:300]
+
+
+def _service_state_failed() -> ApiError:
+    return ApiError(
+        status_code=500,
+        code="internal_error",
+        message="service state storage failed",
+    )

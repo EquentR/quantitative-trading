@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from quantitative_trading.config import Settings
+from quantitative_trading.runtime.scheduler import SchedulerManager
 from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
 from quantitative_trading.storage.sqlite import connect, migrate
 
@@ -96,3 +97,38 @@ def test_scheduler_state_rejects_naive_update_time(tmp_path) -> None:
                 run_on_start=True,
                 now=datetime(2026, 7, 7, 2, 0),
             )
+
+
+def test_scheduler_manager_start_and_stop_are_idempotent(tmp_path) -> None:
+    calls: list[str] = []
+
+    class FakeScheduler:
+        def __init__(self, *, timezone: str) -> None:
+            self.timezone = timezone
+            self.jobs = []
+            self.running = False
+
+        def add_job(self, func, **kwargs) -> None:
+            self.jobs.append((func, kwargs))
+
+        def start(self) -> None:
+            self.running = True
+
+        def shutdown(self, wait: bool = False) -> None:
+            self.running = False
+
+    manager = SchedulerManager(
+        interval_seconds=7,
+        timezone="Asia/Shanghai",
+        job=lambda reason: calls.append(reason),
+        scheduler_factory=FakeScheduler,
+    )
+
+    first = manager.start()
+    second = manager.start()
+    manager.stop()
+    manager.stop()
+
+    assert first is True
+    assert second is False
+    assert manager.is_running is False
