@@ -1,7 +1,9 @@
 from datetime import UTC, datetime, timedelta
 
+from fastapi.testclient import TestClient
 import pytest
 
+from quantitative_trading.api.app import create_app
 from quantitative_trading.api.auth import (
     AuthAlreadyConfiguredError,
     AuthService,
@@ -15,6 +17,53 @@ from quantitative_trading.storage.sqlite import connect, migrate
 
 
 NOW = datetime(2026, 7, 7, 2, 0, tzinfo=UTC)
+
+
+def test_auth_status_reports_setup_required_without_password(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "api.db")
+    client = TestClient(create_app(settings))
+
+    response = client.get("/api/v1/service/status")
+
+    assert response.status_code == 200
+    assert response.json()["auth_status"] == "setup_required"
+
+
+def test_setup_password_then_login_and_me(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "api.db")
+    client = TestClient(create_app(settings))
+
+    setup_response = client.post(
+        "/api/v1/auth/setup-password",
+        json={"password": "local-password"},
+    )
+    login_response = client.post(
+        "/api/v1/auth/login",
+        json={"password": "local-password"},
+    )
+    token = login_response.json()["access_token"]
+    me_response = client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert setup_response.status_code == 200
+    assert setup_response.json() == {"auth_status": "configured"}
+    assert login_response.status_code == 200
+    assert login_response.json()["token_type"] == "bearer"
+    assert me_response.status_code == 200
+    assert me_response.json() == {"user": "local"}
+
+
+def test_protected_endpoint_requires_auth_after_setup(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "api.db")
+    client = TestClient(create_app(settings))
+    client.post("/api/v1/auth/setup-password", json={"password": "local-password"})
+
+    response = client.get("/api/v1/positions")
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
 
 
 def test_auth_repository_starts_unconfigured(tmp_path) -> None:

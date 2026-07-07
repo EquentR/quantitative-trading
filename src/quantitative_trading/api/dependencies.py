@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+
+from fastapi import Depends, Header
+
+from quantitative_trading.api.auth import AuthService, InvalidTokenError
+from quantitative_trading.api.errors import ApiError
+from quantitative_trading.config import Settings
+from quantitative_trading.storage.api_auth import ApiAuthRepository
+from quantitative_trading.storage.sqlite import connect, migrate
+
+
+@dataclass(frozen=True)
+class ApiContainer:
+    settings: Settings
+
+
+def get_container() -> ApiContainer:
+    raise RuntimeError("container dependency not configured")
+
+
+@contextmanager
+def connection_scope(settings: Settings) -> Iterator[sqlite3.Connection]:
+    # API 请求使用短连接，避免跨请求共享 SQLite 连接状态；迁移保持幂等。
+    with connect(settings) as connection:
+        migrate(connection)
+        yield connection
+
+
+def auth_service(settings: Settings, connection: sqlite3.Connection) -> AuthService:
+    return AuthService(
+        ApiAuthRepository(connection),
+        token_ttl_seconds=settings.api_token_ttl_seconds,
+        startup_password=settings.api_access_password,
+        configured_token_secret=settings.api_token_secret,
+    )
+
+
+def require_token(
+    authorization: str | None = Header(default=None),
+    container: ApiContainer = Depends(get_container),
+) -> None:
+    if authorization is None:
+        raise ApiError(
+            status_code=401,
+            code="unauthorized",
+            message="missing bearer token",
+        )
+
+    scheme, separator, token = authorization.partition(" ")
+    token = token.strip()
+    if separator == "" or scheme.lower() != "bearer" or token == "":
+        raise ApiError(
+            status_code=401,
+            code="unauthorized",
+            message="missing bearer token",
+        )
+
+    try:
+        with connection_scope(container.settings) as connection:
+            auth_service(container.settings, connection).verify_token(token)
+    except InvalidTokenError as exc:
+        raise ApiError(
+            status_code=401,
+            code="unauthorized",
+            message="invalid token",
+        ) from exc
