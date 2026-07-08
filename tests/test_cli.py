@@ -145,6 +145,98 @@ def test_ledger_import_reports_missing_file_error(tmp_path) -> None:
     assert "Traceback" not in result.output
 
 
+def test_watchlist_add_list_update_and_remove(tmp_path) -> None:
+    add_result = run_cli(
+        tmp_path,
+        "watchlist",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "浦发银行",
+        "--rank",
+        "1",
+        "--plan-enabled",
+        "false",
+        "--note",
+        "观察",
+    )
+    update_result = run_cli(
+        tmp_path,
+        "watchlist",
+        "update",
+        "600000",
+        "--name",
+        "浦发银行",
+        "--rank",
+        "1",
+        "--plan-enabled",
+        "true",
+        "--note",
+        "观察",
+    )
+    list_result = run_cli(tmp_path, "watchlist", "list")
+    remove_result = run_cli(tmp_path, "watchlist", "remove", "600000")
+    empty_result = run_cli(tmp_path, "watchlist", "list")
+
+    assert add_result.exit_code == 0
+    assert "已新增观察 600000 浦发银行" in add_result.output
+    assert update_result.exit_code == 0
+    assert "已更新观察 600000" in update_result.output
+    assert list_result.exit_code == 0
+    assert "600000" in list_result.output
+    assert "计划=true" in list_result.output
+    assert "来源=manual" in list_result.output
+    assert remove_result.exit_code == 0
+    assert "已删除观察 600000" in remove_result.output
+    assert "暂无观察股" in empty_result.output
+
+
+def test_watchlist_import_and_export(tmp_path) -> None:
+    csv_path = tmp_path / "watchlist.csv"
+    csv_path.write_text(
+        "symbol,name,rank,plan_enabled,note\n"
+        "600000,浦发银行,1,true,观察\n",
+        encoding="utf-8",
+    )
+
+    import_result = run_cli(tmp_path, "watchlist", "import", str(csv_path))
+    export_result = run_cli(tmp_path, "watchlist", "export")
+
+    assert import_result.exit_code == 0
+    assert "已导入 1 条观察" in import_result.output
+    assert export_result.exit_code == 0
+    assert "symbol,name,rank,plan_enabled,note" in export_result.output
+    assert "600000,浦发银行,1,true,观察" in export_result.output
+
+
+def test_watchlist_import_reports_missing_file_error(tmp_path) -> None:
+    csv_path = tmp_path / "missing-watchlist.csv"
+
+    result = run_cli(tmp_path, "watchlist", "import", str(csv_path))
+
+    assert result.exit_code != 0
+    assert "导入观察失败" in result.output
+    assert "missing-watchlist.csv" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_watchlist_import_reports_invalid_header_error(tmp_path) -> None:
+    csv_path = tmp_path / "watchlist.csv"
+    csv_path.write_text(
+        "symbol,name,rank,plan_enabled,note,extra\n"
+        "600000,浦发银行,1,true,观察,x\n",
+        encoding="utf-8",
+    )
+
+    result = run_cli(tmp_path, "watchlist", "import", str(csv_path))
+
+    assert result.exit_code != 0
+    assert "导入观察失败" in result.output
+    assert "CSV header must exactly match" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_service_check_reads_ledger(tmp_path) -> None:
     db_path = tmp_path / "ledger.db"
 

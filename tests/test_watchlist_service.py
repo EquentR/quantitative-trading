@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from quantitative_trading.config import Settings
 from quantitative_trading.storage.sqlite import connect, migrate
 from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
@@ -62,5 +64,24 @@ def test_read_only_watch_pinned_service_can_list_pinned(tmp_path) -> None:
         items = read_only.list_pinned()
 
         assert [item.symbol for item in items] == ["600000"]
+    finally:
+        connection_cm.__exit__(None, None, None)
+
+
+def test_watch_pinned_service_import_csv_rejects_duplicates_and_accepts_bom(
+    tmp_path,
+) -> None:
+    service, _, connection_cm = make_services(tmp_path)
+    csv_path = tmp_path / "watchlist.csv"
+    csv_path.write_text(
+        "\ufeffsymbol,name,rank,plan_enabled,note\n"
+        "600000,浦发银行,1,true,观察\n"
+        "600000,浦发银行,2,false,重复\n",
+        encoding="utf-8",
+    )
+
+    try:
+        with pytest.raises(ValueError, match="duplicate symbol 600000"):
+            service.import_csv(csv_path, source=WatchPinnedSource.MANUAL)
     finally:
         connection_cm.__exit__(None, None, None)

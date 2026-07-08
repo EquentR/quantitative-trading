@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 from quantitative_trading.watchlist.models import (
     WatchPinnedInput,
@@ -46,6 +47,15 @@ class WatchPinnedService(ReadOnlyWatchPinnedService):
         now: datetime | None = None,
     ) -> list[WatchPinnedItem]:
         return self._repository.replace_all(items, source=source, now=now or current_time())
+
+    def import_csv(
+        self,
+        path: Path,
+        *,
+        source: WatchPinnedSource,
+        now: datetime | None = None,
+    ) -> list[WatchPinnedItem]:
+        return self._repository.import_csv(path, source=source, now=now or current_time())
 
     def merge_synced_pinned(
         self,

@@ -31,6 +31,16 @@ from quantitative_trading.market.providers import (
 from quantitative_trading.runtime.service_app import run_api_service
 from quantitative_trading.runtime.service_runner import DebugServiceRunner
 from quantitative_trading.storage.sqlite import connect, migrate
+from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
+from quantitative_trading.watchlist.repository import (
+    WATCH_PINNED_CSV_COLUMNS,
+    WatchPinnedRepository,
+    parse_watch_pinned_bool,
+)
+from quantitative_trading.watchlist.service import (
+    ReadOnlyWatchPinnedService,
+    WatchPinnedService,
+)
 
 
 app = typer.Typer()
@@ -38,11 +48,13 @@ ledger_app = typer.Typer()
 service_app = typer.Typer()
 cash_app = typer.Typer()
 account_app = typer.Typer()
+watchlist_app = typer.Typer()
 
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(service_app, name="service")
 app.add_typer(cash_app, name="cash")
 app.add_typer(account_app, name="account")
+app.add_typer(watchlist_app, name="watchlist")
 
 
 def _services() -> tuple[
@@ -124,6 +136,27 @@ def _read_only_service_scope() -> Iterator[ReadOnlyLedgerService | None]:
             connection_cm.__exit__(*sys.exc_info())
 
 
+@contextmanager
+def _watchlist_service_scope() -> Iterator[
+    tuple[WatchPinnedService, ReadOnlyWatchPinnedService]
+]:
+    settings = load_settings()
+    connection_cm = connect(settings)
+    entered = False
+    try:
+        connection = connection_cm.__enter__()
+        entered = True
+        migrate(connection)
+        repository = WatchPinnedRepository(connection)
+        yield WatchPinnedService(repository), ReadOnlyWatchPinnedService(repository)
+    except BaseException:
+        if entered:
+            connection_cm.__exit__(*sys.exc_info())
+        raise
+    else:
+        connection_cm.__exit__(None, None, None)
+
+
 def _position_input(
     *,
     symbol: str,
@@ -147,6 +180,28 @@ def _position_input(
             }
         )
     except ValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _watch_pinned_input(
+    *,
+    symbol: str,
+    name: str,
+    rank: int,
+    plan_enabled: str,
+    note: str,
+) -> WatchPinnedInput:
+    try:
+        return WatchPinnedInput.model_validate(
+            {
+                "symbol": symbol,
+                "name": name,
+                "rank": rank,
+                "plan_enabled": parse_watch_pinned_bool(plan_enabled),
+                "note": note,
+            }
+        )
+    except (ValidationError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
 
@@ -293,6 +348,112 @@ def export_positions() -> None:
                     position.note,
                 ]
             )
+
+
+@watchlist_app.command("add")
+def add_watch_pinned(
+    symbol: Annotated[str, typer.Option("--symbol")],
+    name: Annotated[str, typer.Option("--name")],
+    rank: Annotated[int, typer.Option("--rank")],
+    plan_enabled: Annotated[str, typer.Option("--plan-enabled")] = "false",
+    note: Annotated[str, typer.Option("--note")] = "",
+) -> None:
+    with _watchlist_service_scope() as (service, _):
+        item = _watch_pinned_input(
+            symbol=symbol,
+            name=name,
+            rank=rank,
+            plan_enabled=plan_enabled,
+            note=note,
+        )
+        service.upsert_pinned(item, source=WatchPinnedSource.MANUAL)
+        typer.echo(f"已新增观察 {item.symbol} {item.name}")
+
+
+@watchlist_app.command("update")
+def update_watch_pinned(
+    symbol: Annotated[str, typer.Argument()],
+    name: Annotated[str, typer.Option("--name")],
+    rank: Annotated[int, typer.Option("--rank")],
+    plan_enabled: Annotated[str, typer.Option("--plan-enabled")] = "false",
+    note: Annotated[str, typer.Option("--note")] = "",
+) -> None:
+    with _watchlist_service_scope() as (service, _):
+        item = _watch_pinned_input(
+            symbol=symbol,
+            name=name,
+            rank=rank,
+            plan_enabled=plan_enabled,
+            note=note,
+        )
+        service.upsert_pinned(item, source=WatchPinnedSource.MANUAL)
+        typer.echo(f"已更新观察 {item.symbol}")
+
+
+@watchlist_app.command("remove")
+def remove_watch_pinned(symbol: Annotated[str, typer.Argument()]) -> None:
+    with _watchlist_service_scope() as (service, _):
+        service.remove_pinned(symbol)
+        typer.echo(f"已删除观察 {symbol}")
+
+
+@watchlist_app.command("list")
+def list_watch_pinned() -> None:
+    with _watchlist_service_scope() as (_, read_only):
+        items = read_only.list_pinned()
+        if not items:
+            typer.echo("暂无观察股")
+            return
+
+        for item in items:
+            typer.echo(
+                (
+                    f"{item.symbol} {item.name} "
+                    f"排序={item.rank} "
+                    f"计划={str(item.plan_enabled).lower()} "
+                    f"来源={item.source.value} "
+                    f"更新={item.updated_at.isoformat()} "
+                    f"备注={item.note}"
+                )
+            )
+
+
+@watchlist_app.command("import")
+def import_watch_pinned(path: Annotated[Path, typer.Argument()]) -> None:
+    with _watchlist_service_scope() as (service, _):
+        try:
+            imported = service.import_csv(path, source=WatchPinnedSource.MANUAL)
+        except (OSError, ValueError) as exc:
+            raise typer.BadParameter(f"导入观察失败 {path.name}: {exc}") from exc
+        typer.echo(f"已导入 {len(imported)} 条观察")
+
+
+@watchlist_app.command("export")
+def export_watch_pinned() -> None:
+    with _watchlist_service_scope() as (_, read_only):
+        writer = csv.DictWriter(
+            sys.stdout,
+            fieldnames=WATCH_PINNED_CSV_COLUMNS,
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for item in read_only.list_pinned():
+            writer.writerow(
+                {
+                    "symbol": item.symbol,
+                    "name": item.name,
+                    "rank": item.rank,
+                    "plan_enabled": str(item.plan_enabled).lower(),
+                    "note": item.note,
+                }
+            )
+
+
+@watchlist_app.command("sync")
+def sync_watch_pinned() -> None:
+    with _watchlist_service_scope() as (_, read_only):
+        count = len(read_only.list_pinned())
+    typer.echo(f"未配置外部自选置顶同步源，未修改观察池；当前观察股数量: {count}")
 
 
 @cash_app.command("init")

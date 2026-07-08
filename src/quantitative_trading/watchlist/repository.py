@@ -1,13 +1,33 @@
 from __future__ import annotations
 
+import csv
 import sqlite3
 from datetime import datetime
+from pathlib import Path
+
+from pydantic import ValidationError
 
 from quantitative_trading.watchlist.models import (
     WatchPinnedInput,
     WatchPinnedItem,
     WatchPinnedSource,
 )
+
+
+WATCH_PINNED_CSV_COLUMNS = ["symbol", "name", "rank", "plan_enabled", "note"]
+TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
+FALSE_VALUES = {"0", "false", "f", "no", "n", "off", ""}
+
+
+def parse_watch_pinned_bool(value: bool | str | None) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = "" if value is None else value.strip().lower()
+    if normalized in TRUE_VALUES:
+        return True
+    if normalized in FALSE_VALUES:
+        return False
+    raise ValueError(f"invalid boolean value: {value}")
 
 
 class WatchPinnedRepository:
@@ -138,6 +158,16 @@ class WatchPinnedRepository:
 
         return self.list()
 
+    def import_csv(
+        self,
+        path: Path,
+        *,
+        source: WatchPinnedSource,
+        now: datetime,
+    ) -> list[WatchPinnedItem]:
+        items = self._read_csv_items(path)
+        return self.replace_all(items, source=source, now=now)
+
     def merge_synced(
         self,
         items: list[WatchPinnedInput],
@@ -253,6 +283,39 @@ class WatchPinnedRepository:
                 raise ValueError(f"duplicate symbol {item.symbol}")
             seen_symbols.add(item.symbol)
         return validated
+
+    def _read_csv_items(self, path: Path) -> list[WatchPinnedInput]:
+        items: list[WatchPinnedInput] = []
+        seen_symbols: dict[str, int] = {}
+        with path.open(newline="", encoding="utf-8-sig") as file:
+            reader = csv.DictReader(file)
+            if reader.fieldnames != WATCH_PINNED_CSV_COLUMNS:
+                expected = ",".join(WATCH_PINNED_CSV_COLUMNS)
+                raise ValueError(f"CSV header must exactly match: {expected}")
+            for row_number, row in enumerate(reader, start=2):
+                try:
+                    item = WatchPinnedInput.model_validate(
+                        {
+                            "symbol": row["symbol"],
+                            "name": row["name"],
+                            "rank": row["rank"],
+                            "plan_enabled": parse_watch_pinned_bool(
+                                row["plan_enabled"],
+                            ),
+                            "note": row["note"],
+                        }
+                    )
+                except (KeyError, ValidationError, ValueError) as exc:
+                    raise ValueError(f"invalid watchlist row {row_number}") from exc
+                if item.symbol in seen_symbols:
+                    first_row = seen_symbols[item.symbol]
+                    raise ValueError(
+                        f"duplicate symbol {item.symbol} at row {row_number}; "
+                        f"first seen at row {first_row}"
+                    )
+                seen_symbols[item.symbol] = row_number
+                items.append(item)
+        return items
 
     def _with_metadata(
         self,
