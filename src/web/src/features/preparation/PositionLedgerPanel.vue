@@ -152,7 +152,7 @@ async function onExportCsv() {
           <td class="py-1">{{ p.name }}</td>
           <td class="py-1">{{ p.quantity }}</td>
           <td class="py-1">{{ p.available_quantity }}</td>
-          <td class="py-1"><FormatValues kind="money" :value="p.cost_price" /></td>
+          <td class="py-1"><FormatValues kind="price" :value="p.cost_price" /></td>
           <td class="py-1">
             <div class="flex justify-end gap-1">
               <Button variant="ghost" @click="onEdit(p)">
@@ -190,7 +190,7 @@ async function onExportCsv() {
         </label>
         <label class="block">
           <span class="text-xs font-medium">成本价</span>
-          <input v-model.number="form.cost_price" type="number" step="0.01" class="mt-1 block w-full rounded-md border border-border px-2 py-1 text-sm" />
+          <input v-model.number="form.cost_price" type="number" step="0.001" class="mt-1 block w-full rounded-md border border-border px-2 py-1 text-sm" />
         </label>
         <label class="block">
           <span class="text-xs font-medium">建仓日期</span>

@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 
 interface Props {
-  kind: 'money' | 'ratio' | 'time'
+  kind: 'money' | 'price' | 'ratio' | 'time'
   value: number | string | null | undefined
 }
 
@@ -16,6 +16,12 @@ const text = computed(() => {
     const n = Number(v)
     if (!Number.isFinite(n)) return '不可用'
     return '¥' + n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
+  }
+
+  if (props.kind === 'price') {
+    const n = Number(v)
+    if (!Number.isFinite(n)) return '不可用'
+    return '¥' + n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 3 })
   }
 
   if (props.kind === 'ratio') {

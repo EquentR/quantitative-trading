@@ -121,9 +121,18 @@ class SensitiveFailingAkShare:
         )
 
 
+def failing_quote_fetcher(url: str, *, timeout: float):
+    raise RuntimeError("fallback unavailable")
+
+
 def test_akshare_provider_wraps_fetch_failure_for_all_requested_symbols() -> None:
     fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
-    provider = AkShareMarketProvider(akshare_module=FailingAkShare, now=lambda: fetched_at)
+    provider = AkShareMarketProvider(
+        akshare_module=FailingAkShare,
+        now=lambda: fetched_at,
+        eastmoney_single_quote_fetcher=failing_quote_fetcher,
+        tencent_quote_fetcher=failing_quote_fetcher,
+    )
 
     quotes = provider.get_quotes(["600000", "000001"])
 
@@ -136,11 +145,123 @@ def test_akshare_provider_wraps_fetch_failure_for_all_requested_symbols() -> Non
         assert "service unavailable" in quote.warning
 
 
+def test_akshare_provider_falls_back_to_single_quote_fetch_when_batch_fetch_fails() -> None:
+    fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
+    requested_urls: list[str] = []
+
+    def single_quote_fetcher(url: str, *, timeout: float):
+        requested_urls.append(url)
+        assert timeout > 0
+        assert url.startswith("https://82.push2.eastmoney.com/")
+        if "secid=0.002555" in url:
+            return {
+                "data": {
+                    "f57": "002555",
+                    "f58": "三七互娱",
+                    "f43": 1883,
+                    "f170": -309,
+                }
+            }
+        if "secid=1.603459" in url:
+            return {
+                "data": {
+                    "f57": "603459",
+                    "f58": "红板科技",
+                    "f43": 8972,
+                    "f170": -2,
+                }
+            }
+        if "secid=1.515880" in url:
+            return {
+                "data": {
+                    "f57": "515880",
+                    "f58": "通信ETF国泰",
+                    "f43": 780,
+                    "f170": 250,
+                }
+            }
+        raise AssertionError(f"unexpected url: {url}")
+
+    provider = AkShareMarketProvider(
+        akshare_module=FailingAkShare,
+        now=lambda: fetched_at,
+        eastmoney_single_quote_fetcher=single_quote_fetcher,
+    )
+
+    quotes = provider.get_quotes(["002555", "515880", "603459"])
+
+    assert quotes["002555"].status is QuoteStatus.OK
+    assert quotes["002555"].name == "三七互娱"
+    assert quotes["002555"].current_price == 18.83
+    assert quotes["002555"].change_pct == -3.09
+    assert quotes["515880"].status is QuoteStatus.OK
+    assert quotes["515880"].name == "通信ETF国泰"
+    assert quotes["515880"].current_price == 0.78
+    assert quotes["515880"].change_pct == 2.5
+    assert quotes["603459"].status is QuoteStatus.OK
+    assert quotes["603459"].name == "红板科技"
+    assert quotes["603459"].current_price == 89.72
+    assert quotes["603459"].change_pct == -0.02
+    assert all(quote.source == "eastmoney_single_quote" for quote in quotes.values())
+    assert len(requested_urls) == 3
+
+
+def test_akshare_provider_falls_back_to_tencent_quotes_when_eastmoney_single_quote_fails() -> None:
+    fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
+
+    def failing_single_quote_fetcher(url: str, *, timeout: float):
+        raise RuntimeError("eastmoney disconnected")
+
+    def tencent_line(prefix: str, symbol: str, name: str, price: str, change_pct: str) -> str:
+        fields = [""] * 88
+        fields[1] = name
+        fields[2] = symbol
+        fields[3] = price
+        fields[32] = change_pct
+        return f'v_{prefix}{symbol}="' + "~".join(fields) + '";'
+
+    def tencent_quote_fetcher(url: str, *, timeout: float):
+        assert timeout > 0
+        assert "q=sz002555,sh515880,sh603459" in url
+        return "\n".join(
+            [
+                tencent_line("sz", "002555", "三七互娱", "18.83", "-3.09"),
+                tencent_line("sh", "515880", "通信ETF国泰", "0.780", "2.50"),
+                tencent_line("sh", "603459", "红板科技", "89.72", "-0.02"),
+            ]
+        )
+
+    provider = AkShareMarketProvider(
+        akshare_module=FailingAkShare,
+        now=lambda: fetched_at,
+        eastmoney_single_quote_fetcher=failing_single_quote_fetcher,
+        tencent_quote_fetcher=tencent_quote_fetcher,
+    )
+
+    quotes = provider.get_quotes(["002555", "515880", "603459"])
+
+    assert quotes["002555"].status is QuoteStatus.OK
+    assert quotes["002555"].name == "三七互娱"
+    assert quotes["002555"].current_price == 18.83
+    assert quotes["002555"].change_pct == -3.09
+    assert quotes["515880"].status is QuoteStatus.OK
+    assert quotes["515880"].name == "通信ETF国泰"
+    assert quotes["515880"].current_price == 0.78
+    assert quotes["515880"].change_pct == 2.5
+    assert quotes["603459"].status is QuoteStatus.OK
+    assert quotes["603459"].name == "红板科技"
+    assert quotes["603459"].current_price == 89.72
+    assert quotes["603459"].change_pct == -0.02
+    assert all(quote.source == "tencent_quote" for quote in quotes.values())
+
+
 def test_akshare_provider_sanitizes_fetch_failure_warning() -> None:
     fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
     provider = AkShareMarketProvider(
         akshare_module=SensitiveFailingAkShare,
         now=lambda: fetched_at,
+        eastmoney_single_quote_fetcher=failing_quote_fetcher,
+        tencent_quote_fetcher=failing_quote_fetcher,
     )
 
     quote = provider.get_quotes(["600000"])["600000"]

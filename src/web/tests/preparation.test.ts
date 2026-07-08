@@ -2,8 +2,10 @@ import { render, screen, waitFor } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
 import { createPinia, setActivePinia } from 'pinia'
 import { VueQueryPlugin } from '@tanstack/vue-query'
+import { http, HttpResponse } from 'msw'
 import { beforeEach, expect, test, vi } from 'vitest'
 import PreparationPage from '@/features/preparation/PreparationPage.vue'
+import { server } from '@/test/server'
 import { useSessionStore } from '@/stores/session'
 
 function renderPreparation() {
@@ -40,6 +42,34 @@ test('点击新增台账记录后出现保存到手动台账按钮', async () =>
   await user.click(screen.getByRole('button', { name: '新增台账记录' }))
 
   await waitFor(() => expect(screen.getByRole('button', { name: '保存到手动台账' })).toBeInTheDocument())
+})
+
+test('成本价支持三位小数展示和录入', async () => {
+  const user = userEvent.setup()
+  server.use(
+    http.get('/api/v1/positions', () =>
+      HttpResponse.json([
+        {
+          symbol: '600000',
+          name: '示例银行',
+          quantity: 1000,
+          available_quantity: 1000,
+          cost_price: 0.123,
+          opened_at: '2026-07-01',
+          note: '测试三位小数成本',
+          updated_at: '2026-07-07T10:30:00+08:00',
+        },
+      ]),
+    ),
+  )
+
+  renderPreparation()
+
+  await waitFor(() => expect(screen.getByText('¥0.123')).toBeInTheDocument())
+
+  await user.click(screen.getByRole('button', { name: '新增台账记录' }))
+
+  expect(screen.getByLabelText('成本价')).toHaveAttribute('step', '0.001')
 })
 
 test('现金校准提交前要求人工确认', async () => {

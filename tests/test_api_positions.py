@@ -56,6 +56,24 @@ def test_positions_crud(tmp_path) -> None:
     assert empty_response.json() == []
 
 
+def test_positions_preserve_three_decimal_cost_price(tmp_path) -> None:
+    client, headers = authenticated_client(tmp_path)
+    payload = position_payload()
+    payload["cost_price"] = 0.123
+
+    create_response = client.post("/api/v1/positions", json=payload, headers=headers)
+    detail_response = client.get("/api/v1/positions/600000", headers=headers)
+    export_response = client.get("/api/v1/positions/export-csv", headers=headers)
+
+    assert create_response.status_code == 201
+    assert create_response.json()["cost_price"] == 0.123
+    assert detail_response.status_code == 200
+    assert detail_response.json()["cost_price"] == 0.123
+    reader = csv.DictReader(StringIO(export_response.text))
+    rows = list(reader)
+    assert rows[0]["cost_price"] == "0.123"
+
+
 def test_update_uses_path_symbol_when_body_symbol_is_omitted(tmp_path) -> None:
     client, headers = authenticated_client(tmp_path)
     client.post("/api/v1/positions", json=position_payload(), headers=headers)
