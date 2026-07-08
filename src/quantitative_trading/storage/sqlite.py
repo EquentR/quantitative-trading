@@ -65,6 +65,56 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
 """
 
 
+WATCH_PINNED_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS watch_pinned (
+  symbol TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL,
+  rank INTEGER NOT NULL CHECK (rank >= 1),
+  plan_enabled INTEGER NOT NULL CHECK (plan_enabled IN (0, 1)),
+  source TEXT NOT NULL CHECK (source IN ('manual', 'synced', 'manual_synced')),
+  note TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  CHECK (symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]')
+);
+"""
+
+
+DATASOURCE_CREDENTIALS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS datasource_credentials (
+  provider TEXT PRIMARY KEY NOT NULL,
+  encrypted_secret TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('configured', 'missing', 'invalid')),
+  last_checked_at TEXT,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+"""
+
+
+UNIVERSE_SNAPSHOTS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS universe_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  status TEXT NOT NULL,
+  warnings_json TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+"""
+
+
+MARKET_INPUT_SNAPSHOTS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS market_input_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  universe_snapshot_id INTEGER NOT NULL,
+  data_time TEXT,
+  fetched_at TEXT NOT NULL,
+  warnings_json TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  FOREIGN KEY (universe_snapshot_id) REFERENCES universe_snapshots(id)
+);
+"""
+
+
 API_AUTH_STATE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS api_auth_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -97,6 +147,10 @@ SCHEMA_STATEMENTS = [
     CASH_ACCOUNT_SCHEMA_SQL,
     CASH_TRANSACTIONS_SCHEMA_SQL,
     ACCOUNT_SNAPSHOTS_SCHEMA_SQL,
+    WATCH_PINNED_SCHEMA_SQL,
+    DATASOURCE_CREDENTIALS_SCHEMA_SQL,
+    UNIVERSE_SNAPSHOTS_SCHEMA_SQL,
+    MARKET_INPUT_SNAPSHOTS_SCHEMA_SQL,
     API_AUTH_STATE_SCHEMA_SQL,
     SCHEDULER_STATE_SCHEMA_SQL,
 ]

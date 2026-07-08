@@ -208,6 +208,46 @@ def test_migrate_creates_expected_table_columns(
     assert [column["name"] for column in columns] == expected_columns
 
 
+def test_migrate_creates_watch_pinned_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'watch_pinned'"
+        ).fetchone()
+    assert row is not None
+
+
+def test_migrate_creates_datasource_credentials_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'datasource_credentials'"
+        ).fetchone()
+    assert row is not None
+
+
+def test_migrate_creates_universe_snapshots_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'universe_snapshots'"
+        ).fetchone()
+    assert row is not None
+
+
+def test_migrate_creates_market_input_snapshots_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'market_input_snapshots'"
+        ).fetchone()
+    assert row is not None
+
+
 def test_connection_enforces_foreign_keys(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "ledger.db")
 
