@@ -18,3 +18,11 @@ data/
 *.db
 *.sqlite
 *.sqlite3
+
+.superpowers/
+src/web/node_modules/
+src/web/dist/
+src/web/playwright-report/
+src/web/test-results/
+src/web/.env.local
+src/web/.env.*.local
