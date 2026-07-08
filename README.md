@@ -101,6 +101,32 @@ qt service check
 qt service run
 ```
 
+## 本地前端控制台开发
+
+前端控制台使用 Node 24 和 pnpm。推荐通过 nvm 切换 Node 版本：
+
+```bash
+nvm use
+pnpm -C src/web install
+pnpm -C src/web test
+pnpm -C src/web dev
+```
+
+如果本机尚未安装 Node 24：
+
+```bash
+nvm install 24
+nvm use
+```
+
+前端开发服务会通过 Vite 将 `/api` 请求代理到本地后端 `http://127.0.0.1:8000`。先启动后端：
+
+```bash
+qt service run
+```
+
+前端只维护本地手动台账、资金账户、账户快照和调度状态，不自动真实下单，不控制真实交易客户端，不保存真实券商凭据。
+
 调试版后台服务单次快照：
 
 ```bash
