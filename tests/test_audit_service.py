@@ -83,3 +83,41 @@ def test_create_event_sanitizes_sensitive_payload_text(service: AuditService) ->
     assert "raw-token" not in text
     assert "raw-cookie" not in text
     assert audit.payload["nested"] == {"safe": "kept"}
+
+
+def test_create_event_preserves_long_non_secret_payload_text(service: AuditService) -> None:
+    long_note = "audit-context-" + ("market-data-ok-" * 30)
+
+    audit = service.record_event(
+        event_type="notification.created",
+        recommendation_id="rec-1",
+        payload={"note": long_note},
+        now=NOW,
+    )
+
+    assert len(long_note) > 300
+    assert audit.payload["note"] == long_note
+    assert service.get("audit-1").payload["note"] == long_note
+
+
+def test_create_event_redacts_configured_secret_text(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "audit.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        service = AuditService(
+            AuditLogRepository(connection),
+            id_factory=lambda: "audit-secret",
+            configured_secret_texts=("hunter2",),
+        )
+
+        audit = service.record_event(
+            event_type="notification.failed",
+            recommendation_id="rec-1",
+            payload={"trace": "request failed with hunter2 in upstream response"},
+            now=NOW,
+        )
+
+        restored = service.get("audit-secret")
+
+    assert audit.payload["trace"] == "request failed with [redacted] in upstream response"
+    assert restored == audit

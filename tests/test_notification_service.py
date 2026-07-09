@@ -104,6 +104,22 @@ def test_create_from_recommendation_sanitizes_summary_risk(
     assert "raw-cookie" not in text
 
 
+def test_create_from_recommendation_preserves_long_non_secret_risk(
+    service: NotificationService,
+) -> None:
+    long_risk = "risk-context-" + ("volume-confirmed-" * 30)
+
+    summary = service.create_from_recommendation(
+        recommendation(risk={"invalid_if": ["跌破 10.0"], "notes": [long_risk]}),
+        audit_log(),
+        now=NOW,
+    )
+
+    assert len(long_risk) > 300
+    assert summary.risk == ["跌破 10.0", long_risk]
+    assert service.get("notif-1").risk == ["跌破 10.0", long_risk]
+
+
 def test_mark_read_changes_only_status(service: NotificationService) -> None:
     original = service.create_from_recommendation(recommendation(), audit_log(), now=NOW)
 

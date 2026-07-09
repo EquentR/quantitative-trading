@@ -16,9 +16,11 @@ class AuditService:
         repository: AuditLogRepository,
         *,
         id_factory: Callable[[], str] | None = None,
+        configured_secret_texts: tuple[str, ...] = (),
     ) -> None:
         self.repository = repository
         self._id_factory = id_factory or (lambda: f"audit-{uuid4().hex}")
+        self._configured_secret_texts = configured_secret_texts
 
     def record_event(
         self,
@@ -33,7 +35,10 @@ class AuditService:
             audit_id=self._id_factory(),
             event_type=event_type,
             recommendation_id=recommendation_id,
-            payload=sanitize_sensitive_data(payload or {}),
+            payload=sanitize_sensitive_data(
+                payload or {},
+                configured_secret_texts=self._configured_secret_texts,
+            ),
             created_at=created_at,
         )
         return self.repository.save(audit)

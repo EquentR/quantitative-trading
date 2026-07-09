@@ -15,6 +15,11 @@ _SENSITIVE_RECORD_WORD_RE = re.compile(
 
 
 def redact_sensitive_text(text: str) -> str:
+    summary = redact_sensitive_text_preserving_length(text)
+    return summary[:300]
+
+
+def redact_sensitive_text_preserving_length(text: str) -> str:
     summary = text.strip()
     summary = re.sub(
         r"(?i)\bAuthorization\s*:\s*Bearer\s+[^\s,;]+",
@@ -49,7 +54,7 @@ def redact_sensitive_text(text: str) -> str:
     summary = re.sub(r"(?i)\b[A-Z]:\\(?:[^\\\s]+\\)*[^\\\s]+", "[path]", summary)
     summary = re.sub(r"\\\\[^\\\s]+\\[^\\\s]+(?:\\[^\\\s]+)*", "[path]", summary)
     summary = re.sub(r"(?<!\w)/(?:[^/\s]+/)*[^/\s]+", "[path]", summary)
-    return summary[:300]
+    return summary
 
 
 def safe_error_summary(exc: Exception) -> str:
@@ -86,7 +91,7 @@ def _sanitize_record_text(
     *,
     configured_secret_texts: tuple[str, ...],
 ) -> str:
-    sanitized = redact_sensitive_text(value)
+    sanitized = redact_sensitive_text_preserving_length(value)
     for secret in configured_secret_texts:
         sanitized = sanitized.replace(secret, "[redacted]")
     return _SENSITIVE_RECORD_WORD_RE.sub("[redacted]", sanitized)
