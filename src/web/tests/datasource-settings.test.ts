@@ -107,3 +107,29 @@ test('检查连接调用 POST 检查接口', async () => {
 
   await waitFor(() => expect(checked).toBe(true))
 })
+
+test('提交 API Key 失败后展示错误提示并保留输入内容，且不泄露到 localStorage', async () => {
+  const user = userEvent.setup()
+  server.use(
+    http.put('/api/v1/datasource/eastmoney/key', () =>
+      HttpResponse.json({ error: { code: 'invalid_api_key', message: 'API Key 无效' } }, { status: 422 }),
+    ),
+  )
+
+  renderPreparation()
+
+  await waitFor(() => expect(screen.getByText('数据源设置')).toBeInTheDocument())
+
+  const input = screen.getByLabelText('API Key')
+  await user.type(input, 'bad-key-999')
+  await user.click(screen.getByRole('button', { name: '保存 API Key' }))
+
+  // Visible error alert appears.
+  await waitFor(() => expect(screen.getByText(/保存失败/)).toBeInTheDocument())
+
+  // The typed key must remain in the input so the user can retry.
+  expect(input).toHaveValue('bad-key-999')
+
+  // The key must not leak into localStorage.
+  expect(JSON.stringify(Array.from(Object.entries(localStorage)))).not.toContain('bad-key-999')
+})

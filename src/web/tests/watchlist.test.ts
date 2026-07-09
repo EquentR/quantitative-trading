@@ -248,3 +248,59 @@ test('JSON 导入接受 { items } 信封并原样发送 { items }', async () => 
     })
   })
 })
+
+test('JSON 导入无效 JSON 时显示校验错误且不调用 import 接口', async () => {
+  const user = userEvent.setup()
+  let importCalled = false
+  server.use(
+    http.post('/api/v1/watchlist/pinned/import', () => {
+      importCalled = true
+      return HttpResponse.json([])
+    }),
+  )
+
+  renderPreparation()
+
+  await user.click(await screen.findByRole('button', { name: '导入自选观察项' }))
+
+  const textarea = screen.getByLabelText('自选 JSON 内容')
+  await fireEvent.update(textarea, 'not-valid-json{{{')
+  await user.click(screen.getByRole('button', { name: '保存导入自选' }))
+
+  // Visible validation error appears.
+  await waitFor(() => expect(screen.getByText(/JSON 格式错误/)).toBeInTheDocument())
+
+  // Import API must not be called.
+  expect(importCalled).toBe(false)
+
+  // Form stays open for correction.
+  expect(screen.getByLabelText('自选 JSON 内容')).toBeInTheDocument()
+})
+
+test('JSON 导入不支持的信封格式时显示校验错误且不调用 import 接口', async () => {
+  const user = userEvent.setup()
+  let importCalled = false
+  server.use(
+    http.post('/api/v1/watchlist/pinned/import', () => {
+      importCalled = true
+      return HttpResponse.json([])
+    }),
+  )
+
+  renderPreparation()
+
+  await user.click(await screen.findByRole('button', { name: '导入自选观察项' }))
+
+  const textarea = screen.getByLabelText('自选 JSON 内容')
+  await fireEvent.update(textarea, '{"watchlist": [{"symbol":"600000","name":"x","rank":1,"plan_enabled":true,"note":""}]}')
+  await user.click(screen.getByRole('button', { name: '保存导入自选' }))
+
+  // Visible validation error appears.
+  await waitFor(() => expect(screen.getByText(/不支持的信封格式/)).toBeInTheDocument())
+
+  // Import API must not be called.
+  expect(importCalled).toBe(false)
+
+  // Form stays open for correction.
+  expect(screen.getByLabelText('自选 JSON 内容')).toBeInTheDocument()
+})

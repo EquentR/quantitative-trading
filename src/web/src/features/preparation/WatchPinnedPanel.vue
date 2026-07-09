@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { Download, FileJson, FileUp, Pencil, Plus, Trash2 } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
+import Alert from '@/components/ui/Alert.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
 import {
   useWatchlistPinnedQuery,
@@ -24,6 +25,7 @@ const importCsvMutation = useImportPinnedCsvMutation()
 const showForm = ref(false)
 const showJsonImport = ref(false)
 const jsonImportText = ref('')
+const importError = ref('')
 const csvInput = ref<HTMLInputElement | null>(null)
 const editingSymbol = ref<string | null>(null)
 const form = ref<WatchPinnedInput>({
@@ -84,15 +86,35 @@ async function onDelete(item: WatchPinnedItem) {
   await deleteMutation.mutateAsync(item.symbol)
 }
 
-async function onJsonImport() {
-  const parsed = JSON.parse(jsonImportText.value) as WatchPinnedInput[] | { items: WatchPinnedInput[] }
-  if (!Array.isArray(parsed) && parsed && Array.isArray(parsed.items)) {
-    await importMutation.mutateAsync(parsed.items)
-  } else {
-    await importMutation.mutateAsync(parsed as WatchPinnedInput[])
+function onJsonImport() {
+  importError.value = ''
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(jsonImportText.value)
+  } catch {
+    importError.value = 'JSON 格式错误，请检查输入内容'
+    return
   }
-  jsonImportText.value = ''
-  showJsonImport.value = false
+
+  let items: WatchPinnedInput[]
+  if (Array.isArray(parsed)) {
+    items = parsed as WatchPinnedInput[]
+  } else if (
+    parsed &&
+    typeof parsed === 'object' &&
+    Array.isArray((parsed as { items?: unknown }).items)
+  ) {
+    items = (parsed as { items: WatchPinnedInput[] }).items
+  } else {
+    importError.value = '不支持的信封格式，请使用数组或 { "items": [...] }'
+    return
+  }
+
+  importMutation.mutateAsync(items).then(() => {
+    jsonImportText.value = ''
+    showJsonImport.value = false
+  })
 }
 
 async function onCsvSelected(event: Event) {
@@ -142,6 +164,9 @@ async function onExportCsv() {
     </div>
 
     <form v-if="showJsonImport" class="space-y-2 rounded-md border border-border p-3" @submit.prevent="onJsonImport">
+      <Alert v-if="importError" variant="danger">
+        {{ importError }}
+      </Alert>
       <label class="block">
         <span class="text-xs font-medium">自选 JSON 内容</span>
         <textarea
