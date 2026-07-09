@@ -138,7 +138,7 @@ async function onExportCsv() {
         <Download class="size-4" />
         导出 CSV 自选
       </Button>
-      <input ref="csvInput" class="sr-only" type="file" accept=".csv,text/csv" @change="onCsvSelected" />
+      <input ref="csvInput" class="sr-only" type="file" accept=".csv,text/csv" aria-label="CSV 文件输入" @change="onCsvSelected" />
     </div>
 
     <form v-if="showJsonImport" class="space-y-2 rounded-md border border-border p-3" @submit.prevent="onJsonImport">
