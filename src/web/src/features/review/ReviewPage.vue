@@ -29,6 +29,26 @@ function keyPriceText(r: Recommendation): string {
   if (typeof kl.stop_loss === 'number') parts.push(`止损 ${kl.stop_loss}`)
   return parts.join(' / ')
 }
+
+function listText(value: unknown, fallback = '不可用'): string {
+  if (!Array.isArray(value)) return fallback
+  const items = value.map((item) => String(item)).filter(Boolean)
+  return items.length ? items.join(' / ') : fallback
+}
+
+function riskText(r: Recommendation): string {
+  const risk = (r.risk ?? {}) as Record<string, unknown>
+  const parts: string[] = []
+  if (risk.position_limit) parts.push(String(risk.position_limit))
+  if (Array.isArray(risk.notes)) {
+    parts.push(...risk.notes.map((item) => String(item)).filter(Boolean))
+  }
+  return parts.length ? parts.join(' / ') : '不可用'
+}
+
+function invalidIfText(r: Recommendation): string {
+  return listText(((r.risk ?? {}) as Record<string, unknown>).invalid_if)
+}
 </script>
 
 <template>
@@ -49,7 +69,11 @@ function keyPriceText(r: Recommendation): string {
               <th class="w-[8%] py-1">动作</th>
               <th class="w-[8%] py-1">置信度</th>
               <th class="w-1/4 py-1">关键价位</th>
+              <th class="w-1/4 py-1">理由</th>
+              <th class="w-1/4 py-1">风险</th>
+              <th class="w-1/4 py-1">失效条件</th>
               <th class="w-1/5 py-1">数据时间</th>
+              <th class="w-1/5 py-1">有效期</th>
               <th class="w-1/5 py-1">建议ID</th>
             </tr>
           </thead>
@@ -66,7 +90,11 @@ function keyPriceText(r: Recommendation): string {
               <td class="py-1.5"><RecommendationStatusBadge kind="action" :value="r.action" /></td>
               <td class="py-1.5"><RecommendationStatusBadge kind="confidence" :value="r.confidence" /></td>
               <td class="py-1.5 break-words whitespace-normal">{{ keyPriceText(r) }}</td>
+              <td class="py-1.5 break-words whitespace-normal">{{ listText(r.reason) }}</td>
+              <td class="py-1.5 break-words whitespace-normal">{{ riskText(r) }}</td>
+              <td class="py-1.5 break-words whitespace-normal">{{ invalidIfText(r) }}</td>
               <td class="py-1.5"><FormatValues kind="time" :value="r.data_time" /></td>
+              <td class="py-1.5"><FormatValues kind="time" :value="r.valid_until" /></td>
               <td class="py-1.5 break-words">{{ r.recommendation_id }}</td>
             </tr>
           </tbody>

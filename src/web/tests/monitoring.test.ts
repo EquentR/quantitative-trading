@@ -40,14 +40,22 @@ test('点击生成快照后显示已请求提示', async () => {
 })
 
 
-test('展示任务状态行和不可用状态', async () => {
+test('展示任务状态行并标记非最近运行任务', async () => {
+  server.use(
+    http.get('/api/v1/service/status', () =>
+      HttpResponse.json({ ...mockServiceStatus, last_task_type: 'close_plan_daily', last_status: 'success' }),
+    ),
+  )
   renderMonitoring()
+
   await waitFor(() => expect(screen.getByText('账户快照任务')).toBeInTheDocument())
   expect(screen.getByText('收盘计划任务')).toBeInTheDocument()
   expect(screen.getByText('盘中触发任务')).toBeInTheDocument()
-  // Default mock last_task_type is plan_generation, not matching any defined task.
-  const taskRows = screen.getAllByText('不可用')
-  expect(taskRows.length).toBeGreaterThanOrEqual(3)
+  expect(screen.getByText(/仅显示全局最近一次任务结果/)).toBeInTheDocument()
+
+  const closePlanRow = screen.getByText('收盘计划任务').closest('tr')!
+  await waitFor(() => expect(closePlanRow).toHaveTextContent('success'))
+  expect(screen.getAllByText('非最近运行')).toHaveLength(2)
 })
 
 test('last_task_type 匹配账户快照任务时展示对应状态', async () => {

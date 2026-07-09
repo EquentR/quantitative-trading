@@ -51,6 +51,12 @@ const taskStatuses = computed(() => {
   return m
 })
 
+function taskStatusText(row: TaskRow): string {
+  const s = service()
+  if (!s) return '不可用'
+  return taskStatuses.value.get(row.task_type) ?? '非最近运行'
+}
+
 const snapshotErrorMessage = () => {
   const error = snapshotQuery.error.value
   if (!(error instanceof ApiError)) return null
@@ -98,6 +104,7 @@ async function onGenerate() {
 
     <section class="space-y-2">
       <h2 class="text-sm font-medium">任务状态</h2>
+      <p class="text-xs text-muted-foreground">仅显示全局最近一次任务结果；其他任务标记为非最近运行。</p>
       <table class="w-full table-fixed text-sm">
         <thead class="text-left text-xs text-muted-foreground">
           <tr>
@@ -114,7 +121,7 @@ async function onGenerate() {
           >
             <td class="py-1.5">{{ row.label }}</td>
             <td class="py-1.5 text-xs text-muted-foreground break-all">{{ row.job_id }}</td>
-            <td class="py-1.5 break-words">{{ taskStatuses.get(row.task_type) ?? '不可用' }}</td>
+            <td class="py-1.5 break-words">{{ taskStatusText(row) }}</td>
           </tr>
         </tbody>
       </table>

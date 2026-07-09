@@ -45,6 +45,18 @@ test('复盘页展示推荐记录', async () => {
   await waitFor(() => expect(screen.getByText('推荐记录')).toBeInTheDocument())
 })
 
+test('复盘页推荐记录展示理由、风险、失效条件和有效期', async () => {
+  renderReview()
+
+  await waitFor(() =>
+    expect(screen.getByText('量价稳定，持仓观望 / 成交额放大 / 资金流转正')).toBeInTheDocument(),
+  )
+  expect(screen.getByText(/单票不超过配置上限/)).toBeInTheDocument()
+  expect(screen.getByText(/行情数据可能延迟/)).toBeInTheDocument()
+  expect(screen.getByText('跌破 9.7 / 资金流重新转负')).toBeInTheDocument()
+  expect(screen.getByText('有效期')).toBeInTheDocument()
+})
+
 test('通知不可用时仪表盘仍可用并显示降级文案', async () => {
   server.use(
     http.get('/api/v1/notifications', () =>
