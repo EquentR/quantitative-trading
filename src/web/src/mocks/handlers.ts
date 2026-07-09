@@ -1,5 +1,20 @@
 import { http, HttpResponse } from 'msw'
-import type { AccountSnapshot, CashAccount, CashTransaction, Position, ServiceStatus } from '@/api/types'
+import type {
+  AccountSnapshot,
+  CashAccount,
+  CashTransaction,
+  Position,
+  ServiceStatus,
+  WatchPinnedItem,
+  UniverseMember,
+  UniverseSnapshot,
+  DatasourceStatus,
+  TradingPlan,
+  Recommendation,
+  NotificationSummary,
+  AuditLog,
+  ExecutionFeedback,
+} from '@/api/types'
 
 const now = '2026-07-07T10:30:00+08:00'
 
@@ -88,6 +103,128 @@ export const mockAccountSnapshot: AccountSnapshot = {
   created_at: now,
 }
 
+export const mockWatchPinned: WatchPinnedItem[] = [
+  {
+    symbol: '600519',
+    name: '示例白酒',
+    rank: 1,
+    plan_enabled: true,
+    source: 'manual',
+    note: '核心自选',
+    updated_at: now,
+  },
+]
+
+export const mockUniverseMembers: UniverseMember[] = [
+  {
+    symbol: '600000',
+    name: '示例银行',
+    sources: ['holding'],
+    priority: 0,
+    ledger_updated_at: now,
+    watch_pinned_rank: null,
+    plan_enabled: true,
+    plan_enabled_source: 'holding',
+    created_at: now,
+  },
+  {
+    symbol: '600519',
+    name: '示例白酒',
+    sources: ['watch_pinned'],
+    priority: 1,
+    ledger_updated_at: null,
+    watch_pinned_rank: 1,
+    plan_enabled: true,
+    plan_enabled_source: 'watch_pinned',
+    created_at: now,
+  },
+]
+
+export const mockUniverseSnapshot: UniverseSnapshot = {
+  created_at: now,
+  status: 'ok',
+  warnings: [],
+  members: mockUniverseMembers,
+}
+
+export const mockDatasourceStatus: DatasourceStatus = {
+  provider: 'eastmoney',
+  status: 'missing',
+  last_checked_at: null,
+  last_error: null,
+  updated_at: now,
+}
+
+export const mockTradingPlan: TradingPlan = {
+  plan_id: 'plan-001',
+  trading_day: '2026-07-07',
+  generated_at: now,
+  valid_until: '2026-07-08T15:00:00+08:00',
+  universe_snapshot_id: 1,
+  account_snapshot_id: 1,
+  ledger_max_updated_at: now,
+  watch_symbols: ['600519'],
+  holding_symbols: ['600000'],
+  key_levels: { '600000': { stop_loss: 9.0, resistance: 11.0 } },
+  candidate_actions: { '600000': ['hold'] },
+  invalid_if: { '600000': ['跌破9.0'] },
+  warnings: [],
+  status: 'active',
+}
+
+export const mockRecommendations: Recommendation[] = [
+  {
+    recommendation_id: 'rec-001',
+    symbol: '600000',
+    name: '示例银行',
+    action: 'hold',
+    confidence: 'medium',
+    position_context: { quantity: 1000 },
+    account_context: { cash_balance: 48000 },
+    price_context: { current_price: 10.5 },
+    reason: ['量价稳定，持仓观望'],
+    risk: { invalid_if: ['跌破9.0'], notes: [] },
+    valid_until: '2026-07-08T15:00:00+08:00',
+    data_time: now,
+  },
+]
+
+export const mockNotifications: NotificationSummary[] = [
+  {
+    notification_id: 'notif-001',
+    recommendation_id: 'rec-001',
+    symbol: '600000',
+    action: 'hold',
+    confidence: 'medium',
+    key_price: null,
+    reason: ['量价稳定，持仓观望'],
+    risk: ['跌破9.0'],
+    data_time: now,
+    audit_id: 'audit-001',
+    status: 'unread',
+    created_at: now,
+  },
+]
+
+export const mockAuditLog: AuditLog = {
+  audit_id: 'audit-001',
+  event_type: 'recommendation_created',
+  recommendation_id: 'rec-001',
+  payload: { symbol: '600000' },
+  created_at: now,
+}
+
+export const mockExecutionFeedback: ExecutionFeedback[] = [
+  {
+    feedback_id: 'fb-001',
+    recommendation_id: 'rec-001',
+    executed: true,
+    execution_price: 10.5,
+    execution_quantity: 100,
+    note: '按计划执行',
+    created_at: now,
+  },
+]
 export const handlers = [
   http.get('/api/v1/service/status', () => HttpResponse.json(mockServiceStatus)),
   http.post('/api/v1/service/scheduler/start', () =>
@@ -128,4 +265,61 @@ export const handlers = [
   http.post('/api/v1/account/snapshots', () =>
     HttpResponse.json({ snapshot_id: 2, snapshot: mockAccountSnapshot }, { status: 201 }),
   ),
+  http.get('/api/v1/watchlist/pinned', () => HttpResponse.json(mockWatchPinned)),
+  http.post('/api/v1/watchlist/pinned', async ({ request }) =>
+    HttpResponse.json(await request.json(), { status: 201 }),
+  ),
+  http.put('/api/v1/watchlist/pinned/:symbol', async ({ request }) =>
+    HttpResponse.json(await request.json()),
+  ),
+  http.delete('/api/v1/watchlist/pinned/:symbol', () => new HttpResponse(null, { status: 204 })),
+  http.post('/api/v1/watchlist/pinned/import', () => HttpResponse.json(mockWatchPinned)),
+  http.post('/api/v1/watchlist/pinned/import-csv', () => HttpResponse.json(mockWatchPinned)),
+  http.get('/api/v1/watchlist/pinned/export-csv', () =>
+    new HttpResponse('symbol,name,rank,plan_enabled,note\n600519,示例白酒,1,true,核心自选\n', {
+      headers: { 'content-type': 'text/csv' },
+    }),
+  ),
+  http.post('/api/v1/watchlist/pinned/sync', () => HttpResponse.json(mockWatchPinned)),
+  http.get('/api/v1/universe', () => HttpResponse.json(mockUniverseMembers)),
+  http.post('/api/v1/universe/snapshots', () =>
+    HttpResponse.json({ snapshot_id: 2, snapshot: mockUniverseSnapshot }, { status: 201 }),
+  ),
+  http.get('/api/v1/universe/snapshots/latest', () => HttpResponse.json(mockUniverseSnapshot)),
+  http.get('/api/v1/datasource/eastmoney/status', () => HttpResponse.json(mockDatasourceStatus)),
+  http.put('/api/v1/datasource/eastmoney/key', () =>
+    HttpResponse.json({ ...mockDatasourceStatus, status: 'configured', last_checked_at: now }),
+  ),
+  http.delete('/api/v1/datasource/eastmoney/key', () => HttpResponse.json(mockDatasourceStatus)),
+  http.post('/api/v1/datasource/eastmoney/check', () =>
+    HttpResponse.json({ ...mockDatasourceStatus, last_checked_at: now }),
+  ),
+  http.post('/api/v1/plans', async ({ request }) => {
+    const body = await request.json().catch(() => ({}))
+    const plan = { ...mockTradingPlan, ...(body as Record<string, unknown>).trading_day ? { trading_day: (body as Record<string, unknown>).trading_day as string } : {} }
+    return HttpResponse.json({ plan_id: 'plan-001', plan }, { status: 201 })
+  }),
+  http.get('/api/v1/plans/latest', () => HttpResponse.json(mockTradingPlan)),
+  http.get('/api/v1/plans/:plan_id', () => HttpResponse.json(mockTradingPlan)),
+  http.post('/api/v1/recommendations/scan', () =>
+    HttpResponse.json({ count: mockRecommendations.length, recommendations: mockRecommendations }),
+  ),
+  http.get('/api/v1/recommendations', () => HttpResponse.json(mockRecommendations)),
+  http.get('/api/v1/recommendations/:recommendation_id', () =>
+    HttpResponse.json(mockRecommendations[0]),
+  ),
+  http.get('/api/v1/notifications', () => HttpResponse.json(mockNotifications)),
+  http.post('/api/v1/notifications/:notification_id/read', () =>
+    HttpResponse.json({ status: 'read' }),
+  ),
+  http.get('/api/v1/audit', () => HttpResponse.json([mockAuditLog])),
+  http.get('/api/v1/audit/:audit_id', () => HttpResponse.json(mockAuditLog)),
+  http.get('/api/v1/feedback', () => HttpResponse.json(mockExecutionFeedback)),
+  http.post('/api/v1/feedback', async ({ request }) => {
+    const body = await request.json()
+    return HttpResponse.json(
+      { ...(body as Record<string, unknown>), feedback_id: 'fb-001', created_at: now },
+      { status: 201 },
+    )
+  }),
 ]

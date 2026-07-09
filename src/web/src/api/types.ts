@@ -110,3 +110,139 @@ export interface ApiErrorPayload {
     details?: unknown
   }
 }
+
+export type NotificationProcessingStatus = 'unread' | 'read' | 'feedback_recorded'
+export type RecommendationAction = 'buy' | 'sell' | 'add' | 'reduce' | 'hold' | 'watch' | 'avoid'
+export type RecommendationConfidence = 'low' | 'medium' | 'high'
+export type WatchPinnedSource = 'manual' | 'synced' | 'manual_synced'
+export type UniverseSource = 'holding' | 'watch_pinned'
+export type DatasourceStatusCode = 'configured' | 'missing' | 'invalid'
+export type TradingPlanStatus = 'active' | 'expired' | 'stale'
+
+export interface WatchPinnedInput {
+  symbol: string
+  name: string
+  rank: number
+  plan_enabled: boolean
+  note: string
+}
+
+export interface WatchPinnedItem extends WatchPinnedInput {
+  source: WatchPinnedSource
+  updated_at: string
+}
+
+export interface UniverseMember {
+  symbol: string
+  name: string
+  sources: UniverseSource[]
+  priority: number
+  ledger_updated_at: string | null
+  watch_pinned_rank: number | null
+  plan_enabled: boolean
+  plan_enabled_source: UniverseSource
+  created_at: string
+}
+
+export interface UniverseSnapshot {
+  created_at: string
+  status: 'ok'
+  warnings: string[]
+  members: UniverseMember[]
+}
+
+export interface CreatedUniverseSnapshotResponse {
+  snapshot_id: number
+  snapshot: UniverseSnapshot
+}
+
+export interface DatasourceStatus {
+  provider: string
+  status: DatasourceStatusCode
+  last_checked_at: string | null
+  last_error: string | null
+  updated_at: string
+}
+
+export interface TradingPlan {
+  plan_id: string
+  trading_day: string
+  generated_at: string
+  valid_until: string
+  universe_snapshot_id: number
+  account_snapshot_id: number | null
+  ledger_max_updated_at: string | null
+  watch_symbols: string[]
+  holding_symbols: string[]
+  key_levels: Record<string, Record<string, number>>
+  candidate_actions: Record<string, string[]>
+  invalid_if: Record<string, string[]>
+  warnings: string[]
+  status: TradingPlanStatus
+}
+
+export interface CreatedPlanResponse {
+  plan_id: string
+  plan: TradingPlan
+}
+
+export interface Recommendation {
+  recommendation_id: string
+  symbol: string
+  name: string
+  action: RecommendationAction
+  confidence: RecommendationConfidence
+  position_context: Record<string, unknown>
+  account_context: Record<string, unknown>
+  price_context: Record<string, unknown>
+  reason: string[]
+  risk: Record<string, unknown>
+  valid_until: string
+  data_time: string
+}
+
+export interface RecommendationScanResponse {
+  count: number
+  recommendations: Recommendation[]
+}
+
+export interface NotificationSummary {
+  notification_id: string
+  recommendation_id: string
+  symbol: string
+  action: string
+  confidence: string
+  key_price: number | null
+  reason: string[]
+  risk: string[]
+  data_time: string
+  audit_id: string
+  status: NotificationProcessingStatus
+  created_at: string
+}
+
+export interface AuditLog {
+  audit_id: string
+  event_type: string
+  recommendation_id: string | null
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+export interface ExecutionFeedbackInput {
+  recommendation_id: string
+  executed: boolean
+  execution_price: number | null
+  execution_quantity: number | null
+  note: string
+}
+
+export interface ExecutionFeedback {
+  feedback_id: string
+  recommendation_id: string
+  executed: boolean
+  execution_price: number | null
+  execution_quantity: number | null
+  note: string
+  created_at: string
+}
