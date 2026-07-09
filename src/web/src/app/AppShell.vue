@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { LayoutDashboard, ListChecks, Activity, ClipboardList, Settings } from 'lucide-vue-next'
+import { LayoutDashboard, ListChecks, Activity, ClipboardList, Settings, Sparkles } from 'lucide-vue-next'
 import { useServiceStatusQuery } from '@/queries/service'
 import { useSessionStore } from '@/stores/session'
 import StatusBadges from '@/components/domain/StatusBadges.vue'
@@ -15,6 +15,7 @@ const nav = [
   { to: '/', label: '今日仪表盘', icon: LayoutDashboard },
   { to: '/prepare', label: '准备', icon: ListChecks },
   { to: '/monitor', label: '监控', icon: Activity },
+  { to: '/recommendations', label: '建议', icon: Sparkles },
   { to: '/review', label: '复盘', icon: ClipboardList },
   { to: '/settings', label: '设置', icon: Settings },
 ]
@@ -94,7 +95,7 @@ onUnmounted(() => window.removeEventListener('qt-console-auth-error', onAuthErro
       class="fixed inset-x-0 bottom-0 border-t border-border bg-background md:hidden"
       aria-label="移动导航"
     >
-      <ul class="grid grid-cols-5">
+      <ul class="grid grid-cols-6">
         <li v-for="item in nav" :key="`mobile-${item.to}`">
           <RouterLink
             :to="item.to"

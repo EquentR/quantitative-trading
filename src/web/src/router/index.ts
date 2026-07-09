@@ -6,6 +6,7 @@ import PreparationPage from '@/features/preparation/PreparationPage.vue'
 import MonitoringPage from '@/features/monitoring/MonitoringPage.vue'
 import ReviewPage from '@/features/review/ReviewPage.vue'
 import SettingsPage from '@/features/settings/SettingsPage.vue'
+import RecommendationListPage from '@/features/recommendations/RecommendationListPage.vue'
 import LoginPage from '@/features/auth/LoginPage.vue'
 import SetupPage from '@/features/auth/SetupPage.vue'
 
@@ -13,6 +14,7 @@ export const routes: RouteRecordRaw[] = [
   { path: '/', component: DashboardPage, meta: { auth: true, name: '今日仪表盘' } },
   { path: '/prepare', component: PreparationPage, meta: { auth: true, name: '准备' } },
   { path: '/monitor', component: MonitoringPage, meta: { auth: true, name: '监控' } },
+  { path: '/recommendations', component: RecommendationListPage, meta: { auth: true, name: '建议' } },
   { path: '/review', component: ReviewPage, meta: { auth: true, name: '复盘' } },
   { path: '/settings', component: SettingsPage, meta: { auth: true, name: '设置' } },
   { path: '/login', component: LoginPage, meta: { name: '登录' } },
