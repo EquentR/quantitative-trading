@@ -15,6 +15,7 @@ from quantitative_trading.api.routes import (
     datasource,
     positions,
     service,
+    universe,
     watchlist,
 )
 from quantitative_trading.config import Settings
@@ -42,6 +43,7 @@ def create_app(
     app.include_router(datasource.router, prefix="/api/v1")
     app.include_router(positions.router, prefix="/api/v1")
     app.include_router(service.router, prefix="/api/v1")
+    app.include_router(universe.router, prefix="/api/v1")
     app.include_router(watchlist.router, prefix="/api/v1")
 
     if restore_scheduler and scheduler is not None:
