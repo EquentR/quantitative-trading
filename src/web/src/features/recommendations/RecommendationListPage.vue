@@ -38,6 +38,8 @@ const filteredRecommendations = computed(() => {
   )
 })
 
+const scanError = ref(false)
+
 const selectedId = ref<string | null>(null)
 const selectedRecommendation = computed(
   () => recommendations.value.find((r) => r.recommendation_id === selectedId.value) ?? null,
@@ -51,7 +53,12 @@ function closeDetail() {
 }
 
 async function onScan() {
-  await scanMutation.mutateAsync()
+  scanError.value = false
+  try {
+    await scanMutation.mutateAsync()
+  } catch {
+    scanError.value = true
+  }
 }
 
 function keyPriceText(r: Recommendation): string {
@@ -81,6 +88,10 @@ function keyPriceText(r: Recommendation): string {
       建议数据加载失败，请稍后重试或检查后端服务状态。
     </Alert>
 
+    <Alert v-if="scanError" variant="danger" data-testid="scan-error-alert">
+      扫描建议失败，请稍后重试或检查后端服务状态。
+    </Alert>
+
     <div v-if="showFilter" class="flex items-center gap-2 text-sm">
       <label for="rec-status-filter" class="whitespace-nowrap">处理状态筛选</label>
       <select
@@ -102,7 +113,7 @@ function keyPriceText(r: Recommendation): string {
             <th class="w-1/4 py-1">股票</th>
             <th class="w-[8%] py-1">动作</th>
             <th class="w-[8%] py-1">置信度</th>
-            <th class="w-1/10 py-1">处理状态</th>
+            <th class="w-[10%] py-1">处理状态</th>
             <th class="w-1/4 py-1">关键价位</th>
             <th class="w-1/5 py-1">数据时间</th>
             <th class="py-1 text-right">详情</th>

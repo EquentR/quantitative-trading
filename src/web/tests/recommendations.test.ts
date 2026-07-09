@@ -64,7 +64,7 @@ test('点击行按钮打开详情抽屉并展示必要区块与数据时间', as
 
   await user.click(screen.getByRole('button', { name: /查看详情/ }))
 
-  const drawer = await screen.findByRole('complementary', { name: '建议详情' })
+  const drawer = await screen.findByRole('dialog', { name: '建议详情' })
 
   for (const section of ['理由', '风险', '失效条件', '仓位约束', '账户上下文', '持仓上下文', '数据引用', '审计引用']) {
     expect(within(drawer).getByText(section)).toBeInTheDocument()
@@ -92,6 +92,26 @@ test('扫描按钮触发 POST /api/v1/recommendations/scan 并刷新列表', asy
 
   await waitFor(() => expect(scanCalled).toBe(true))
   await waitFor(() => expect(screen.getByText('600000')).toBeInTheDocument())
+})
+
+test('扫描失败时显示告警且页面仍可用', async () => {
+  const user = userEvent.setup()
+  server.use(
+    http.post('/api/v1/recommendations/scan', () =>
+      HttpResponse.json({ error: { message: 'scan failed' } }, { status: 500 }),
+    ),
+  )
+  renderPage()
+  await screen.findByText('600000')
+
+  await user.click(screen.getByRole('button', { name: '扫描建议' }))
+
+  await waitFor(() =>
+    expect(screen.getByText('扫描建议失败，请稍后重试或检查后端服务状态。')).toBeInTheDocument(),
+  )
+  // Page remains usable: list still visible, scan button re-enabled.
+  expect(screen.getByText('600000')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '扫描建议' })).not.toBeDisabled()
 })
 
 test('处理状态筛选可按未读/已读过滤列表', async () => {
@@ -143,6 +163,103 @@ test('缺失失效条件的建议详情用告警替代完整展示', async () =>
   )
   expect(screen.queryByText('失效条件')).not.toBeInTheDocument()
   expect(screen.queryByText('仓位约束')).not.toBeInTheDocument()
+})
+
+test('详情抽屉可按 role dialog 与名称建议详情定位', async () => {
+  const user = userEvent.setup()
+  renderPage()
+  await screen.findByText('600000')
+
+  await user.click(screen.getByRole('button', { name: /查看详情/ }))
+
+  const dialog = await screen.findByRole('dialog', { name: '建议详情' })
+  expect(dialog).toBeInTheDocument()
+  expect(dialog.getAttribute('aria-modal')).toBe('true')
+})
+
+test('按 Escape 关闭详情抽屉', async () => {
+  const user = userEvent.setup()
+  renderPage()
+  await screen.findByText('600000')
+
+  await user.click(screen.getByRole('button', { name: /查看详情/ }))
+
+  await screen.findByRole('dialog', { name: '建议详情' })
+  await user.keyboard('{Escape}')
+
+  await waitFor(() => expect(screen.queryByRole('dialog', { name: '建议详情' })).not.toBeInTheDocument())
+})
+
+test('打开详情抽屉后焦点移至关闭按钮', async () => {
+  const user = userEvent.setup()
+  renderPage()
+  await screen.findByText('600000')
+
+  await user.click(screen.getByRole('button', { name: /查看详情/ }))
+
+  const closeBtn = await screen.findByRole('button', { name: '关闭详情' })
+  await waitFor(() => expect(closeBtn).toHaveFocus())
+})
+
+test('sell 建议缺少 invalid_if 不触发契约错误并展示不适用', async () => {
+  const user = userEvent.setup()
+  const sellRec: Recommendation = {
+    ...mockRecommendations[0],
+    recommendation_id: 'rec-sell',
+    action: 'sell',
+    reason: ['止损线触发'],
+    risk: { notes: [] },
+    position_context: {},
+    account_context: {},
+    price_context: {},
+  }
+  server.use(
+    http.get('/api/v1/recommendations', () => HttpResponse.json([sellRec])),
+    http.get('/api/v1/notifications', () => HttpResponse.json([])),
+  )
+  renderPage()
+  await screen.findByRole('button', { name: /查看详情/ })
+
+  await user.click(screen.getByRole('button', { name: /查看详情/ }))
+
+  const dialog = await screen.findByRole('dialog', { name: '建议详情' })
+
+  // No contract error for sell without invalid_if.
+  expect(within(dialog).queryByText(/缺少必要字段/)).not.toBeInTheDocument()
+
+  // Fallback text for optional empty invalid_if.
+  expect(within(dialog).getByText('不适用')).toBeInTheDocument()
+
+  // Fallback text for empty reason is NOT expected here (reason is non-empty).
+  // Fallback text for empty context sections.
+  expect(within(dialog).getByText('价格上下文不可用')).toBeInTheDocument()
+  expect(within(dialog).getByText('账户上下文不可用')).toBeInTheDocument()
+  expect(within(dialog).getByText('持仓上下文不可用')).toBeInTheDocument()
+})
+
+test('空理由列表展示暂无理由占位', async () => {
+  const user = userEvent.setup()
+  const emptyReasonRec: Recommendation = {
+    ...mockRecommendations[0],
+    recommendation_id: 'rec-noreason',
+    action: 'avoid',
+    reason: [],
+    risk: { invalid_if: ['不适用'], notes: [] },
+    position_context: {},
+    account_context: {},
+    price_context: {},
+  }
+  server.use(
+    http.get('/api/v1/recommendations', () => HttpResponse.json([emptyReasonRec])),
+    http.get('/api/v1/notifications', () => HttpResponse.json([])),
+  )
+  renderPage()
+  await screen.findByRole('button', { name: /查看详情/ })
+
+  await user.click(screen.getByRole('button', { name: /查看详情/ }))
+
+  const dialog = await screen.findByRole('dialog', { name: '建议详情' })
+  expect(within(dialog).getByText('暂无理由')).toBeInTheDocument()
 })
 
 test('页面不包含真实下单或成交按钮文案', async () => {
