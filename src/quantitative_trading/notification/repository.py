@@ -79,3 +79,21 @@ class NotificationRepository:
             (limit,),
         ).fetchall()
         return [NotificationSummary.model_validate_json(row["payload_json"]) for row in rows]
+
+    def list_by_recommendation_id(
+        self,
+        recommendation_id: str,
+        *,
+        limit: int = 50,
+    ) -> list[NotificationSummary]:
+        rows = self.connection.execute(
+            """
+            SELECT payload_json
+            FROM notifications
+            WHERE recommendation_id = ?
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            (recommendation_id, limit),
+        ).fetchall()
+        return [NotificationSummary.model_validate_json(row["payload_json"]) for row in rows]

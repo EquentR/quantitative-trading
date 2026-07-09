@@ -257,6 +257,19 @@ def insert_trading_plan(
                 "payload_json",
             ],
         ),
+        (
+            "execution_feedback",
+            [
+                "feedback_id",
+                "recommendation_id",
+                "executed",
+                "execution_price",
+                "execution_quantity",
+                "note",
+                "created_at",
+                "payload_json",
+            ],
+        ),
     ],
 )
 def test_migrate_creates_expected_table_columns(

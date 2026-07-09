@@ -166,6 +166,20 @@ CREATE TABLE IF NOT EXISTS notifications (
 """
 
 
+EXECUTION_FEEDBACK_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS execution_feedback (
+  feedback_id TEXT PRIMARY KEY NOT NULL,
+  recommendation_id TEXT NOT NULL,
+  executed INTEGER NOT NULL CHECK (executed IN (0, 1)),
+  execution_price REAL CHECK (execution_price IS NULL OR execution_price > 0),
+  execution_quantity INTEGER CHECK (execution_quantity IS NULL OR execution_quantity > 0),
+  note TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+"""
+
+
 API_AUTH_STATE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS api_auth_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -206,6 +220,7 @@ SCHEMA_STATEMENTS = [
     RECOMMENDATIONS_SCHEMA_SQL,
     AUDIT_LOGS_SCHEMA_SQL,
     NOTIFICATIONS_SCHEMA_SQL,
+    EXECUTION_FEEDBACK_SCHEMA_SQL,
     API_AUTH_STATE_SCHEMA_SQL,
     SCHEDULER_STATE_SCHEMA_SQL,
 ]
