@@ -139,6 +139,37 @@ def insert_account_snapshot(
     )
 
 
+def insert_trading_plan(
+    connection: sqlite3.Connection,
+    omitted: set[str] | None = None,
+    **overrides: object,
+) -> None:
+    data = {
+        "plan_id": "plan-20260709",
+        "trading_day": "2026-07-09",
+        "generated_at": "2026-07-08T15:05:00+08:00",
+        "valid_until": "2026-07-09T15:00:00+08:00",
+        "status": "active",
+        "payload_json": "{}",
+    }
+    data.update(overrides)
+    for field in omitted or set():
+        data.pop(field)
+
+    columns = list(data)
+    placeholders = [f":{column}" for column in columns]
+    connection.execute(
+        f"""
+        INSERT INTO trading_plans (
+          {", ".join(columns)}
+        ) VALUES (
+          {", ".join(placeholders)}
+        )
+        """,
+        data,
+    )
+
+
 @pytest.mark.parametrize(
     ("table_name", "expected_columns"),
     [
@@ -189,6 +220,17 @@ def insert_account_snapshot(
                 "total_assets",
                 "total_pnl",
                 "position_ratio",
+                "payload_json",
+            ],
+        ),
+        (
+            "trading_plans",
+            [
+                "plan_id",
+                "trading_day",
+                "generated_at",
+                "valid_until",
+                "status",
                 "payload_json",
             ],
         ),
@@ -244,6 +286,16 @@ def test_migrate_creates_market_input_snapshots_table(tmp_path) -> None:
         migrate(connection)
         row = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'market_input_snapshots'"
+        ).fetchone()
+    assert row is not None
+
+
+def test_migrate_creates_trading_plans_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'trading_plans'"
         ).fetchone()
     assert row is not None
 
@@ -514,3 +566,39 @@ def test_migrate_creates_scheduler_state_table(tmp_path) -> None:
         ).fetchone()
 
     assert row is not None
+
+
+def test_trading_plans_reject_duplicate_plan_id(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "planning.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        insert_trading_plan(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_trading_plan(connection)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["plan_id", "trading_day", "generated_at", "valid_until", "status", "payload_json"],
+)
+def test_trading_plans_reject_null_required_fields(tmp_path, field: str) -> None:
+    settings = Settings(database_path=tmp_path / "planning.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_trading_plan(connection, **{field: None})
+
+
+@pytest.mark.parametrize("status", ["draft", "ok", ""])
+def test_trading_plans_reject_unknown_status(tmp_path, status: str) -> None:
+    settings = Settings(database_path=tmp_path / "planning.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_trading_plan(connection, status=status)
