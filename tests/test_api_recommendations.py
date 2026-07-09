@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from tests.test_api_positions import authenticated_client, position_payload
 from tests.test_api_watchlist import watchlist_payload
 
@@ -46,6 +48,38 @@ def test_recommendation_scan_without_plan_returns_uniform_404(tmp_path) -> None:
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "plan_not_found"
+
+
+def test_recommendation_scan_rejects_expired_plan_without_persisting(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.api.routes.recommendations as recommendation_routes
+
+    client, headers = authenticated_client(tmp_path)
+    client.post("/api/v1/positions", json=position_payload("600000"), headers=headers)
+    client.post(
+        "/api/v1/plans",
+        json={"trading_day": "2026-07-09"},
+        headers=headers,
+    )
+    monkeypatch.setattr(
+        recommendation_routes,
+        "_current_time",
+        lambda: datetime(2026, 7, 9, 8, 0, tzinfo=UTC),
+    )
+
+    scan_response = client.post("/api/v1/recommendations/scan", headers=headers)
+    list_response = client.get("/api/v1/recommendations", headers=headers)
+
+    assert scan_response.status_code == 422
+    body = scan_response.json()
+    assert body["error"]["code"] == "plan_not_scannable"
+    assert body["error"]["message"] == "trading plan is not scannable"
+    assert body["error"]["details"]["plan_id"] == "plan-20260709"
+    assert body["error"]["details"]["status"] == "active"
+    assert list_response.status_code == 200
+    assert list_response.json() == []
 
 
 def test_get_missing_recommendation_returns_uniform_404(tmp_path) -> None:

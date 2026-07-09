@@ -9,7 +9,7 @@ from quantitative_trading.account.models import AccountSnapshot
 from quantitative_trading.account.repository import AccountSnapshotRepository
 from quantitative_trading.ledger.models import Position
 from quantitative_trading.ledger.repository import PositionRepository
-from quantitative_trading.planning.models import TradingPlan
+from quantitative_trading.planning.models import TradingPlan, TradingPlanStatus
 from quantitative_trading.planning.repository import TradingPlanRepository
 from quantitative_trading.recommendation.models import Recommendation
 from quantitative_trading.recommendation.repository import RecommendationRepository
@@ -27,6 +27,15 @@ class RecommendationScan:
     recommendations: list[Recommendation]
 
 
+class PlanNotScannableError(ValueError):
+    def __init__(self, plan: TradingPlan, *, now: datetime) -> None:
+        super().__init__("trading plan is not scannable")
+        self.plan_id = plan.plan_id
+        self.status = plan.status
+        self.valid_until = plan.valid_until
+        self.now = now
+
+
 def scan_latest_plan_recommendations(
     connection: sqlite3.Connection,
     *,
@@ -35,6 +44,8 @@ def scan_latest_plan_recommendations(
     plan = TradingPlanRepository(connection).latest()
     if plan is None:
         return None
+    if not _is_plan_scannable(plan, now=now):
+        raise PlanNotScannableError(plan, now=now)
 
     universe_snapshot = UniverseSnapshotRepository(connection).get(plan.universe_snapshot_id)
     members = [] if universe_snapshot is None else universe_snapshot.members
@@ -55,6 +66,10 @@ def scan_latest_plan_recommendations(
     ]
     RecommendationRepository(connection).save_many(recommendations, created_at=now)
     return RecommendationScan(plan=plan, recommendations=recommendations)
+
+
+def _is_plan_scannable(plan: TradingPlan, *, now: datetime) -> bool:
+    return plan.status is TradingPlanStatus.ACTIVE and now <= plan.valid_until
 
 
 def _is_scannable_member(

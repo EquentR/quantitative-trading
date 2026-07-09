@@ -15,7 +15,10 @@ from quantitative_trading.api.dependencies import (
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.recommendation.models import Recommendation
 from quantitative_trading.recommendation.repository import RecommendationRepository
-from quantitative_trading.recommendation.scanner import scan_latest_plan_recommendations
+from quantitative_trading.recommendation.scanner import (
+    PlanNotScannableError,
+    scan_latest_plan_recommendations,
+)
 
 
 router = APIRouter(
@@ -58,6 +61,19 @@ def _recommendation_storage_failed() -> ApiError:
     )
 
 
+def _plan_not_scannable(exc: PlanNotScannableError) -> ApiError:
+    return ApiError(
+        status_code=422,
+        code="plan_not_scannable",
+        message="trading plan is not scannable",
+        details={
+            "plan_id": exc.plan_id,
+            "status": exc.status.value,
+            "valid_until": exc.valid_until.isoformat(),
+        },
+    )
+
+
 @router.post("/scan", response_model=RecommendationScanResponse, status_code=201)
 def scan_recommendations(
     container: ApiContainer = Depends(get_container),
@@ -65,6 +81,8 @@ def scan_recommendations(
     try:
         with connection_scope(container.settings) as connection:
             scan = scan_latest_plan_recommendations(connection, now=_current_time())
+    except PlanNotScannableError as exc:
+        raise _plan_not_scannable(exc) from exc
     except (sqlite3.Error, ValidationError) as exc:
         raise _recommendation_storage_failed() from exc
 

@@ -32,7 +32,10 @@ from quantitative_trading.market.providers import (
 from quantitative_trading.planning.repository import TradingPlanRepository
 from quantitative_trading.planning.workflow import generate_trading_plan
 from quantitative_trading.recommendation.repository import RecommendationRepository
-from quantitative_trading.recommendation.scanner import scan_latest_plan_recommendations
+from quantitative_trading.recommendation.scanner import (
+    PlanNotScannableError,
+    scan_latest_plan_recommendations,
+)
 from quantitative_trading.runtime.service_app import run_api_service
 from quantitative_trading.runtime.service_runner import DebugServiceRunner
 from quantitative_trading.storage.sqlite import connect, migrate
@@ -660,8 +663,11 @@ def latest_plan() -> None:
 
 @recommendations_app.command("scan")
 def scan_recommendations() -> None:
-    with _database_scope() as (_settings, connection):
-        scan = scan_latest_plan_recommendations(connection, now=datetime.now(UTC))
+    try:
+        with _database_scope() as (_settings, connection):
+            scan = scan_latest_plan_recommendations(connection, now=datetime.now(UTC))
+    except PlanNotScannableError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if scan is None:
         typer.echo("暂无计划，无法生成建议")
         return

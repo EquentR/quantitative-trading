@@ -753,6 +753,45 @@ def test_recommendation_scan_list_and_show_commands(tmp_path) -> None:
     assert "action=hold" in show_result.output
 
 
+def test_recommendation_scan_rejects_expired_plan_without_traceback(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 7, 9, 8, 0, tzinfo=UTC)
+
+    run_cli(
+        tmp_path,
+        "ledger",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "浦发银行",
+        "--quantity",
+        "1000",
+        "--available-quantity",
+        "800",
+        "--cost-price",
+        "9.5",
+        "--opened-at",
+        "2026-07-06",
+    )
+    run_cli(tmp_path, "plan", "generate", "--date", "2026-07-09")
+    monkeypatch.setattr(cli, "datetime", FakeDatetime)
+
+    scan_result = run_cli(tmp_path, "recommendations", "scan")
+    list_result = run_cli(tmp_path, "recommendations", "list")
+
+    assert scan_result.exit_code != 0
+    assert "trading plan is not scannable" in scan_result.output
+    assert "Traceback" not in scan_result.output
+    assert list_result.exit_code == 0
+    assert "暂无建议" in list_result.output
+
+
 def test_service_run_once_uses_configured_akshare_provider(monkeypatch, tmp_path) -> None:
     class FakeAkShareProvider:
         calls: list[list[str]] = []
