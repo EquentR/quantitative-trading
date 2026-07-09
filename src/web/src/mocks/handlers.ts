@@ -32,6 +32,9 @@ export const mockServiceStatus: ServiceStatus = {
   last_reason: 'manual_api',
   last_error: null,
   last_snapshot_id: 1,
+  last_task_type: 'plan_generation',
+  last_plan_id: 'plan-001',
+  last_recommendation_ids: ['rec-001'],
 }
 
 export const mockPositions: Position[] = [
@@ -309,12 +312,19 @@ export const handlers = [
     HttpResponse.json(mockRecommendations[0]),
   ),
   http.get('/api/v1/notifications', () => HttpResponse.json(mockNotifications)),
-  http.post('/api/v1/notifications/:notification_id/read', () =>
-    HttpResponse.json({ status: 'read' }),
-  ),
   http.get('/api/v1/audit', () => HttpResponse.json([mockAuditLog])),
   http.get('/api/v1/audit/:audit_id', () => HttpResponse.json(mockAuditLog)),
-  http.get('/api/v1/feedback', () => HttpResponse.json(mockExecutionFeedback)),
+  http.get('/api/v1/feedback', ({ request }) => {
+    const url = new URL(request.url)
+    const recId = url.searchParams.get('recommendation_id')
+    if (recId === '' || recId === 'undefined') {
+      return HttpResponse.json(
+        { error: { code: 'bad_request', message: 'invalid recommendation_id' } },
+        { status: 400 },
+      )
+    }
+    return HttpResponse.json(mockExecutionFeedback)
+  }),
   http.post('/api/v1/feedback', async ({ request }) => {
     const body = await request.json()
     return HttpResponse.json(

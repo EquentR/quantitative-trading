@@ -28,6 +28,9 @@ export interface ServiceStatus {
   last_reason?: string | null
   last_error?: string | null
   last_snapshot_id?: number | null
+  last_task_type?: string | null
+  last_plan_id?: string | null
+  last_recommendation_ids?: string[]
 }
 
 export interface PositionInput {

@@ -2,8 +2,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useApiClient } from '@/api/client-provider'
 import type { ExecutionFeedback, ExecutionFeedbackInput } from '@/api/types'
 
-export const feedbackQueryKey = (recommendationId: string, limit = 20) =>
-  ['feedback', recommendationId, limit] as const
+export const feedbackQueryKey = (recommendationId: string | undefined, limit = 20) =>
+  ['feedback', recommendationId ?? null, limit] as const
 
 function invalidateFeedbackDependents(queryClient: ReturnType<typeof useQueryClient>) {
   queryClient.invalidateQueries({ queryKey: ['feedback'] })
@@ -11,12 +11,18 @@ function invalidateFeedbackDependents(queryClient: ReturnType<typeof useQueryCli
   queryClient.invalidateQueries({ queryKey: ['recommendations'] })
 }
 
-export function useFeedbackQuery(recommendationId: string, limit = 20) {
+export function useFeedbackQuery(recommendationId?: string, limit = 20) {
   const client = useApiClient()
   return useQuery({
     queryKey: feedbackQueryKey(recommendationId, limit),
-    queryFn: () =>
-      client.get<ExecutionFeedback[]>(`/feedback?recommendation_id=${recommendationId}&limit=${limit}`),
+    queryFn: () => {
+      const params = new URLSearchParams()
+      if (recommendationId) {
+        params.set('recommendation_id', recommendationId)
+      }
+      params.set('limit', String(limit))
+      return client.get<ExecutionFeedback[]>(`/feedback?${params.toString()}`)
+    },
   })
 }
 

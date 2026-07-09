@@ -28,6 +28,19 @@ test('通过 query hook 读取服务状态', async () => {
   await waitFor(() => expect(screen.getByText('configured')).toBeInTheDocument())
 })
 
+test('通过 query hook 读取服务状态 Task 11 字段', async () => {
+  const Component = defineComponent({
+    setup() {
+      return { query: useServiceStatusQuery() }
+    },
+    template: '<div>{{ query.data.value?.last_task_type }}|{{ query.data.value?.last_plan_id }}|{{ query.data.value?.last_recommendation_ids?.join(",") }}</div>',
+  })
+
+  render(Component, { global: { plugins: [createPinia(), [VueQueryPlugin, queryPlugin]] } })
+
+  await waitFor(() => expect(screen.getByText('plan_generation|plan-001|rec-001')).toBeInTheDocument())
+})
+
 test('通过 query hook 读取持仓列表', async () => {
   const Component = defineComponent({
     setup() {
@@ -136,6 +149,19 @@ test('通过 query hook 读取执行反馈', async () => {
   const Component = defineComponent({
     setup() {
       return { query: useFeedbackQuery('rec-001') }
+    },
+    template: '<div>{{ query.data.value?.[0].feedback_id }}</div>',
+  })
+
+  render(Component, { global: { plugins: [createPinia(), [VueQueryPlugin, queryPlugin]] } })
+
+  await waitFor(() => expect(screen.getByText('fb-001')).toBeInTheDocument())
+})
+
+test('通过 query hook 读取全部执行反馈', async () => {
+  const Component = defineComponent({
+    setup() {
+      return { query: useFeedbackQuery() }
     },
     template: '<div>{{ query.data.value?.[0].feedback_id }}</div>',
   })

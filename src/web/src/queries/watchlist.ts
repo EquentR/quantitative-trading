@@ -33,7 +33,7 @@ export function useUpdatePinnedItemMutation() {
   const client = useApiClient()
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ symbol, input }: { symbol: string; input: Partial<WatchPinnedInput> }) =>
+    mutationFn: ({ symbol, input }: { symbol: string; input: WatchPinnedInput }) =>
       client.put<WatchPinnedItem>(`/watchlist/pinned/${symbol}`, input),
     onSuccess: () => invalidateWatchlistDependents(queryClient),
   })
