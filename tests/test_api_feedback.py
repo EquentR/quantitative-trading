@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import sqlite3
 
 from fastapi.testclient import TestClient
 
@@ -34,10 +35,14 @@ def position_payload(symbol: str = "600000") -> dict[str, object]:
     }
 
 
-def notification_summary() -> NotificationSummary:
+def notification_summary(
+    *,
+    notification_id: str = "notif-1",
+    recommendation_id: str = "rec-1",
+) -> NotificationSummary:
     return NotificationSummary(
-        notification_id="notif-1",
-        recommendation_id="rec-1",
+        notification_id=notification_id,
+        recommendation_id=recommendation_id,
         symbol="600000",
         action="watch",
         confidence="medium",
@@ -109,6 +114,65 @@ def test_post_feedback_records_manual_execution_without_mutating_ledgers(tmp_pat
         notification = NotificationRepository(connection).get("notif-1")
     assert notification is not None
     assert notification.status is NotificationStatus.FEEDBACK_RECORDED
+
+
+def test_post_feedback_rolls_back_when_notification_update_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    with connect(settings) as connection:
+        migrate(connection)
+        NotificationRepository(connection).save(notification_summary())
+
+    def fail_save(self, summary, *, commit=True):  # noqa: ANN001, ARG001
+        raise sqlite3.OperationalError("simulated notification write failure")
+
+    monkeypatch.setattr(NotificationRepository, "save", fail_save)
+
+    response = client.post(
+        "/api/v1/feedback",
+        json={"recommendation_id": "rec-1", "executed": False},
+        headers=headers,
+    )
+    list_response = client.get("/api/v1/feedback?recommendation_id=rec-1", headers=headers)
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert list_response.status_code == 200
+    assert list_response.json() == []
+    with connect(settings) as connection:
+        notification = NotificationRepository(connection).get("notif-1")
+    assert notification is not None
+    assert notification.status is NotificationStatus.UNREAD
+
+
+def test_post_feedback_marks_all_matching_notifications(tmp_path) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = NotificationRepository(connection)
+        for index in range(55):
+            repository.save(notification_summary(notification_id=f"notif-{index:02d}"))
+
+    response = client.post(
+        "/api/v1/feedback",
+        json={"recommendation_id": "rec-1", "executed": False},
+        headers=headers,
+    )
+
+    assert response.status_code == 201
+    with connect(settings) as connection:
+        rows = connection.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM notifications
+            WHERE recommendation_id = ?
+            GROUP BY status
+            """,
+            ("rec-1",),
+        ).fetchall()
+    assert {row["status"]: row["count"] for row in rows} == {"feedback_recorded": 55}
 
 
 def test_feedback_endpoints_require_authentication_after_setup(tmp_path) -> None:

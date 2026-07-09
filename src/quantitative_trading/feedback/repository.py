@@ -10,7 +10,7 @@ class FeedbackRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
 
-    def save(self, feedback: ExecutionFeedback) -> ExecutionFeedback:
+    def save(self, feedback: ExecutionFeedback, *, commit: bool = True) -> ExecutionFeedback:
         self.connection.execute(
             """
             INSERT INTO execution_feedback (
@@ -52,7 +52,8 @@ class FeedbackRepository:
                 feedback.model_dump_json(),
             ),
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return feedback
 
     def get(self, feedback_id: str) -> ExecutionFeedback | None:

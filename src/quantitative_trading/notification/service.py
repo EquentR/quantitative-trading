@@ -58,18 +58,24 @@ class NotificationService:
         notification_id: str,
         *,
         now: datetime | None = None,
+        commit: bool = True,
     ) -> NotificationSummary:
         del now
-        return self._set_status(notification_id, NotificationStatus.READ)
+        return self._set_status(notification_id, NotificationStatus.READ, commit=commit)
 
     def mark_feedback_recorded(
         self,
         notification_id: str,
         *,
         now: datetime | None = None,
+        commit: bool = True,
     ) -> NotificationSummary:
         del now
-        return self._set_status(notification_id, NotificationStatus.FEEDBACK_RECORDED)
+        return self._set_status(
+            notification_id,
+            NotificationStatus.FEEDBACK_RECORDED,
+            commit=commit,
+        )
 
     def get(self, notification_id: str) -> NotificationSummary | None:
         return self.repository.get(notification_id)
@@ -78,12 +84,14 @@ class NotificationService:
         self,
         notification_id: str,
         status: NotificationStatus,
+        *,
+        commit: bool = True,
     ) -> NotificationSummary:
         existing = self.repository.get(notification_id)
         if existing is None:
             raise KeyError(f"notification not found: {notification_id}")
         updated = existing.model_copy(update={"status": status})
-        return self.repository.save(updated)
+        return self.repository.save(updated, commit=commit)
 
     @staticmethod
     def _current_price_or_none(recommendation: Recommendation) -> float | None:

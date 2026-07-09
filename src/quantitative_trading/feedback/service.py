@@ -24,6 +24,7 @@ class FeedbackService:
         payload: ExecutionFeedbackInput,
         *,
         now: datetime | None = None,
+        commit: bool = True,
     ) -> ExecutionFeedback:
         payload = ExecutionFeedbackInput.model_validate(payload)
         feedback = ExecutionFeedback(
@@ -35,7 +36,7 @@ class FeedbackService:
             note=sanitize_sensitive_data(payload.note),
             created_at=now or datetime.now(UTC),
         )
-        return self.repository.save(feedback)
+        return self.repository.save(feedback, commit=commit)
 
     def list(
         self,

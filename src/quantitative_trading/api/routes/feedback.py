@@ -47,15 +47,22 @@ def record_feedback(
 ) -> ExecutionFeedback:
     try:
         with connection_scope(container.settings) as connection:
-            feedback = FeedbackService(FeedbackRepository(connection)).record(
-                payload,
-                now=_current_time(),
-            )
-            _mark_matching_notifications_feedback_recorded(
-                connection,
-                recommendation_id=feedback.recommendation_id,
-            )
-            return feedback
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                feedback = FeedbackService(FeedbackRepository(connection)).record(
+                    payload,
+                    now=_current_time(),
+                    commit=False,
+                )
+                _mark_matching_notifications_feedback_recorded(
+                    connection,
+                    recommendation_id=feedback.recommendation_id,
+                )
+                connection.commit()
+                return feedback
+            except (sqlite3.Error, ValidationError):
+                connection.rollback()
+                raise
     except (sqlite3.Error, ValidationError) as exc:
         raise _feedback_storage_failed() from exc
 
@@ -84,4 +91,4 @@ def _mark_matching_notifications_feedback_recorded(
     repository = NotificationRepository(connection)
     service = NotificationService(repository)
     for notification in repository.list_by_recommendation_id(recommendation_id):
-        service.mark_feedback_recorded(notification.notification_id)
+        service.mark_feedback_recorded(notification.notification_id, commit=False)

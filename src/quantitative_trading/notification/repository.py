@@ -10,7 +10,7 @@ class NotificationRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
 
-    def save(self, summary: NotificationSummary) -> NotificationSummary:
+    def save(self, summary: NotificationSummary, *, commit: bool = True) -> NotificationSummary:
         self.connection.execute(
             """
             INSERT INTO notifications (
@@ -52,7 +52,8 @@ class NotificationRepository:
                 summary.model_dump_json(),
             ),
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return summary
 
     def get(self, notification_id: str) -> NotificationSummary | None:
@@ -84,16 +85,27 @@ class NotificationRepository:
         self,
         recommendation_id: str,
         *,
-        limit: int = 50,
+        limit: int | None = None,
     ) -> list[NotificationSummary]:
-        rows = self.connection.execute(
-            """
-            SELECT payload_json
-            FROM notifications
-            WHERE recommendation_id = ?
-            ORDER BY created_at DESC, rowid DESC
-            LIMIT ?
-            """,
-            (recommendation_id, limit),
-        ).fetchall()
+        if limit is None:
+            rows = self.connection.execute(
+                """
+                SELECT payload_json
+                FROM notifications
+                WHERE recommendation_id = ?
+                ORDER BY created_at DESC, rowid DESC
+                """,
+                (recommendation_id,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """
+                SELECT payload_json
+                FROM notifications
+                WHERE recommendation_id = ?
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                (recommendation_id, limit),
+            ).fetchall()
         return [NotificationSummary.model_validate_json(row["payload_json"]) for row in rows]
