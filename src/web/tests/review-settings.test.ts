@@ -12,14 +12,14 @@ beforeEach(() => {
   localStorage.clear()
 })
 
-test('复盘页显示后续能力说明且不出现买入成功', () => {
+test('复盘页展示推荐记录和人工执行反馈且不出现买入成功', async () => {
   const pinia = createPinia()
   setActivePinia(pinia)
   render(ReviewPage, { global: { plugins: [pinia, VueQueryPlugin] } })
 
-  expect(
-    screen.getByText('推荐记录、人工执行反馈、审计日志将在后续 API 落地后接入'),
-  ).toBeInTheDocument()
+  await waitFor(() => expect(screen.getByText('推荐记录')).toBeInTheDocument())
+  expect(screen.getByText('人工执行反馈')).toBeInTheDocument()
+  expect(screen.getByText('审计日志')).toBeInTheDocument()
   expect(screen.queryByText('买入成功')).not.toBeInTheDocument()
 })
 

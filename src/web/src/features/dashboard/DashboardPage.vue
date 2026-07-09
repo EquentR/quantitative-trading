@@ -4,6 +4,9 @@ import { useServiceStatusQuery } from '@/queries/service'
 import { useLatestSnapshotQuery } from '@/queries/account'
 import { usePositionsQuery } from '@/queries/positions'
 import { useCashAccountQuery } from '@/queries/cash'
+import { useLatestPlanQuery } from '@/queries/plans'
+import { useRecommendationsQuery } from '@/queries/recommendations'
+import { useNotificationsQuery } from '@/queries/notifications'
 import { ApiError } from '@/api/client'
 import StatusBadges from '@/components/domain/StatusBadges.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
@@ -13,16 +16,32 @@ const serviceQuery = useServiceStatusQuery()
 const snapshotQuery = useLatestSnapshotQuery()
 const positionsQuery = usePositionsQuery()
 const cashQuery = useCashAccountQuery()
+const planQuery = useLatestPlanQuery()
+const recommendationsQuery = useRecommendationsQuery()
+const notificationsQuery = useNotificationsQuery()
 
 const service = computed(() => serviceQuery.data.value)
 const snapshot = computed(() => snapshotQuery.data.value)
 const positions = computed(() => positionsQuery.data.value)
 const cash = computed(() => cashQuery.data.value)
+const plan = computed(() => planQuery.data.value)
+const recommendations = computed(() => recommendationsQuery.data.value ?? [])
+const notifications = computed(() => notificationsQuery.data.value ?? [])
 
 const snapshotWarning = computed(() => {
   if (!snapshot.value) return false
   return snapshot.value.status !== 'ok'
 })
+
+const notificationsUnavailable = computed(() => notificationsQuery.error.value != null)
+
+const unreadCount = computed(() =>
+  notifications.value.filter((n) => n.status === 'unread').length,
+)
+
+const pendingFeedbackCount = computed(() =>
+  notifications.value.filter((n) => n.status !== 'feedback_recorded').length,
+)
 
 const snapshotNotFound = computed(() => {
   const error = snapshotQuery.error.value
@@ -65,6 +84,49 @@ const snapshotErrorMessage = computed(() => {
         />
         <p>调度间隔：{{ service?.interval_seconds ? `${service.interval_seconds} 秒` : '不可用' }}</p>
         <p v-if="service?.last_status">最近运行：{{ service.last_status }}</p>
+      </div>
+    </section>
+
+    <section>
+      <h2 class="mb-2 text-sm font-medium">最新计划</h2>
+      <div class="space-y-1 text-sm">
+        <template v-if="plan">
+          <p>计划ID：{{ plan.plan_id }}</p>
+          <p>交易日：{{ plan.trading_day }}</p>
+          <p>状态：{{ plan.status }}</p>
+          <p>有效期至：<FormatValues kind="time" :value="plan.valid_until" /></p>
+        </template>
+        <p v-else-if="planQuery.error.value" class="text-muted-foreground">计划数据不可用</p>
+        <p v-else class="text-muted-foreground">暂无最新计划</p>
+      </div>
+    </section>
+
+    <section>
+      <h2 class="mb-2 text-sm font-medium">建议摘要</h2>
+      <div class="space-y-1 text-sm">
+        <p>建议数：{{ recommendations.length }}</p>
+        <ul v-if="recommendations.length" class="space-y-0.5">
+          <li v-for="r in recommendations.slice(0, 5)" :key="r.recommendation_id" class="break-words">
+            {{ r.symbol }} {{ r.name }} {{ r.action }}
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <section>
+      <h2 class="mb-2 text-sm font-medium">通知摘要</h2>
+      <div class="space-y-1 text-sm">
+        <template v-if="notificationsUnavailable">
+          <p class="text-muted-foreground">通知数据不可用</p>
+          <p>待反馈: 不可用</p>
+        </template>
+        <template v-else>
+          <p>未读: {{ unreadCount }}</p>
+          <p>待反馈: {{ pendingFeedbackCount }}</p>
+          <p v-if="notifications.length" class="text-xs text-muted-foreground break-words">
+            最近通知：{{ notifications[0].symbol }} {{ notifications[0].action }}
+          </p>
+        </template>
       </div>
     </section>
 

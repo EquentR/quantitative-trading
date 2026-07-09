@@ -10,6 +10,7 @@ export function useAuditLogQuery() {
   return useQuery({
     queryKey: auditLogQueryKey,
     queryFn: () => client.get<AuditLog[]>('/audit'),
+    retry: false,
   })
 }
 

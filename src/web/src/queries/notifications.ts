@@ -9,5 +9,6 @@ export function useNotificationsQuery() {
   return useQuery({
     queryKey: notificationsQueryKey,
     queryFn: () => client.get<NotificationSummary[]>('/notifications'),
+    retry: false,
   })
 }

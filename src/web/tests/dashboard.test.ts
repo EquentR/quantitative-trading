@@ -57,3 +57,33 @@ test('无账户快照时提示生成快照', async () => {
 
   await waitFor(() => expect(screen.getByText('尚未生成账户快照')).toBeInTheDocument())
 })
+
+
+test('展示最新计划状态', async () => {
+  renderDashboard()
+  await waitFor(() => expect(screen.getByText(/plan-001/)).toBeInTheDocument())
+  expect(screen.getByText(/2026-07-07/)).toBeInTheDocument()
+})
+
+test('展示建议摘要', async () => {
+  renderDashboard()
+  await waitFor(() => expect(screen.getByText('建议摘要')).toBeInTheDocument())
+  expect(screen.getByText(/建议数.*\d/)).toBeInTheDocument()
+})
+
+test('展示通知摘要和未读与待反馈计数', async () => {
+  renderDashboard()
+  await waitFor(() => expect(screen.getByText('未读: 1')).toBeInTheDocument())
+  expect(screen.getByText('待反馈: 1')).toBeInTheDocument()
+})
+
+test('通知不可用时显示降级文案', async () => {
+  server.use(
+    http.get('/api/v1/notifications', () =>
+      HttpResponse.json({ error: { message: 'not mounted' } }, { status: 404 }),
+    ),
+  )
+  renderDashboard()
+  await waitFor(() => expect(screen.getByText('通知数据不可用')).toBeInTheDocument())
+  await waitFor(() => expect(screen.getByText('待反馈: 不可用')).toBeInTheDocument())
+})
