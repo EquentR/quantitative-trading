@@ -82,6 +82,26 @@ GET /api/v1/account/snapshots/latest
 
 账户快照可读取手动持仓台账、手动资金账户和行情数据，并写入本地账户快照。`GET /api/v1/account/snapshot?fresh=true` 生成并保存新的账户快照；不带 `fresh=true` 时返回已保存的最新快照。行情缺失或覆盖不足时，快照必须显式保留状态，不得把不完整估值伪装成完整账户估值。
 
+## 计划接口
+
+```text
+POST /api/v1/plans
+GET /api/v1/plans/latest
+GET /api/v1/plans/{plan_id}
+```
+
+计划接口从手动持仓台账和自选置顶生成本地交易计划，并同步保存当时使用的股票池快照。未接入行情时，计划只生成保守候选动作、台账成本附近的关键价位和明确失效条件，不伪造实时价格。
+
+## 建议接口
+
+```text
+POST /api/v1/recommendations/scan
+GET /api/v1/recommendations
+GET /api/v1/recommendations/{recommendation_id}
+```
+
+建议扫描读取最新计划、手动持仓台账和最近账户快照，生成本地可追溯建议并保存。当前实现不触发外部行情抓取，不自动下单，不控制真实交易客户端；数据不足时仅输出保守持有或观察建议，并保留风险说明和失效条件。
+
 ## 服务与调度接口
 
 ```text
@@ -96,5 +116,7 @@ POST /api/v1/service/run-once
 ## CLI 关系
 
 `qt service run` 启动统一后台服务，组合 HTTP API 和调度器。`qt service debug-run --once` 仍是本地调试快照辅助入口，用于手动执行一次快照检查。
+
+`qt plan generate --date YYYY-MM-DD` 和 `qt plan latest` 使用与计划 API 相同的生成和读取逻辑。`qt recommendations scan`、`qt recommendations list` 和 `qt recommendations show <recommendation_id>` 使用与建议 API 相同的扫描和读取逻辑。
 
 HTTP API、CLI 和后台调度器共享相同的 service、repository、adapter、风控和审计日志逻辑，不为不同入口维护独立口径。

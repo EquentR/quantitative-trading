@@ -127,6 +127,19 @@ CREATE TABLE IF NOT EXISTS trading_plans (
 """
 
 
+RECOMMENDATIONS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS recommendations (
+  recommendation_id TEXT PRIMARY KEY NOT NULL,
+  symbol TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('buy', 'sell', 'add', 'reduce', 'hold', 'watch', 'avoid')),
+  data_time TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  CHECK (symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]')
+);
+"""
+
+
 API_AUTH_STATE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS api_auth_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -164,6 +177,7 @@ SCHEMA_STATEMENTS = [
     UNIVERSE_SNAPSHOTS_SCHEMA_SQL,
     MARKET_INPUT_SNAPSHOTS_SCHEMA_SQL,
     TRADING_PLANS_SCHEMA_SQL,
+    RECOMMENDATIONS_SCHEMA_SQL,
     API_AUTH_STATE_SCHEMA_SQL,
     SCHEDULER_STATE_SCHEMA_SQL,
 ]

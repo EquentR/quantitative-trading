@@ -13,7 +13,9 @@ from quantitative_trading.api.routes import (
     auth,
     cash,
     datasource,
+    plans,
     positions,
+    recommendations,
     service,
     universe,
     watchlist,
@@ -41,7 +43,9 @@ def create_app(
     app.include_router(auth.router, prefix="/api/v1")
     app.include_router(cash.router, prefix="/api/v1")
     app.include_router(datasource.router, prefix="/api/v1")
+    app.include_router(plans.router, prefix="/api/v1")
     app.include_router(positions.router, prefix="/api/v1")
+    app.include_router(recommendations.router, prefix="/api/v1")
     app.include_router(service.router, prefix="/api/v1")
     app.include_router(universe.router, prefix="/api/v1")
     app.include_router(watchlist.router, prefix="/api/v1")

@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -28,6 +29,10 @@ from quantitative_trading.market.providers import (
     DisabledMarketProvider,
     MarketDataProvider,
 )
+from quantitative_trading.planning.repository import TradingPlanRepository
+from quantitative_trading.planning.workflow import generate_trading_plan
+from quantitative_trading.recommendation.repository import RecommendationRepository
+from quantitative_trading.recommendation.scanner import scan_latest_plan_recommendations
 from quantitative_trading.runtime.service_app import run_api_service
 from quantitative_trading.runtime.service_runner import DebugServiceRunner
 from quantitative_trading.storage.sqlite import connect, migrate
@@ -49,12 +54,16 @@ service_app = typer.Typer()
 cash_app = typer.Typer()
 account_app = typer.Typer()
 watchlist_app = typer.Typer()
+plan_app = typer.Typer()
+recommendations_app = typer.Typer()
 
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(service_app, name="service")
 app.add_typer(cash_app, name="cash")
 app.add_typer(account_app, name="account")
 app.add_typer(watchlist_app, name="watchlist")
+app.add_typer(plan_app, name="plan")
+app.add_typer(recommendations_app, name="recommendations")
 
 
 def _services() -> tuple[
@@ -224,6 +233,31 @@ def _market_provider(settings: Settings) -> MarketDataProvider:
         return AkShareMarketProvider()
 
     raise typer.BadParameter(f"unsupported market provider: {settings.market_provider}")
+
+
+@contextmanager
+def _database_scope() -> Iterator[tuple[Settings, sqlite3.Connection]]:
+    settings = load_settings()
+    with connect(settings) as connection:
+        migrate(connection)
+        yield settings, connection
+
+
+def _parse_trading_day(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise typer.BadParameter("date must use YYYY-MM-DD") from exc
+
+
+def _echo_recommendation_line(recommendation) -> None:
+    typer.echo(
+        f"{recommendation.recommendation_id} "
+        f"{recommendation.symbol} "
+        f"{recommendation.action.value} "
+        f"confidence={recommendation.confidence} "
+        f"data_time={recommendation.data_time.isoformat()}"
+    )
 
 
 @ledger_app.command("add")
@@ -584,6 +618,86 @@ def account_snapshot(json_output: Annotated[bool, typer.Option("--json")] = Fals
         )
         for warning in snapshot.warnings:
             typer.echo(f"warning={warning}")
+
+
+@plan_app.command("generate")
+def generate_plan(date_text: Annotated[str, typer.Option("--date")]) -> None:
+    trading_day = _parse_trading_day(date_text)
+    with _database_scope() as (settings, connection):
+        created = generate_trading_plan(
+            connection,
+            trading_day=trading_day,
+            now=datetime.now(UTC),
+            timezone=settings.timezone,
+        )
+    typer.echo(
+        f"plan_id={created.plan_id} "
+        f"trading_day={created.plan.trading_day.isoformat()} "
+        f"holdings={len(created.plan.holding_symbols)} "
+        f"watch={len(created.plan.watch_symbols)}"
+    )
+    for warning in created.plan.warnings:
+        typer.echo(f"warning={warning}")
+
+
+@plan_app.command("latest")
+def latest_plan() -> None:
+    with _database_scope() as (_settings, connection):
+        plan = TradingPlanRepository(connection).latest()
+    if plan is None:
+        typer.echo("暂无计划")
+        return
+    typer.echo(
+        f"plan_id={plan.plan_id} "
+        f"trading_day={plan.trading_day.isoformat()} "
+        f"status={plan.status.value} "
+        f"holdings={len(plan.holding_symbols)} "
+        f"watch={len(plan.watch_symbols)}"
+    )
+    for warning in plan.warnings:
+        typer.echo(f"warning={warning}")
+
+
+@recommendations_app.command("scan")
+def scan_recommendations() -> None:
+    with _database_scope() as (_settings, connection):
+        scan = scan_latest_plan_recommendations(connection, now=datetime.now(UTC))
+    if scan is None:
+        typer.echo("暂无计划，无法生成建议")
+        return
+    typer.echo(f"generated={len(scan.recommendations)} plan_id={scan.plan.plan_id}")
+    for recommendation in scan.recommendations:
+        _echo_recommendation_line(recommendation)
+
+
+@recommendations_app.command("list")
+def list_recommendations() -> None:
+    with _database_scope() as (_settings, connection):
+        recommendations = RecommendationRepository(connection).list()
+    if not recommendations:
+        typer.echo("暂无建议")
+        return
+    for recommendation in recommendations:
+        _echo_recommendation_line(recommendation)
+
+
+@recommendations_app.command("show")
+def show_recommendation(recommendation_id: Annotated[str, typer.Argument()]) -> None:
+    with _database_scope() as (_settings, connection):
+        recommendation = RecommendationRepository(connection).get(recommendation_id)
+    if recommendation is None:
+        raise typer.BadParameter(f"recommendation not found: {recommendation_id}")
+    typer.echo(f"recommendation_id={recommendation.recommendation_id}")
+    typer.echo(f"symbol={recommendation.symbol}")
+    typer.echo(f"name={recommendation.name}")
+    typer.echo(f"action={recommendation.action.value}")
+    typer.echo(f"confidence={recommendation.confidence}")
+    typer.echo(f"data_time={recommendation.data_time.isoformat()}")
+    typer.echo(f"valid_until={recommendation.valid_until.isoformat()}")
+    typer.echo("reason=" + "; ".join(recommendation.reason))
+    invalid_if = recommendation.risk.get("invalid_if", [])
+    if isinstance(invalid_if, list):
+        typer.echo("invalid_if=" + "; ".join(str(item) for item in invalid_if))
 
 
 @service_app.command("check")

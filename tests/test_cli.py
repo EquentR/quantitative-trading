@@ -674,6 +674,85 @@ def test_account_snapshot_with_market_fetch_disabled_reports_warning(tmp_path) -
     assert "market fetch disabled" in result.output
 
 
+def test_plan_generate_and_latest_commands(tmp_path) -> None:
+    run_cli(
+        tmp_path,
+        "ledger",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "浦发银行",
+        "--quantity",
+        "1000",
+        "--available-quantity",
+        "800",
+        "--cost-price",
+        "9.5",
+        "--opened-at",
+        "2026-07-06",
+    )
+    run_cli(
+        tmp_path,
+        "watchlist",
+        "add",
+        "--symbol",
+        "000001",
+        "--name",
+        "平安银行",
+        "--rank",
+        "2",
+        "--plan-enabled",
+        "true",
+    )
+
+    generate_result = run_cli(tmp_path, "plan", "generate", "--date", "2026-07-09")
+    latest_result = run_cli(tmp_path, "plan", "latest")
+
+    assert generate_result.exit_code == 0
+    assert "plan_id=plan-20260709" in generate_result.output
+    assert "holdings=1" in generate_result.output
+    assert "watch=1" in generate_result.output
+    assert latest_result.exit_code == 0
+    assert "plan_id=plan-20260709" in latest_result.output
+    assert "trading_day=2026-07-09" in latest_result.output
+
+
+def test_recommendation_scan_list_and_show_commands(tmp_path) -> None:
+    run_cli(
+        tmp_path,
+        "ledger",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "浦发银行",
+        "--quantity",
+        "1000",
+        "--available-quantity",
+        "800",
+        "--cost-price",
+        "9.5",
+        "--opened-at",
+        "2026-07-06",
+    )
+    run_cli(tmp_path, "plan", "generate", "--date", "2026-07-09")
+
+    scan_result = run_cli(tmp_path, "recommendations", "scan")
+    list_result = run_cli(tmp_path, "recommendations", "list")
+    show_result = run_cli(tmp_path, "recommendations", "show", "rec-plan-20260709-600000")
+
+    assert scan_result.exit_code == 0
+    assert "generated=1" in scan_result.output
+    assert "rec-plan-20260709-600000 600000 hold" in scan_result.output
+    assert list_result.exit_code == 0
+    assert "rec-plan-20260709-600000 600000 hold" in list_result.output
+    assert show_result.exit_code == 0
+    assert "recommendation_id=rec-plan-20260709-600000" in show_result.output
+    assert "symbol=600000" in show_result.output
+    assert "action=hold" in show_result.output
+
+
 def test_service_run_once_uses_configured_akshare_provider(monkeypatch, tmp_path) -> None:
     class FakeAkShareProvider:
         calls: list[list[str]] = []
