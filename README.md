@@ -6,6 +6,16 @@
 
 首版以手动持仓台账作为真实持仓、成本价、持仓数量和可用数量的唯一权威源。
 
+## 自选置顶观察池
+
+自选置顶观察池是候选买入股票池来源，不代表真实持仓。观察池记录 `symbol,name,rank,plan_enabled,note`，并由系统记录来源：
+
+- `manual`：本地手动维护。
+- `synced`：外部自选置顶同步结果，默认不进入计划。
+- `manual_synced`：外部同步命中本地手动记录，保留本地 `plan_enabled` 和备注。
+
+非持仓自选股票只有 `plan_enabled=true` 时才会进入收盘计划和建议扫描；持仓台账中的股票始终按持仓来源进入计划。
+
 ## 本地开发安装
 
 项目依赖声明在 `pyproject.toml` 中，不使用 `requirements.txt`。推荐使用虚拟环境安装运行依赖和测试依赖：
@@ -64,6 +74,14 @@ qt ledger add --symbol 600000 --name 浦发银行 --quantity 1000 --available-qu
 qt ledger list
 ```
 
+维护自选置顶观察池：
+
+```bash
+qt watchlist add --symbol 600519 --name 示例白酒 --rank 1 --plan-enabled true --note 核心自选
+qt watchlist list
+qt watchlist export
+```
+
 ## 资金账户与账户估值
 
 手动资金账户是现金余额、净本金和可用买入资金的权威来源。模拟银证转入、银证转出和现金校准都需要通过 CLI 记录，后台服务只读取资金账户并生成账户估值快照。
@@ -101,6 +119,23 @@ qt service check
 qt service run
 ```
 
+默认调度使用 `Asia/Shanghai` 时区：账户快照每 180 秒执行一次，收盘计划在周一至周五 15:30 生成下一工作日计划，盘中触发在 09:35-11:30、13:00-13:59 和 14:00-14:55 扫描最新有效计划。当前只跳过周末，不内置 A 股节假日交易日历。
+
+生成计划和建议：
+
+```bash
+qt plan generate --date 2026-07-10
+qt plan latest
+qt recommendations scan
+qt recommendations list
+```
+
+建议 API 和 CLI 只生成可解释的本地建议；未接入实时行情时会输出保守持有或观察建议，并保留风险和失效条件。
+
+## 数据源密钥安全
+
+东方财富和妙想相关 API key、token、cookie、账号信息不得提交到 git。`MX_APIKEY` 只能来自环境变量或未入库本地配置。前端数据源设置页和 `/api/v1/datasource/eastmoney/key` 只维护本地凭据状态，接口响应不返回密钥明文。
+
 ## 本地前端控制台开发
 
 前端控制台使用 Node 24 和 pnpm。推荐通过 nvm 切换 Node 版本：
@@ -125,7 +160,9 @@ nvm use
 qt service run
 ```
 
-前端只维护本地手动台账、资金账户、账户快照和调度状态，不自动真实下单，不控制真实交易客户端，不保存真实券商凭据。
+前端只维护本地手动台账、资金账户、账户快照、自选置顶观察池、建议复盘反馈和调度状态，不自动真实下单，不控制真实交易客户端，不保存真实券商凭据。
+
+人工执行反馈只写入复盘记录和关联通知状态，不修改手动持仓台账、手动资金账户、现金余额或净本金。真实成交后的权威数据仍需要用户手动维护。
 
 调试版后台服务单次快照：
 

@@ -118,7 +118,46 @@
 
 `buy`、`add`、`hold`、`watch` 类型建议必须包含非空 `risk.invalid_if`。最终建议动作必须以风控结果为准；当风控将策略信号降级时，建议中的 `action` 使用降级后的动作，同时保留原始策略原因和风控说明用于复核。
 
-## 5. 日志要求
+建议扫描必须以最新有效收盘计划为入口。持仓股票始终可被扫描；非持仓自选置顶股票只有在计划中的 `plan_enabled=true` 时才可生成 `watch` 类建议。若最新计划不存在、过期或状态不是 `active`，API 和 CLI 不得静默生成建议。
+
+当前建议扫描读取最新计划、手动持仓台账、最新账户快照和计划对应的股票池快照。未接入实时行情时，只能生成保守 `hold` 或 `watch` 建议，并在风险说明中保留行情缺口和人工复核要求。
+
+## 5. HTTP API 契约
+
+建议 API 使用与 CLI 相同的核心逻辑：
+
+```text
+POST /api/v1/recommendations/scan
+GET /api/v1/recommendations
+GET /api/v1/recommendations/{recommendation_id}
+```
+
+`POST /scan` 返回：
+
+```json
+{
+  "count": 0,
+  "recommendations": []
+}
+```
+
+`recommendations` 数组中的每一项必须满足本文定义的建议模型。最新计划不存在时返回 `plan_not_found`；计划不可扫描时返回 `plan_not_scannable`，并在 `details` 中包含 `plan_id`、`status` 和 `valid_until`。列表接口返回最近保存的建议，详情接口按 `recommendation_id` 返回单条建议。
+
+## 6. 通知与反馈状态
+
+通知摘要是建议推送和复盘之间的本地状态记录。通知必须包含建议 ID、股票、动作、置信度、关键价、理由、风险、数据时间、审计 ID 和处理状态。
+
+通知处理状态首版为：
+
+- `unread`：已生成通知，尚未处理。
+- `read`：用户或后续界面已标记读取。
+- `feedback_recorded`：已记录关联建议的人工执行反馈。
+
+人工执行反馈字段为 `recommendation_id`、`executed`、`execution_price`、`execution_quantity`、`note` 和 `created_at`。反馈写入后可以把同一建议关联通知标记为 `feedback_recorded`，但不得修改手动持仓台账、手动资金账户、现金余额、净本金或账户快照。反馈只用于复盘和策略改进，不代表系统确认真实成交。
+
+当前后端已经具备通知和审计日志持久化服务，并提供反馈写入与查询接口；通知创建、审计写入工作流和通知/审计 HTTP 读取路由尚未作为稳定 API 开放。前端在这些读取接口不可用时必须降级展示，不得影响建议、台账或资金维护。
+
+## 7. 日志要求
 
 结构化日志应记录：
 
@@ -131,7 +170,7 @@
 - 推送渠道和推送状态。
 - 用户是否执行以及人工反馈。
 
-## 6. 推送格式
+## 8. 推送格式
 
 本地控制台和消息渠道可以使用更短的展示格式，但不得丢失以下信息：
 
