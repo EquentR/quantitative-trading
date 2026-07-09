@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import PositionLedgerPanel from './PositionLedgerPanel.vue'
 import CashAccountPanel from './CashAccountPanel.vue'
+import WatchPinnedPanel from './WatchPinnedPanel.vue'
+import DataSourcePanel from './DataSourcePanel.vue'
 </script>
 
 <template>
@@ -11,5 +13,7 @@ import CashAccountPanel from './CashAccountPanel.vue'
     </p>
     <PositionLedgerPanel />
     <CashAccountPanel />
+    <WatchPinnedPanel />
+    <DataSourcePanel />
   </div>
 </template>
