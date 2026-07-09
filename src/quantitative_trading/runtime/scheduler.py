@@ -5,6 +5,8 @@ from threading import Lock
 from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.combining import OrTrigger
+from apscheduler.triggers.cron import CronTrigger
 
 
 class SchedulerManager:
@@ -59,6 +61,22 @@ class SchedulerManager:
                 max_instances=1,
                 replace_existing=True,
             )
+            scheduler.add_job(
+                lambda: self._job("close_plan_daily"),
+                trigger="cron",
+                hour=15,
+                minute=30,
+                id="close_plan_daily",
+                max_instances=1,
+                replace_existing=True,
+            )
+            scheduler.add_job(
+                lambda: self._job("intraday_trigger"),
+                trigger=_intraday_trigger(self._timezone),
+                id="recommendation_intraday_trigger",
+                max_instances=1,
+                replace_existing=True,
+            )
             scheduler.start()
             self._scheduler = scheduler
             return True
@@ -73,3 +91,15 @@ class SchedulerManager:
             scheduler.shutdown(wait=False)
             self._scheduler = None
             return True
+
+
+def _intraday_trigger(timezone: str) -> OrTrigger:
+    return OrTrigger(
+        [
+            CronTrigger(hour=9, minute="35-59", timezone=timezone),
+            CronTrigger(hour=10, minute="*", timezone=timezone),
+            CronTrigger(hour=11, minute="0-30", timezone=timezone),
+            CronTrigger(hour=13, minute="*", timezone=timezone),
+            CronTrigger(hour=14, minute="0-55", timezone=timezone),
+        ]
+    )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,9 @@ class SchedulerState:
     last_reason: str | None
     last_error: str | None
     last_snapshot_id: int | None
+    last_task_type: str | None
+    last_plan_id: str | None
+    last_recommendation_ids: list[str]
     updated_at: datetime
 
 
@@ -105,6 +109,9 @@ class SchedulerStateRepository:
         reason: str,
         error: str | None,
         snapshot_id: int | None,
+        task_type: str | None = None,
+        plan_id: str | None = None,
+        recommendation_ids: list[str] | None = None,
         now: datetime,
     ) -> SchedulerState:
         _require_timezone_aware(started_at)
@@ -129,6 +136,9 @@ class SchedulerStateRepository:
                   last_reason = ?,
                   last_error = ?,
                   last_snapshot_id = ?,
+                  last_task_type = ?,
+                  last_plan_id = ?,
+                  last_recommendation_ids = ?,
                   updated_at = ?
                 WHERE id = 1
                 """,
@@ -139,6 +149,9 @@ class SchedulerStateRepository:
                     reason,
                     error,
                     snapshot_id,
+                    task_type,
+                    plan_id,
+                    json.dumps(recommendation_ids or [], ensure_ascii=False),
                     now.isoformat(),
                 ),
             )
@@ -163,6 +176,9 @@ class SchedulerStateRepository:
               last_reason,
               last_error,
               last_snapshot_id,
+              last_task_type,
+              last_plan_id,
+              last_recommendation_ids,
               updated_at
             FROM scheduler_state
             WHERE id = 1
@@ -180,6 +196,11 @@ class SchedulerStateRepository:
             last_reason=row["last_reason"],
             last_error=row["last_error"],
             last_snapshot_id=row["last_snapshot_id"],
+            last_task_type=row["last_task_type"],
+            last_plan_id=row["last_plan_id"],
+            last_recommendation_ids=self._parse_recommendation_ids(
+                row["last_recommendation_ids"]
+            ),
             updated_at=self._parse_datetime(row["updated_at"]),
         )
 
@@ -192,6 +213,15 @@ class SchedulerStateRepository:
     @staticmethod
     def _to_int(value: bool) -> int:
         return int(value)
+
+    @staticmethod
+    def _parse_recommendation_ids(value: str | None) -> list[str]:
+        if not value:
+            return []
+        parsed = json.loads(value)
+        if not isinstance(parsed, list):
+            return []
+        return [str(item) for item in parsed]
 
 
 def _require_timezone_aware(value: datetime) -> None:

@@ -43,6 +43,9 @@ def test_service_status_reports_scheduler_state(tmp_path) -> None:
     assert payload["timezone"] == "Asia/Shanghai"
     assert payload["run_on_start"] is True
     assert payload["last_status"] is None
+    assert payload["last_task_type"] is None
+    assert payload["last_plan_id"] is None
+    assert payload["last_recommendation_ids"] == []
 
 
 def test_setup_required_public_status_returns_only_auth_status(tmp_path) -> None:
@@ -701,9 +704,13 @@ def test_run_once_records_latest_result(tmp_path) -> None:
     assert run_response.status_code == 200
     assert run_response.json()["last_status"] == "success"
     assert run_response.json()["last_reason"] == "manual_api"
+    assert run_response.json()["last_task_type"] == "account_snapshot"
+    assert run_response.json()["last_plan_id"] is None
+    assert run_response.json()["last_recommendation_ids"] == []
     assert status_response.json()["last_status"] == "success"
     assert status_response.json()["last_reason"] == "manual_api"
     assert status_response.json()["last_snapshot_id"] == 1
+    assert status_response.json()["last_task_type"] == "account_snapshot"
 
 
 def test_service_control_endpoints_require_auth_after_setup(tmp_path) -> None:

@@ -89,6 +89,9 @@ def run_once(container: ApiContainer = Depends(get_container)) -> dict[str, obje
                 reason="manual_api",
                 error=error,
                 snapshot_id=snapshot_id,
+                task_type="account_snapshot",
+                plan_id=None,
+                recommendation_ids=[],
                 now=finished_at,
             )
     except (sqlite3.Error, ValidationError) as exc:
@@ -123,6 +126,9 @@ def _status_payload(container: ApiContainer) -> dict[str, object]:
         "last_reason": scheduler_state.last_reason,
         "last_error": scheduler_state.last_error,
         "last_snapshot_id": scheduler_state.last_snapshot_id,
+        "last_task_type": scheduler_state.last_task_type,
+        "last_plan_id": scheduler_state.last_plan_id,
+        "last_recommendation_ids": scheduler_state.last_recommendation_ids,
     }
 
 

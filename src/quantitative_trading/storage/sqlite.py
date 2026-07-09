@@ -202,6 +202,9 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
   last_reason TEXT,
   last_error TEXT,
   last_snapshot_id INTEGER,
+  last_task_type TEXT,
+  last_plan_id TEXT,
+  last_recommendation_ids TEXT,
   updated_at TEXT NOT NULL
 );
 """
@@ -242,4 +245,22 @@ def connect(settings: Settings) -> Iterator[sqlite3.Connection]:
 
 def migrate(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA_SQL)
+    _ensure_scheduler_state_columns(connection)
     connection.commit()
+
+
+def _ensure_scheduler_state_columns(connection: sqlite3.Connection) -> None:
+    existing = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(scheduler_state)").fetchall()
+    }
+    columns = {
+        "last_task_type": "TEXT",
+        "last_plan_id": "TEXT",
+        "last_recommendation_ids": "TEXT",
+    }
+    for name, column_type in columns.items():
+        if name not in existing:
+            connection.execute(
+                f"ALTER TABLE scheduler_state ADD COLUMN {name} {column_type}"
+            )

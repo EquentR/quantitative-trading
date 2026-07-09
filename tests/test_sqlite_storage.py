@@ -270,6 +270,25 @@ def insert_trading_plan(
                 "payload_json",
             ],
         ),
+        (
+            "scheduler_state",
+            [
+                "id",
+                "enabled",
+                "interval_seconds",
+                "run_on_start",
+                "last_started_at",
+                "last_finished_at",
+                "last_status",
+                "last_reason",
+                "last_error",
+                "last_snapshot_id",
+                "last_task_type",
+                "last_plan_id",
+                "last_recommendation_ids",
+                "updated_at",
+            ],
+        ),
     ],
 )
 def test_migrate_creates_expected_table_columns(

@@ -138,6 +138,7 @@ def test_scheduler_manager_start_and_stop_are_idempotent(tmp_path) -> None:
     assert second is False
     assert manager.is_running is False
     assert calls == ["intraday"]
+    assert len(scheduler.jobs) == 3
     assert job_kwargs == {
         "trigger": "interval",
         "seconds": 7,
