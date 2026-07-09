@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
+
+import pytest
 
 from quantitative_trading.config import Settings
 from quantitative_trading.recommendation.scanner import PlanNotScannableError
@@ -54,6 +57,7 @@ def test_scheduler_registers_trading_workflow_jobs() -> None:
         "hour": 15,
         "minute": 30,
         "day_of_week": "mon-fri",
+        "timezone": "Asia/Shanghai",
         "id": "close_plan_daily",
         "max_instances": 1,
         "replace_existing": True,
@@ -80,7 +84,57 @@ def test_scheduler_registers_trading_workflow_jobs() -> None:
     assert calls == ["intraday", "close_plan_daily", "intraday_trigger"]
 
 
-def test_intraday_trigger_records_holding_risk_only_when_no_valid_plan(
+@pytest.mark.parametrize(
+    ("local_now", "expected_trading_day"),
+    [
+        (
+            datetime(2026, 7, 9, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+            date(2026, 7, 10),
+        ),
+        (
+            datetime(2026, 7, 10, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+            date(2026, 7, 13),
+        ),
+    ],
+)
+def test_close_plan_daily_uses_next_weekday_trading_day(
+    tmp_path,
+    monkeypatch,
+    local_now: datetime,
+    expected_trading_day: date,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    @dataclass(frozen=True)
+    class FakeCreatedPlan:
+        plan_id: str
+
+    fixed_utc_now = local_now.astimezone(UTC)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_utc_now.replace(tzinfo=None)
+            return fixed_utc_now.astimezone(tz)
+
+    generated_for: list[date] = []
+    settings = Settings(database_path=tmp_path / "service.db", enable_market_fetch=False)
+
+    def fake_generate(connection, *, trading_day, now, timezone):
+        generated_for.append(trading_day)
+        return FakeCreatedPlan(plan_id=f"plan-{trading_day:%Y%m%d}")
+
+    monkeypatch.setattr(service_app, "datetime", FixedDatetime)
+    monkeypatch.setattr(service_app, "generate_trading_plan", fake_generate)
+
+    result = service_app._run_close_plan_job(settings)
+
+    assert generated_for == [expected_trading_day]
+    assert result.plan_id == f"plan-{expected_trading_day:%Y%m%d}"
+
+
+def test_intraday_trigger_records_no_recommendations_when_no_valid_plan(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -122,12 +176,12 @@ def test_intraday_trigger_records_holding_risk_only_when_no_valid_plan(
 
     assert state.last_status == "success"
     assert state.last_task_type == "recommendation_intraday_trigger"
-    assert state.last_reason == "holding_risk_only_no_valid_plan"
+    assert state.last_reason == "no_recommendations_no_valid_plan"
     assert state.last_plan_id is None
     assert state.last_recommendation_ids == []
 
 
-def test_intraday_trigger_records_holding_risk_only_when_plan_not_scannable(
+def test_intraday_trigger_records_no_recommendations_when_plan_not_scannable(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -175,9 +229,74 @@ def test_intraday_trigger_records_holding_risk_only_when_plan_not_scannable(
 
     assert state.last_status == "success"
     assert state.last_task_type == "recommendation_intraday_trigger"
-    assert state.last_reason == "holding_risk_only_plan_not_scannable"
+    assert state.last_reason == "no_recommendations_plan_not_scannable"
     assert state.last_plan_id == "plan-20260709"
     assert state.last_recommendation_ids == []
+
+
+def test_intraday_trigger_records_generated_recommendation_ids(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    @dataclass(frozen=True)
+    class FakePlan:
+        plan_id: str
+
+    @dataclass(frozen=True)
+    class FakeRecommendation:
+        recommendation_id: str
+
+    @dataclass(frozen=True)
+    class FakeScan:
+        plan: FakePlan
+        recommendations: list[FakeRecommendation]
+
+    settings = Settings(database_path=tmp_path / "service.db", enable_market_fetch=False)
+    captured_jobs = []
+
+    class FakeSchedulerManager:
+        def __init__(self, *, interval_seconds, timezone, job) -> None:
+            captured_jobs.append(job)
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    def fake_scan(connection, *, now):
+        return FakeScan(
+            plan=FakePlan(plan_id="plan-20260709"),
+            recommendations=[
+                FakeRecommendation(recommendation_id="rec-plan-20260709-600000")
+            ],
+        )
+
+    monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
+    monkeypatch.setattr(service_app, "scan_latest_plan_recommendations", fake_scan)
+    monkeypatch.setattr(service_app.uvicorn, "run", lambda app, *, host, port: None)
+
+    service_app.run_api_service(settings)
+    captured_jobs[0]("intraday_trigger")
+
+    with connect(settings) as connection:
+        state = SchedulerStateRepository(connection).get_or_create(
+            interval_seconds=settings.intraday_interval_seconds,
+            run_on_start=settings.service_run_on_start_when_scheduler_enabled,
+            now=datetime.now(UTC),
+        )
+
+    assert state.last_status == "success"
+    assert state.last_task_type == "recommendation_intraday_trigger"
+    assert state.last_reason == "recommendations_generated"
+    assert state.last_plan_id == "plan-20260709"
+    assert state.last_recommendation_ids == ["rec-plan-20260709-600000"]
 
 
 def test_close_plan_daily_records_generated_plan(tmp_path, monkeypatch) -> None:
@@ -228,3 +347,36 @@ def test_close_plan_daily_records_generated_plan(tmp_path, monkeypatch) -> None:
     assert state.last_task_type == "close_plan_daily"
     assert state.last_reason == "close_plan_generated"
     assert state.last_plan_id == f"plan-{generated_for[0]:%Y%m%d}"
+
+
+def test_close_plan_daily_rerun_is_idempotent_for_same_plan_id(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    local_now = datetime(2026, 7, 9, 15, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    fixed_utc_now = local_now.astimezone(UTC)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_utc_now.replace(tzinfo=None)
+            return fixed_utc_now.astimezone(tz)
+
+    settings = Settings(database_path=tmp_path / "service.db", enable_market_fetch=False)
+    monkeypatch.setattr(service_app, "datetime", FixedDatetime)
+
+    first = service_app._run_close_plan_job(settings)
+    second = service_app._run_close_plan_job(settings)
+
+    with connect(settings) as connection:
+        plan_rows = connection.execute(
+            "SELECT plan_id FROM trading_plans ORDER BY plan_id"
+        ).fetchall()
+
+    assert first.status == "success"
+    assert second.status == "success"
+    assert first.plan_id == second.plan_id == "plan-20260710"
+    assert [row["plan_id"] for row in plan_rows] == ["plan-20260710"]

@@ -4,7 +4,9 @@ from tests.test_api_positions import authenticated_client, position_payload
 from tests.test_api_watchlist import watchlist_payload
 
 
-def test_scan_recommendations_persists_list_and_detail(tmp_path) -> None:
+def test_scan_recommendations_persists_list_and_detail(tmp_path, monkeypatch) -> None:
+    import quantitative_trading.api.routes.recommendations as recommendation_routes
+
     client, headers = authenticated_client(tmp_path)
     client.post("/api/v1/positions", json=position_payload("600000"), headers=headers)
     client.post(
@@ -16,6 +18,11 @@ def test_scan_recommendations_persists_list_and_detail(tmp_path) -> None:
         "/api/v1/plans",
         json={"trading_day": "2026-07-09"},
         headers=headers,
+    )
+    monkeypatch.setattr(
+        recommendation_routes,
+        "_current_time",
+        lambda: datetime(2026, 7, 9, 6, 0, tzinfo=UTC),
     )
 
     scan_response = client.post("/api/v1/recommendations/scan", headers=headers)

@@ -120,6 +120,42 @@ def test_scheduler_state_ignores_malformed_recommendation_ids_json(tmp_path) -> 
     assert state.last_recommendation_ids == []
 
 
+def test_scheduler_state_ignores_non_list_recommendation_ids_json(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "scheduler.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = SchedulerStateRepository(connection)
+        repository.record_result(
+            started_at=NOW,
+            finished_at=NOW,
+            status="success",
+            reason="intraday_trigger",
+            error=None,
+            snapshot_id=None,
+            task_type="recommendation_intraday_trigger",
+            plan_id="plan-20260709",
+            recommendation_ids=["rec-1"],
+            now=NOW,
+        )
+        connection.execute(
+            """
+            UPDATE scheduler_state
+            SET last_recommendation_ids = ?
+            WHERE id = 1
+            """,
+            ('{"id": "rec-1"}',),
+        )
+        connection.commit()
+
+        state = repository.get_or_create(
+            interval_seconds=180,
+            run_on_start=True,
+            now=NOW,
+        )
+
+    assert state.last_recommendation_ids == []
+
+
 def test_scheduler_state_rejects_naive_update_time(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "scheduler.db")
     with connect(settings) as connection:

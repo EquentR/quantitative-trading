@@ -718,7 +718,7 @@ def test_plan_generate_and_latest_commands(tmp_path) -> None:
     assert "trading_day=2026-07-09" in latest_result.output
 
 
-def test_recommendation_scan_list_and_show_commands(tmp_path) -> None:
+def test_recommendation_scan_list_and_show_commands(tmp_path, monkeypatch) -> None:
     run_cli(
         tmp_path,
         "ledger",
@@ -737,6 +737,16 @@ def test_recommendation_scan_list_and_show_commands(tmp_path) -> None:
         "2026-07-06",
     )
     run_cli(tmp_path, "plan", "generate", "--date", "2026-07-09")
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            fixed = datetime(2026, 7, 9, 6, 0, tzinfo=UTC)
+            if tz is None:
+                return fixed.replace(tzinfo=None)
+            return fixed.astimezone(tz)
+
+    monkeypatch.setattr(cli, "datetime", FixedDatetime)
 
     scan_result = run_cli(tmp_path, "recommendations", "scan")
     list_result = run_cli(tmp_path, "recommendations", "list")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import logging
 from zoneinfo import ZoneInfo
 
@@ -97,7 +97,7 @@ def _run_scheduler_task(settings: Settings, reason: str) -> SchedulerJobResult:
 def _run_close_plan_job(settings: Settings) -> SchedulerJobResult:
     now = datetime.now(UTC)
     local_now = now.astimezone(ZoneInfo(settings.timezone))
-    trading_day = local_now.date() + timedelta(days=1)
+    trading_day = _next_weekday(local_now.date())
     with connect(settings) as connection:
         migrate(connection)
         created = generate_trading_plan(
@@ -114,6 +114,13 @@ def _run_close_plan_job(settings: Settings) -> SchedulerJobResult:
     )
 
 
+def _next_weekday(current_day: date) -> date:
+    trading_day = current_day + timedelta(days=1)
+    while trading_day.weekday() >= 5:
+        trading_day += timedelta(days=1)
+    return trading_day
+
+
 def _run_intraday_trigger_job(settings: Settings) -> SchedulerJobResult:
     now = datetime.now(UTC)
     try:
@@ -123,7 +130,7 @@ def _run_intraday_trigger_job(settings: Settings) -> SchedulerJobResult:
     except PlanNotScannableError as exc:
         return SchedulerJobResult(
             task_type="recommendation_intraday_trigger",
-            reason="holding_risk_only_plan_not_scannable",
+            reason="no_recommendations_plan_not_scannable",
             plan_id=exc.plan_id,
             recommendation_ids=[],
         )
@@ -131,7 +138,7 @@ def _run_intraday_trigger_job(settings: Settings) -> SchedulerJobResult:
     if scan is None:
         return SchedulerJobResult(
             task_type="recommendation_intraday_trigger",
-            reason="holding_risk_only_no_valid_plan",
+            reason="no_recommendations_no_valid_plan",
             recommendation_ids=[],
         )
 

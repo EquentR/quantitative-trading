@@ -67,6 +67,7 @@ class SchedulerManager:
                 day_of_week="mon-fri",
                 hour=15,
                 minute=30,
+                timezone=self._timezone,
                 id="close_plan_daily",
                 max_instances=1,
                 replace_existing=True,
