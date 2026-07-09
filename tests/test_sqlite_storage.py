@@ -234,6 +234,29 @@ def insert_trading_plan(
                 "payload_json",
             ],
         ),
+        (
+            "audit_logs",
+            [
+                "audit_id",
+                "event_type",
+                "recommendation_id",
+                "created_at",
+                "payload_json",
+            ],
+        ),
+        (
+            "notifications",
+            [
+                "notification_id",
+                "recommendation_id",
+                "symbol",
+                "action",
+                "status",
+                "data_time",
+                "created_at",
+                "payload_json",
+            ],
+        ),
     ],
 )
 def test_migrate_creates_expected_table_columns(
