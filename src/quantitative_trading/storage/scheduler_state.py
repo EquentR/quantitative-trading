@@ -218,7 +218,10 @@ class SchedulerStateRepository:
     def _parse_recommendation_ids(value: str | None) -> list[str]:
         if not value:
             return []
-        parsed = json.loads(value)
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
         if not isinstance(parsed, list):
             return []
         return [str(item) for item in parsed]

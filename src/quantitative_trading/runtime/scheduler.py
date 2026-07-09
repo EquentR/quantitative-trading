@@ -64,6 +64,7 @@ class SchedulerManager:
             scheduler.add_job(
                 lambda: self._job("close_plan_daily"),
                 trigger="cron",
+                day_of_week="mon-fri",
                 hour=15,
                 minute=30,
                 id="close_plan_daily",
@@ -96,10 +97,35 @@ class SchedulerManager:
 def _intraday_trigger(timezone: str) -> OrTrigger:
     return OrTrigger(
         [
-            CronTrigger(hour=9, minute="35-59", timezone=timezone),
-            CronTrigger(hour=10, minute="*", timezone=timezone),
-            CronTrigger(hour=11, minute="0-30", timezone=timezone),
-            CronTrigger(hour=13, minute="*", timezone=timezone),
-            CronTrigger(hour=14, minute="0-55", timezone=timezone),
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=9,
+                minute="35-59",
+                timezone=timezone,
+            ),
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=10,
+                minute="*",
+                timezone=timezone,
+            ),
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=11,
+                minute="0-30",
+                timezone=timezone,
+            ),
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=13,
+                minute="*",
+                timezone=timezone,
+            ),
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=14,
+                minute="0-55",
+                timezone=timezone,
+            ),
         ]
     )

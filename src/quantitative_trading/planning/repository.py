@@ -28,6 +28,12 @@ class TradingPlanRepository:
               ?,
               ?
             )
+            ON CONFLICT(plan_id) DO UPDATE SET
+              trading_day = excluded.trading_day,
+              generated_at = excluded.generated_at,
+              valid_until = excluded.valid_until,
+              status = excluded.status,
+              payload_json = excluded.payload_json
             """,
             (
                 plan.plan_id,

@@ -62,6 +62,37 @@ def test_save_and_get_round_trip_plan(repository: TradingPlanRepository) -> None
     assert restored == plan
 
 
+def test_save_upserts_existing_plan_id_with_latest_payload(
+    repository: TradingPlanRepository,
+) -> None:
+    original = trading_plan(status=TradingPlanStatus.ACTIVE)
+    latest = original.model_copy(
+        update={
+            "generated_at": LATER,
+            "status": TradingPlanStatus.STALE,
+            "warnings": ["regenerated after close"],
+        }
+    )
+
+    repository.save(original)
+    repository.save(latest)
+
+    restored = repository.get(original.plan_id)
+    row = repository.connection.execute(
+        """
+        SELECT generated_at, status, payload_json
+        FROM trading_plans
+        WHERE plan_id = ?
+        """,
+        (original.plan_id,),
+    ).fetchone()
+
+    assert restored == latest
+    assert row["generated_at"] == LATER.isoformat()
+    assert row["status"] == "stale"
+    assert TradingPlan.model_validate_json(row["payload_json"]) == latest
+
+
 def test_latest_returns_none_when_table_is_empty(repository: TradingPlanRepository) -> None:
     assert repository.latest() is None
 

@@ -53,6 +53,7 @@ def test_scheduler_registers_trading_workflow_jobs() -> None:
         "trigger": "cron",
         "hour": 15,
         "minute": 30,
+        "day_of_week": "mon-fri",
         "id": "close_plan_daily",
         "max_instances": 1,
         "replace_existing": True,
@@ -63,6 +64,10 @@ def test_scheduler_registers_trading_workflow_jobs() -> None:
         str(trigger.timezone)
         for trigger in intraday_trigger.triggers
     } == {"Asia/Shanghai"}
+    assert {
+        str(trigger.fields[4])
+        for trigger in intraday_trigger.triggers
+    } == {"mon-fri"}
     trigger_text = str(intraday_trigger)
     assert "35-59" in trigger_text
     assert "0-30" in trigger_text
