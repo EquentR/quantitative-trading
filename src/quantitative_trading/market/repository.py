@@ -62,6 +62,18 @@ class MarketInputSnapshotRepository:
         self.connection = connection
 
     def save(self, snapshot: MarketInputSnapshot, *, commit: bool = True) -> int:
+        for symbol, quote_id in snapshot.quote_snapshot_refs.items():
+            reference = self.connection.execute(
+                """
+                SELECT 1
+                FROM quote_snapshots
+                WHERE id = ? AND symbol = ?
+                """,
+                (quote_id, symbol),
+            ).fetchone()
+            if reference is None:
+                raise ValueError("invalid quote snapshot reference")
+
         cursor = self.connection.execute(
             """
             INSERT INTO market_input_snapshots (
