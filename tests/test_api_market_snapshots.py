@@ -243,6 +243,44 @@ def test_market_snapshot_detail_rejects_non_positive_ids_before_lookup(
     assert RecordingMarketSnapshotRepository.calls == []
 
 
+def test_market_snapshot_detail_rejects_ids_above_sqlite_integer_max_before_lookup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    lookup_calls: list[int] = []
+    repository_get = market_routes.MarketInputSnapshotRepository.get
+
+    def recording_get(repository, snapshot_id):
+        lookup_calls.append(snapshot_id)
+        return repository_get(repository, snapshot_id)
+
+    monkeypatch.setattr(
+        market_routes.MarketInputSnapshotRepository,
+        "get",
+        recording_get,
+    )
+    client, headers = authenticated_client(
+        tmp_path,
+        monkeypatch,
+        provider=RecordingMarketProvider(),
+        raise_server_exceptions=False,
+    )
+
+    response = client.get(
+        f"/api/v1/market/snapshots/{2**100}",
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert response.json()["error"]["message"] == "request validation failed"
+    assert response.json()["error"]["details"]["errors"][0]["loc"] == [
+        "path",
+        "snapshot_id",
+    ]
+    assert lookup_calls == []
+
+
 def test_unsupported_provider_matches_account_snapshot_validation_error(
     tmp_path,
     monkeypatch,

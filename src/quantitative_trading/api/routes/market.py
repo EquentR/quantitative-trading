@@ -31,7 +31,11 @@ router = APIRouter(
     dependencies=[Depends(require_auth)],
 )
 
-MarketSnapshotIdPath = Annotated[int, ApiPath(gt=0)]
+SQLITE_SIGNED_64_BIT_INTEGER_MAX = 9_223_372_036_854_775_807
+MarketSnapshotIdPath = Annotated[
+    int,
+    ApiPath(gt=0, le=SQLITE_SIGNED_64_BIT_INTEGER_MAX),
+]
 
 
 class CreatedMarketSnapshotResponse(BaseModel):
