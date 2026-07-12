@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+StrictPositiveId = Annotated[int, Field(strict=True, gt=0)]
 
 
 class QuoteStatus(StrEnum):
@@ -68,11 +72,11 @@ class QuoteSnapshot(BaseModel):
 class MarketInputSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    universe_snapshot_id: int = Field(gt=0)
-    quote_snapshot_refs: dict[str, int]
-    history_snapshot_refs: dict[str, int]
-    money_flow_snapshot_refs: dict[str, int]
-    intraday_strength_snapshot_refs: dict[str, int]
+    universe_snapshot_id: StrictPositiveId
+    quote_snapshot_refs: dict[str, StrictPositiveId]
+    history_snapshot_refs: dict[str, StrictPositiveId]
+    money_flow_snapshot_refs: dict[str, StrictPositiveId]
+    intraday_strength_snapshot_refs: dict[str, StrictPositiveId]
     data_time: datetime | None = None
     fetched_at: datetime
     warnings: list[str]
@@ -89,9 +93,12 @@ class MarketInputSnapshot(BaseModel):
         "intraday_strength_snapshot_refs",
     )
     @classmethod
-    def references_must_be_valid(cls, value: dict[str, int]) -> dict[str, int]:
-        if any(len(symbol) != 6 or not symbol.isdigit() for symbol in value):
-            raise ValueError("snapshot reference symbols must contain six digits")
-        if any(reference_id <= 0 for reference_id in value.values()):
-            raise ValueError("snapshot reference ids must be positive")
+    def references_must_be_valid(
+        cls, value: dict[str, StrictPositiveId]
+    ) -> dict[str, StrictPositiveId]:
+        if any(
+            len(symbol) != 6 or not symbol.isascii() or not symbol.isdigit()
+            for symbol in value
+        ):
+            raise ValueError("snapshot reference symbols must contain six ASCII digits")
         return value

@@ -139,6 +139,42 @@ def insert_account_snapshot(
     )
 
 
+def insert_quote_snapshot(
+    connection: sqlite3.Connection,
+    **overrides: object,
+) -> None:
+    data = {
+        "symbol": "600000",
+        "status": "ok",
+        "data_time": "2026-07-12T14:30:00+08:00",
+        "fetched_at": "2026-07-12T14:30:03+08:00",
+        "source": "akshare",
+        "payload_json": "{}",
+    }
+    data.update(overrides)
+
+    connection.execute(
+        """
+        INSERT INTO quote_snapshots (
+          symbol,
+          status,
+          data_time,
+          fetched_at,
+          source,
+          payload_json
+        ) VALUES (
+          :symbol,
+          :status,
+          :data_time,
+          :fetched_at,
+          :source,
+          :payload_json
+        )
+        """,
+        data,
+    )
+
+
 def insert_trading_plan(
     connection: sqlite3.Connection,
     omitted: set[str] | None = None,
@@ -348,18 +384,64 @@ def test_migrate_twice_creates_quote_snapshots_table(tmp_path) -> None:
     assert row is not None
 
 
+def test_migrate_creates_quote_snapshots_required_columns(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        columns = connection.execute("PRAGMA table_info(quote_snapshots)").fetchall()
+
+    assert [
+        (column["name"], column["type"], column["notnull"], column["pk"])
+        for column in columns
+    ] == [
+        ("id", "INTEGER", 0, 1),
+        ("symbol", "TEXT", 1, 0),
+        ("status", "TEXT", 1, 0),
+        ("data_time", "TEXT", 0, 0),
+        ("fetched_at", "TEXT", 1, 0),
+        ("source", "TEXT", 1, 0),
+        ("payload_json", "TEXT", 1, 0),
+    ]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"status": "unknown"},
+        {"symbol": "60000"},
+        {"symbol": "６０００００"},
+        {"symbol": "٦٠٠٠٠٠"},
+    ],
+)
+def test_quote_snapshots_reject_invalid_status_and_symbols(
+    tmp_path,
+    overrides: dict[str, object],
+) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            insert_quote_snapshot(connection, **overrides)
+
+
 def test_migrate_twice_creates_quote_snapshots_symbol_id_index(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "app.db")
 
     with connect(settings) as connection:
         migrate(connection)
         migrate(connection)
-        row = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'index' "
-            "AND name = 'idx_quote_snapshots_symbol_id'"
-        ).fetchone()
+        columns = connection.execute(
+            "PRAGMA index_xinfo(idx_quote_snapshots_symbol_id)"
+        ).fetchall()
 
-    assert row is not None
+    assert [
+        (column["name"], column["desc"])
+        for column in columns
+        if column["key"] == 1
+    ] == [("symbol", 0), ("id", 1)]
 
 
 def test_migrate_creates_market_input_snapshots_table(tmp_path) -> None:

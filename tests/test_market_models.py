@@ -91,12 +91,54 @@ def test_market_input_snapshot_rejects_invalid_reference_symbols(field: str) -> 
         "intraday_strength_snapshot_refs",
     ],
 )
+@pytest.mark.parametrize("symbol", ["６０００００", "٦٠٠٠٠٠"])
+def test_market_input_snapshot_rejects_unicode_digit_reference_symbols(
+    field: str,
+    symbol: str,
+) -> None:
+    payload = valid_market_input_snapshot_payload(**{field: {symbol: 10}})
+
+    with pytest.raises(ValidationError):
+        MarketInputSnapshot.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "quote_snapshot_refs",
+        "history_snapshot_refs",
+        "money_flow_snapshot_refs",
+        "intraday_strength_snapshot_refs",
+    ],
+)
 @pytest.mark.parametrize("reference_id", [0, -1])
 def test_market_input_snapshot_rejects_nonpositive_reference_ids(
     field: str,
     reference_id: int,
 ) -> None:
     payload = valid_market_input_snapshot_payload(**{field: {"600000": reference_id}})
+
+    with pytest.raises(ValidationError):
+        MarketInputSnapshot.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "universe_snapshot_id",
+        "quote_snapshot_refs",
+        "history_snapshot_refs",
+        "money_flow_snapshot_refs",
+        "intraday_strength_snapshot_refs",
+    ],
+)
+@pytest.mark.parametrize("snapshot_id", [True, "1", 1.0])
+def test_market_input_snapshot_rejects_coercible_snapshot_ids(
+    field: str,
+    snapshot_id: object,
+) -> None:
+    value = snapshot_id if field == "universe_snapshot_id" else {"600000": snapshot_id}
+    payload = valid_market_input_snapshot_payload(**{field: value})
 
     with pytest.raises(ValidationError):
         MarketInputSnapshot.model_validate(payload)
