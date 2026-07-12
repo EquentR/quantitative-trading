@@ -8,10 +8,7 @@ from quantitative_trading.config import Settings
 from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
-from quantitative_trading.market.repository import (
-    MarketInputSnapshotRepository,
-    QuoteSnapshotRepository,
-)
+from quantitative_trading.market.repository import QuoteSnapshotRepository
 from quantitative_trading.market.snapshot_service import MarketSnapshotService
 from quantitative_trading.storage.sqlite import connect, migrate
 from quantitative_trading.universe.repository import UniverseSnapshotRepository
@@ -107,12 +104,11 @@ def test_capture_fetches_stable_sorted_decision_enabled_quotes_and_persists_refe
         now=FETCHED_AT,
     ).capture()
 
-    aggregate = MarketInputSnapshotRepository(connection).get(created.market_input_snapshot_id)
-
     assert provider.calls == [["000001", "600000"]]
-    assert aggregate is not None
-    assert set(aggregate.quote_snapshot_refs) == {"000001", "600000"}
-    assert aggregate.data_time == OLDER_DATA_TIME
+    assert created.snapshot_id > 0
+    assert created.snapshot.universe_snapshot_id > 0
+    assert set(created.snapshot.quote_snapshot_refs) == {"000001", "600000"}
+    assert created.snapshot.data_time == OLDER_DATA_TIME
     assert created.quotes["600000"].status is QuoteStatus.OK
 
 
@@ -123,11 +119,8 @@ def test_capture_persists_failed_quote_when_provider_omits_requested_symbol(
     provider = RecordingMarketDataProvider({"000001": ok_quote("000001")})
 
     created = MarketSnapshotService(connection, provider, now=FETCHED_AT).capture()
-    aggregate = MarketInputSnapshotRepository(connection).get(created.market_input_snapshot_id)
-
-    assert aggregate is not None
     failed_quote = QuoteSnapshotRepository(connection).get(
-        aggregate.quote_snapshot_refs["600000"]
+        created.snapshot.quote_snapshot_refs["600000"]
     )
     assert failed_quote is not None
     assert failed_quote.status is QuoteStatus.FAILED
@@ -148,12 +141,9 @@ def test_capture_ignores_extra_provider_symbol_and_records_collection_warning(
     )
 
     created = MarketSnapshotService(connection, provider, now=FETCHED_AT).capture()
-    aggregate = MarketInputSnapshotRepository(connection).get(created.market_input_snapshot_id)
-
-    assert aggregate is not None
     assert set(created.quotes) == {"000001", "600000"}
-    assert set(aggregate.quote_snapshot_refs) == {"000001", "600000"}
-    assert any("000002" in warning for warning in aggregate.warnings)
+    assert set(created.snapshot.quote_snapshot_refs) == {"000001", "600000"}
+    assert any("000002" in warning for warning in created.snapshot.warnings)
 
 
 def test_capture_sanitizes_provider_exception_before_persistence(
@@ -167,15 +157,12 @@ def test_capture_sanitizes_provider_exception_before_persistence(
             raise RuntimeError(secret_text)
 
     created = MarketSnapshotService(connection, FailingProvider(), now=FETCHED_AT).capture()
-    aggregate = MarketInputSnapshotRepository(connection).get(created.market_input_snapshot_id)
-
-    assert aggregate is not None
     persisted_quotes = [
         QuoteSnapshotRepository(connection).get(snapshot_id)
-        for snapshot_id in aggregate.quote_snapshot_refs.values()
+        for snapshot_id in created.snapshot.quote_snapshot_refs.values()
     ]
     persisted_text = " ".join(
-        [*aggregate.warnings, *(quote.warning for quote in persisted_quotes if quote)]
+        [*created.snapshot.warnings, *(quote.warning for quote in persisted_quotes if quote)]
     )
     assert "supersecret" not in persisted_text
     assert "Bearer abc" not in persisted_text
@@ -188,15 +175,15 @@ def test_capture_empty_decision_enabled_set_skips_provider_and_persists_snapshot
     provider = RecordingMarketDataProvider({})
 
     created = MarketSnapshotService(connection, provider, now=FETCHED_AT).capture()
-    universe = UniverseSnapshotRepository(connection).get(created.universe_snapshot_id)
-    aggregate = MarketInputSnapshotRepository(connection).get(created.market_input_snapshot_id)
+    universe = UniverseSnapshotRepository(connection).get(
+        created.snapshot.universe_snapshot_id
+    )
 
     assert provider.calls == []
     assert universe is not None
     assert universe.members == []
-    assert aggregate is not None
-    assert aggregate.quote_snapshot_refs == {}
-    assert "无决策启用标的，未调用行情数据源" in aggregate.warnings
+    assert created.snapshot.quote_snapshot_refs == {}
+    assert "无决策启用标的，未调用行情数据源" in created.snapshot.warnings
 
 
 def test_capture_requests_symbol_once_when_holding_and_enabled_watch_overlap(
@@ -235,16 +222,16 @@ def test_capture_replaces_mismatched_provider_quote_with_requested_symbol_failur
     )
 
     created = MarketSnapshotService(connection, provider, now=FETCHED_AT).capture()
-    aggregate = MarketInputSnapshotRepository(connection).get(created.market_input_snapshot_id)
-
-    assert aggregate is not None
     mismatch = QuoteSnapshotRepository(connection).get(
-        aggregate.quote_snapshot_refs["000001"]
+        created.snapshot.quote_snapshot_refs["000001"]
     )
     assert mismatch is not None
     assert mismatch.symbol == "000001"
     assert mismatch.status is QuoteStatus.FAILED
-    assert any("000001" in warning and "mismatch" in warning for warning in aggregate.warnings)
+    assert any(
+        "000001" in warning and "mismatch" in warning
+        for warning in created.snapshot.warnings
+    )
 
 
 def test_capture_sanitizes_provider_quote_warnings_before_persistence(
@@ -262,12 +249,11 @@ def test_capture_sanitizes_provider_quote_warnings_before_persistence(
     )
 
     created = MarketSnapshotService(connection, provider, now=FETCHED_AT).capture()
-    aggregate = MarketInputSnapshotRepository(connection).get(created.market_input_snapshot_id)
-
-    assert aggregate is not None
-    quote = QuoteSnapshotRepository(connection).get(aggregate.quote_snapshot_refs["000001"])
+    quote = QuoteSnapshotRepository(connection).get(
+        created.snapshot.quote_snapshot_refs["000001"]
+    )
     assert quote is not None
-    persisted_text = " ".join([quote.warning, *aggregate.warnings])
+    persisted_text = " ".join([quote.warning, *created.snapshot.warnings])
     assert "supersecret" not in persisted_text
     assert "Bearer abc" not in persisted_text
     assert "/tmp/private.db" not in persisted_text

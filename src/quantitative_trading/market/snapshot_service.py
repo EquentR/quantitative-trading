@@ -30,8 +30,8 @@ _BARE_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
 
 @dataclass(frozen=True)
 class CreatedMarketInputSnapshot:
-    universe_snapshot_id: int
-    market_input_snapshot_id: int
+    snapshot_id: int
+    snapshot: MarketInputSnapshot
     quotes: dict[str, QuoteSnapshot]
 
 
@@ -109,8 +109,8 @@ class MarketSnapshotService:
             raise
 
         return CreatedMarketInputSnapshot(
-            universe_snapshot_id=universe_snapshot_id,
-            market_input_snapshot_id=market_input_snapshot_id,
+            snapshot_id=market_input_snapshot_id,
+            snapshot=market_snapshot,
             quotes=quotes,
         )
 
