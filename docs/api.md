@@ -2,7 +2,7 @@
 
 ## 安全边界
 
-HTTP API 是后台服务接口，只维护手动持仓台账、手动资金账户、本地账户快照和本地调度状态。它不自动真实下单，不模拟点击或控制真实交易客户端，不读取、保存或提交真实券商账号、密码、cookie、token 或 API key。
+HTTP API 是后台服务接口，只维护本地台账、观察池、快照、计划、建议反馈和调度状态。它不自动真实下单，不模拟点击或控制真实交易客户端，不读取、保存或提交真实券商账号、密码、cookie、token 或 API key。
 
 API 写入的持仓和资金数据等价于用户手动维护本地台账。所有真实交易仍必须由用户在交易软件中人工确认，API 输出和快照不得被描述为保证收益或确定性交易结果。
 
@@ -111,6 +111,22 @@ GET /api/v1/universe/snapshots/latest
 
 股票池由手动持仓台账和自选置顶观察池构建。持仓来源优先，`plan_enabled_source=holding`；非持仓自选来源保留自选排序和 `plan_enabled_source=watch_pinned`。
 
+## 市场快照接口
+
+```text
+POST /api/v1/market/snapshots
+GET /api/v1/market/snapshots/latest
+GET /api/v1/market/snapshots/{snapshot_id}
+```
+
+三个接口都是业务接口，必须携带 `Authorization: Bearer <access_token>`；缺失、格式错误或无效 token 返回 `unauthorized`。`POST` 通过共享 `MarketSnapshotService` 和当前市场 provider 配置执行一次采集，成功时返回 `201`，响应只包含 `snapshot_id` 和聚合 `snapshot`。两个 `GET` 只读取已经保存的聚合快照，不重新请求行情。
+
+采集范围仅包含手动持仓和 `plan_enabled=true` 的非持仓自选标的。关闭计划的非持仓自选被排除，同时属于持仓和自选的股票只采集一次。provider 稀疏返回或整体失败时，请求仍成功保存可追溯的逐标的失败记录和告警；provider 返回的额外标的会被忽略并告警。
+
+最新快照或指定 ID 不存在时返回 `404` 和稳定错误码 `market_snapshot_not_found`；按 ID 查询的 `details` 包含 `snapshot_id`。不支持的市场 provider 沿用 `422 validation_error`，存储或读取失败沿用经过清理的 `500 internal_error`，均不得暴露数据库内容、第三方原始响应或凭据。
+
+市场快照只保存本地可追溯输入，不下单、不控制真实交易客户端，也不读取或修改真实券商凭据或账户。本期快照尚未被计划、策略、建议、通知或调度流程消费。
+
 ## 数据源密钥接口
 
 ```text
@@ -194,6 +210,6 @@ POST /api/v1/service/run-once
 
 `qt service run` 启动统一后台服务，组合 HTTP API 和调度器。`qt service debug-run --once` 仍是本地调试快照辅助入口，用于手动执行一次快照检查。
 
-`qt watchlist add/update/remove/list/import/export/sync` 使用与自选置顶 API 相同的本地观察池逻辑。`qt plan generate --date YYYY-MM-DD` 和 `qt plan latest` 使用与计划 API 相同的生成和读取逻辑。`qt recommendations scan`、`qt recommendations list` 和 `qt recommendations show <recommendation_id>` 使用与建议 API 相同的扫描和读取逻辑。
+`qt watchlist add/update/remove/list/import/export/sync` 使用与自选置顶 API 相同的本地观察池逻辑。`qt market snapshot` 与市场快照 `POST` 接口共享 `MarketSnapshotService` 和市场 provider 配置，只输出内部快照摘要，不输出第三方原始响应。`qt plan generate --date YYYY-MM-DD` 和 `qt plan latest` 使用与计划 API 相同的生成和读取逻辑。`qt recommendations scan`、`qt recommendations list` 和 `qt recommendations show <recommendation_id>` 使用与建议 API 相同的扫描和读取逻辑。
 
 HTTP API、CLI 和后台调度器共享相同的 service、repository、adapter、风控和审计日志逻辑，不为不同入口维护独立口径。

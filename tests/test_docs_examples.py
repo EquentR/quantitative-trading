@@ -79,3 +79,47 @@ def test_project_docs_mention_http_api_without_frontend_scope() -> None:
 
     assert "HTTP API" in text
     assert "不实现前端" in text or "不涉及前端" in text
+
+
+def test_readme_documents_manual_market_snapshot_capture_boundaries() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert "qt market snapshot" in readme
+    assert "手动持仓" in readme
+    assert "plan_enabled=true" in readme
+    assert "不会下单" in readme
+    assert "尚未接入计划、策略、建议、通知或调度" in readme
+
+
+def test_api_docs_document_authenticated_market_snapshot_contract() -> None:
+    api_docs = Path("docs/api.md").read_text(encoding="utf-8")
+
+    assert "POST /api/v1/market/snapshots" in api_docs
+    assert "GET /api/v1/market/snapshots/latest" in api_docs
+    assert "GET /api/v1/market/snapshots/{snapshot_id}" in api_docs
+    assert "snapshot_id" in api_docs
+    assert "market_snapshot_not_found" in api_docs
+    assert "MarketSnapshotService" in api_docs
+    assert "第三方原始响应" in api_docs
+
+
+def test_data_source_docs_define_traceable_market_snapshot_semantics() -> None:
+    data_sources = Path("docs/data-sources.md").read_text(encoding="utf-8")
+
+    for expected in (
+        "quote_snapshot_refs",
+        "history_snapshot_refs",
+        "money_flow_snapshot_refs",
+        "intraday_strength_snapshot_refs",
+        "plan_enabled=true",
+        "每个请求标的",
+        "失败行",
+        "额外标的",
+        "最早的可用报价市场时间",
+        "系统采集和工作流时间",
+        "data_time=null",
+        "CLI 显示 `-`",
+        "不读取或修改真实券商凭据或账户",
+        "不被计划、策略、建议、通知或调度流程消费",
+    ):
+        assert expected in data_sources
