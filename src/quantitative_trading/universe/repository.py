@@ -10,7 +10,7 @@ class UniverseSnapshotRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
 
-    def save(self, snapshot: UniverseSnapshot) -> int:
+    def save(self, snapshot: UniverseSnapshot, *, commit: bool = True) -> int:
         cursor = self.connection.execute(
             """
             INSERT INTO universe_snapshots (
@@ -32,7 +32,8 @@ class UniverseSnapshotRepository:
                 snapshot.model_dump_json(),
             ),
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return int(cursor.lastrowid)
 
     def latest(self) -> UniverseSnapshot | None:
