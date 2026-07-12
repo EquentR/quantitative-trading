@@ -46,6 +46,7 @@ def authenticated_client(
     *,
     provider=None,
     settings_overrides: dict[str, object] | None = None,
+    raise_server_exceptions: bool = True,
 ) -> tuple[TestClient, dict[str, str]]:
     if provider is not None:
         monkeypatch.setattr(
@@ -59,7 +60,10 @@ def authenticated_client(
         enable_market_fetch=True,
         **(settings_overrides or {}),
     )
-    client = TestClient(create_app(settings))
+    client = TestClient(
+        create_app(settings),
+        raise_server_exceptions=raise_server_exceptions,
+    )
     client.post("/api/v1/auth/setup-password", json={"password": "local-password"})
     login = client.post("/api/v1/auth/login", json={"password": "local-password"})
     return client, {"Authorization": f"Bearer {login.json()['access_token']}"}
@@ -197,6 +201,48 @@ def test_missing_latest_and_detail_return_market_snapshot_not_found(
     }
 
 
+def test_market_snapshot_detail_rejects_non_positive_ids_before_lookup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class RecordingMarketSnapshotRepository:
+        calls: list[int] = []
+
+        def __init__(self, connection) -> None:
+            pass
+
+        def get(self, snapshot_id):
+            self.calls.append(snapshot_id)
+            return None
+
+    monkeypatch.setattr(
+        market_routes,
+        "MarketInputSnapshotRepository",
+        RecordingMarketSnapshotRepository,
+    )
+    client, headers = authenticated_client(
+        tmp_path,
+        monkeypatch,
+        provider=RecordingMarketProvider(),
+    )
+
+    for snapshot_id in (0, -1):
+        response = client.get(
+            f"/api/v1/market/snapshots/{snapshot_id}",
+            headers=headers,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "validation_error"
+        assert response.json()["error"]["message"] == "request validation failed"
+        assert response.json()["error"]["details"]["errors"][0]["loc"] == [
+            "path",
+            "snapshot_id",
+        ]
+
+    assert RecordingMarketSnapshotRepository.calls == []
+
+
 def test_unsupported_provider_matches_account_snapshot_validation_error(
     tmp_path,
     monkeypatch,
@@ -259,6 +305,34 @@ def test_create_market_snapshot_storage_error_is_sanitized(tmp_path, monkeypatch
         tmp_path,
         monkeypatch,
         provider=RecordingMarketProvider(),
+    )
+
+    response = client.post("/api/v1/market/snapshots", headers=headers)
+
+    assert_storage_error_is_sanitized(response)
+
+
+def test_create_market_snapshot_value_error_is_sanitized(tmp_path, monkeypatch) -> None:
+    class BrokenMarketSnapshotService:
+        def __init__(self, connection, provider) -> None:
+            pass
+
+        def capture(self):
+            raise ValueError(
+                "SELECT secret trigger_secret raw_payload api_key token cookie password "
+                "/home/private/market.db"
+            )
+
+    monkeypatch.setattr(
+        market_routes,
+        "MarketSnapshotService",
+        BrokenMarketSnapshotService,
+    )
+    client, headers = authenticated_client(
+        tmp_path,
+        monkeypatch,
+        provider=RecordingMarketProvider(),
+        raise_server_exceptions=False,
     )
 
     response = client.post("/api/v1/market/snapshots", headers=headers)

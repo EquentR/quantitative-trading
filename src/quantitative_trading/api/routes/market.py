@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Annotated
 
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ValidationError
+from fastapi import APIRouter, Depends, Path as ApiPath
+from pydantic import BaseModel, ValidationError as PydanticValidationError
 
 from quantitative_trading.api.dependencies import (
     ApiContainer,
@@ -29,6 +30,8 @@ router = APIRouter(
     tags=["market"],
     dependencies=[Depends(require_auth)],
 )
+
+MarketSnapshotIdPath = Annotated[int, ApiPath(gt=0)]
 
 
 class CreatedMarketSnapshotResponse(BaseModel):
@@ -82,7 +85,7 @@ def create_market_snapshot(
             created = MarketSnapshotService(connection, provider).capture()
     except UnsupportedMarketProviderError as exc:
         raise _unsupported_market_provider(exc) from exc
-    except (sqlite3.Error, ValidationError) as exc:
+    except (sqlite3.Error, PydanticValidationError, ValueError) as exc:
         raise _market_snapshot_storage_failed() from exc
     return _created_snapshot_response(created)
 
@@ -94,7 +97,7 @@ def get_latest_market_snapshot(
     try:
         with connection_scope(container.settings) as connection:
             snapshot = MarketInputSnapshotRepository(connection).latest()
-    except (sqlite3.Error, ValidationError) as exc:
+    except (sqlite3.Error, PydanticValidationError) as exc:
         raise _market_snapshot_storage_failed() from exc
 
     if snapshot is None:
@@ -104,13 +107,13 @@ def get_latest_market_snapshot(
 
 @router.get("/snapshots/{snapshot_id}", response_model=MarketInputSnapshot)
 def get_market_snapshot(
-    snapshot_id: int,
+    snapshot_id: MarketSnapshotIdPath,
     container: ApiContainer = Depends(get_container),
 ) -> MarketInputSnapshot:
     try:
         with connection_scope(container.settings) as connection:
             snapshot = MarketInputSnapshotRepository(connection).get(snapshot_id)
-    except (sqlite3.Error, ValidationError) as exc:
+    except (sqlite3.Error, PydanticValidationError) as exc:
         raise _market_snapshot_storage_failed() from exc
 
     if snapshot is None:
