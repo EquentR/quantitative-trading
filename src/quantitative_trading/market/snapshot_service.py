@@ -94,7 +94,8 @@ class MarketSnapshotService:
                     (
                         quote.data_time
                         for quote in quotes.values()
-                        if quote.data_time is not None
+                        if quote.status is not QuoteStatus.FAILED
+                        and quote.data_time is not None
                     ),
                     default=None,
                 ),
@@ -176,7 +177,10 @@ class MarketSnapshotService:
 
             quotes[symbol] = quote
             if quote.status is not QuoteStatus.OK:
-                warnings.append(f"标的 {symbol} 行情状态为 {quote.status.value}")
+                status_warning = f"标的 {symbol} 行情状态为 {quote.status.value}"
+                if quote.warning:
+                    status_warning = f"{status_warning}: {quote.warning}"
+                warnings.append(status_warning)
 
         return quotes, warnings
 

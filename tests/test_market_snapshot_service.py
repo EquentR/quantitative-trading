@@ -87,6 +87,17 @@ def ok_quote(symbol: str, *, data_time: datetime = FETCHED_AT) -> QuoteSnapshot:
     )
 
 
+def failed_quote(symbol: str, *, data_time: datetime) -> QuoteSnapshot:
+    return QuoteSnapshot(
+        symbol=symbol,
+        data_time=data_time,
+        fetched_at=FETCHED_AT,
+        source="fake_provider",
+        status=QuoteStatus.FAILED,
+        warning="provider quote failed",
+    )
+
+
 def test_capture_fetches_stable_sorted_decision_enabled_quotes_and_persists_references(
     connection,
     decision_universe,
@@ -110,6 +121,38 @@ def test_capture_fetches_stable_sorted_decision_enabled_quotes_and_persists_refe
     assert set(created.snapshot.quote_snapshot_refs) == {"000001", "600000"}
     assert created.snapshot.data_time == OLDER_DATA_TIME
     assert created.quotes["600000"].status is QuoteStatus.OK
+
+
+def test_capture_data_time_ignores_older_failed_quote(
+    connection,
+    decision_universe,
+) -> None:
+    provider = RecordingMarketDataProvider(
+        {
+            "000001": failed_quote("000001", data_time=OLDER_DATA_TIME),
+            "600000": ok_quote("600000"),
+        }
+    )
+
+    created = MarketSnapshotService(connection, provider, now=FETCHED_AT).capture()
+
+    assert created.snapshot.data_time == FETCHED_AT
+
+
+def test_capture_data_time_is_none_when_all_quotes_failed(
+    connection,
+    decision_universe,
+) -> None:
+    provider = RecordingMarketDataProvider(
+        {
+            "000001": failed_quote("000001", data_time=OLDER_DATA_TIME),
+            "600000": failed_quote("600000", data_time=FETCHED_AT),
+        }
+    )
+
+    created = MarketSnapshotService(connection, provider, now=FETCHED_AT).capture()
+
+    assert created.snapshot.data_time is None
 
 
 def test_capture_persists_failed_quote_when_provider_omits_requested_symbol(
@@ -238,7 +281,7 @@ def test_capture_sanitizes_provider_quote_warnings_before_persistence(
     connection,
     decision_universe,
 ) -> None:
-    warning = "api_key=supersecret, Bearer abc, /tmp/private.db"
+    warning = "provider response incomplete; api_key=supersecret, Bearer abc, /tmp/private.db"
     provider = RecordingMarketDataProvider(
         {
             "000001": ok_quote("000001").model_copy(
@@ -253,6 +296,12 @@ def test_capture_sanitizes_provider_quote_warnings_before_persistence(
         created.snapshot.quote_snapshot_refs["000001"]
     )
     assert quote is not None
+    aggregate_warning = next(
+        warning
+        for warning in created.snapshot.warnings
+        if "000001" in warning and "partial" in warning
+    )
+    assert "provider response incomplete" in aggregate_warning
     persisted_text = " ".join([quote.warning, *created.snapshot.warnings])
     assert "supersecret" not in persisted_text
     assert "Bearer abc" not in persisted_text
