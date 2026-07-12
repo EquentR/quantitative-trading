@@ -3,8 +3,6 @@ from __future__ import annotations
 import csv
 from datetime import date
 from io import StringIO
-from pathlib import Path as FilePath
-from tempfile import NamedTemporaryFile
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Path as ApiPath, Response, UploadFile
@@ -17,6 +15,7 @@ from quantitative_trading.api.dependencies import (
     require_token,
 )
 from quantitative_trading.api.errors import ApiError
+from quantitative_trading.api.uploads import closed_temporary_upload
 from quantitative_trading.ledger.models import Position, PositionInput
 from quantitative_trading.ledger.repository import (
     DuplicatePositionError,
@@ -137,12 +136,10 @@ async def import_positions_csv(
     content = await file.read()
 
     try:
-        with NamedTemporaryFile(delete=True, suffix=".csv") as temp_file:
-            temp_file.write(content)
-            temp_file.flush()
+        with closed_temporary_upload(content, suffix=".csv") as path:
             with connection_scope(container.settings) as connection:
                 service = LedgerService(PositionRepository(connection))
-                return service.import_csv(FilePath(temp_file.name))
+                return service.import_csv(path)
     except ValueError as exc:
         raise _validation_error(
             "request validation failed",
