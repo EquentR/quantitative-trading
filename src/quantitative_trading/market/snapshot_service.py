@@ -26,6 +26,7 @@ _PHASE_BOUNDARY_WARNINGS = (
     "分时强弱快照未在此阶段采集",
 )
 _BARE_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_PERSISTENCE_SAVEPOINT = "market_snapshot_persistence"
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,7 @@ class MarketSnapshotService:
             members=members,
         )
 
+        self.connection.execute(f"SAVEPOINT {_PERSISTENCE_SAVEPOINT}")
         try:
             universe_snapshot_id = UniverseSnapshotRepository(self.connection).save(
                 universe_snapshot,
@@ -103,9 +105,10 @@ class MarketSnapshotService:
                 market_snapshot,
                 commit=False,
             )
-            self.connection.commit()
+            self.connection.execute(f"RELEASE SAVEPOINT {_PERSISTENCE_SAVEPOINT}")
         except BaseException:
-            self.connection.rollback()
+            self.connection.execute(f"ROLLBACK TO SAVEPOINT {_PERSISTENCE_SAVEPOINT}")
+            self.connection.execute(f"RELEASE SAVEPOINT {_PERSISTENCE_SAVEPOINT}")
             raise
 
         return CreatedMarketInputSnapshot(

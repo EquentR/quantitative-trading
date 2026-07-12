@@ -283,3 +283,42 @@ def test_capture_rolls_back_universe_quote_and_aggregate_writes_on_database_fail
     assert connection.execute("SELECT COUNT(*) FROM universe_snapshots").fetchone()[0] == 0
     assert connection.execute("SELECT COUNT(*) FROM quote_snapshots").fetchone()[0] == 0
     assert connection.execute("SELECT COUNT(*) FROM market_input_snapshots").fetchone()[0] == 0
+
+
+def test_capture_rolls_back_all_writes_with_autocommit_connection() -> None:
+    connection = sqlite3.connect(":memory:", isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    migrate(connection)
+    try:
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="600000",
+                name="Pufa Bank",
+                quantity=1000,
+                available_quantity=800,
+                cost_price=9.5,
+                opened_at=date(2026, 7, 6),
+            ),
+            now=FETCHED_AT,
+        )
+        connection.commit()
+        connection.execute(
+            """
+            CREATE TRIGGER fail_autocommit_market_input_snapshot_insert
+            BEFORE INSERT ON market_input_snapshots
+            BEGIN
+              SELECT RAISE(ABORT, 'forced aggregate failure');
+            END;
+            """
+        )
+        provider = RecordingMarketDataProvider({"600000": ok_quote("600000")})
+
+        with pytest.raises(sqlite3.IntegrityError, match="forced aggregate failure"):
+            MarketSnapshotService(connection, provider, now=FETCHED_AT).capture()
+
+        assert connection.execute("SELECT COUNT(*) FROM universe_snapshots").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM quote_snapshots").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM market_input_snapshots").fetchone()[0] == 0
+    finally:
+        connection.close()
