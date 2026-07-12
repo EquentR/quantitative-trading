@@ -12,7 +12,12 @@ def closed_temporary_upload(content: bytes, *, suffix: str) -> Iterator[Path]:
     descriptor, raw_path = mkstemp(suffix=suffix)
     path = Path(raw_path)
     try:
-        with os.fdopen(descriptor, "wb") as file:
+        try:
+            file = os.fdopen(descriptor, "wb")
+        except OSError:
+            os.close(descriptor)
+            raise
+        with file:
             file.write(content)
         yield path
     finally:
