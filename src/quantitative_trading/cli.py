@@ -629,11 +629,14 @@ def account_snapshot(json_output: Annotated[bool, typer.Option("--json")] = Fals
 
 @market_app.command("snapshot")
 def market_snapshot() -> None:
-    with _database_scope() as (settings, connection):
-        created = MarketSnapshotService(
-            connection,
-            _market_provider(settings),
-        ).capture()
+    try:
+        with _database_scope() as (settings, connection):
+            created = MarketSnapshotService(
+                connection,
+                _market_provider(settings),
+            ).capture()
+    except (sqlite3.Error, ValidationError, ValueError):
+        raise typer.BadParameter("market snapshot storage failed") from None
     counts = Counter(quote.status.value for quote in created.quotes.values())
     typer.echo(
         f"market_snapshot_id={created.snapshot_id} "

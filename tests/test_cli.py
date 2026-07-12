@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -756,6 +757,56 @@ def test_market_snapshot_captures_decision_enabled_symbols(
     assert "warning=\u8d44\u91d1\u6d41\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6" in result.output
     assert "warning=\u5206\u65f6\u5f3a\u5f31\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6" in result.output
     assert FakeAkShareMarketProvider.calls == [["000001", "600000"]]
+
+
+def test_market_snapshot_sanitizes_storage_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "synthetic-database-secret.db"
+    password = "synthetic-password-secret"
+    token = "synthetic-token-secret"
+    cookie = "synthetic-cookie-secret"
+    api_key = "synthetic-api-key-secret"
+
+    def fail_migration(_connection) -> None:
+        raise sqlite3.IntegrityError(
+            f"raw sqlite failure path={database_path} password={password} "
+            f"token={token} cookie={cookie} api_key={api_key}"
+        )
+
+    monkeypatch.setattr(cli, "migrate", fail_migration)
+
+    result = run_cli(
+        tmp_path,
+        "market",
+        "snapshot",
+        env={
+            "QT_DATABASE_PATH": str(database_path),
+            "QT_API_ACCESS_PASSWORD": password,
+            "QT_API_TOKEN_SECRET": token,
+        },
+    )
+
+    assert result.exit_code != 0
+    assert "market snapshot storage failed" in result.output
+    assert "Traceback" not in result.output
+    assert "raw sqlite failure" not in result.output
+    for sensitive_value in (str(database_path), password, token, cookie, api_key):
+        assert sensitive_value not in result.output
+
+
+def test_market_snapshot_reports_empty_decision_universe(tmp_path) -> None:
+    result = run_cli(tmp_path, "market", "snapshot")
+
+    assert result.exit_code == 0
+    assert "requested=0" in result.output
+    assert "ok=0" in result.output
+    assert "partial=0" in result.output
+    assert "stale=0" in result.output
+    assert "failed=0" in result.output
+    assert "data_time=-" in result.output
+    assert "warning=\u65e0\u51b3\u7b56\u542f\u7528\u6807\u7684\uff0c\u672a\u8c03\u7528\u884c\u60c5\u6570\u636e\u6e90" in result.output
 
 
 def test_plan_generate_and_latest_commands(tmp_path) -> None:
