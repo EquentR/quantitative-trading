@@ -4,6 +4,7 @@ import csv
 import json
 import sqlite3
 import sys
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -29,6 +30,7 @@ from quantitative_trading.market.providers import (
     DisabledMarketProvider,
     MarketDataProvider,
 )
+from quantitative_trading.market.snapshot_service import MarketSnapshotService
 from quantitative_trading.planning.repository import TradingPlanRepository
 from quantitative_trading.planning.workflow import generate_trading_plan
 from quantitative_trading.recommendation.repository import RecommendationRepository
@@ -56,6 +58,7 @@ ledger_app = typer.Typer()
 service_app = typer.Typer()
 cash_app = typer.Typer()
 account_app = typer.Typer()
+market_app = typer.Typer()
 watchlist_app = typer.Typer()
 plan_app = typer.Typer()
 recommendations_app = typer.Typer()
@@ -64,6 +67,7 @@ app.add_typer(ledger_app, name="ledger")
 app.add_typer(service_app, name="service")
 app.add_typer(cash_app, name="cash")
 app.add_typer(account_app, name="account")
+app.add_typer(market_app, name="market")
 app.add_typer(watchlist_app, name="watchlist")
 app.add_typer(plan_app, name="plan")
 app.add_typer(recommendations_app, name="recommendations")
@@ -621,6 +625,26 @@ def account_snapshot(json_output: Annotated[bool, typer.Option("--json")] = Fals
         )
         for warning in snapshot.warnings:
             typer.echo(f"warning={warning}")
+
+
+@market_app.command("snapshot")
+def market_snapshot() -> None:
+    with _database_scope() as (settings, connection):
+        created = MarketSnapshotService(
+            connection,
+            _market_provider(settings),
+        ).capture()
+    counts = Counter(quote.status.value for quote in created.quotes.values())
+    typer.echo(
+        f"market_snapshot_id={created.snapshot_id} "
+        f"universe_snapshot_id={created.snapshot.universe_snapshot_id} "
+        f"requested={len(created.quotes)} "
+        f"ok={counts['ok']} partial={counts['partial']} "
+        f"stale={counts['stale']} failed={counts['failed']} "
+        f"data_time={created.snapshot.data_time.isoformat() if created.snapshot.data_time else '-'}"
+    )
+    for warning in created.snapshot.warnings:
+        typer.echo(f"warning={warning}")
 
 
 @plan_app.command("generate")

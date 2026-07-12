@@ -674,6 +674,90 @@ def test_account_snapshot_with_market_fetch_disabled_reports_warning(tmp_path) -
     assert "market fetch disabled" in result.output
 
 
+def test_market_snapshot_captures_decision_enabled_symbols(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class FakeAkShareMarketProvider:
+        calls: list[list[str]] = []
+
+        def get_quotes(self, symbols):
+            self.calls.append(list(symbols))
+            return {
+                symbol: QuoteSnapshot(
+                    symbol=symbol,
+                    name=f"Stock {symbol}",
+                    current_price=10.5,
+                    change_pct=1.2,
+                    data_time=datetime(2026, 7, 7, 2, 30, tzinfo=UTC),
+                    fetched_at=datetime(2026, 7, 7, 2, 30, 3, tzinfo=UTC),
+                    source="akshare",
+                    status=QuoteStatus.OK,
+                )
+                for symbol in symbols
+            }
+
+    monkeypatch.setattr(
+        cli,
+        "AkShareMarketProvider",
+        FakeAkShareMarketProvider,
+        raising=False,
+    )
+    add_result = run_cli(
+        tmp_path,
+        "ledger",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "Pufa Bank",
+        "--quantity",
+        "1000",
+        "--available-quantity",
+        "800",
+        "--cost-price",
+        "9.5",
+        "--opened-at",
+        "2026-07-06",
+    )
+    watch_result = run_cli(
+        tmp_path,
+        "watchlist",
+        "add",
+        "--symbol",
+        "000001",
+        "--name",
+        "Ping An Bank",
+        "--rank",
+        "1",
+        "--plan-enabled",
+        "true",
+    )
+
+    result = run_cli(
+        tmp_path,
+        "market",
+        "snapshot",
+        env={"QT_ENABLE_MARKET_FETCH": "true", "QT_MARKET_PROVIDER": "akshare"},
+    )
+
+    assert add_result.exit_code == 0
+    assert watch_result.exit_code == 0
+    assert result.exit_code == 0, result.output
+    assert "market_snapshot_id=1" in result.output
+    assert "universe_snapshot_id=1" in result.output
+    assert "requested=2" in result.output
+    assert "ok=2" in result.output
+    assert "partial=0" in result.output
+    assert "stale=0" in result.output
+    assert "failed=0" in result.output
+    assert "data_time=2026-07-07T02:30:00+00:00" in result.output
+    assert "warning=\u5386\u53f2K\u7ebf\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6" in result.output
+    assert "warning=\u8d44\u91d1\u6d41\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6" in result.output
+    assert "warning=\u5206\u65f6\u5f3a\u5f31\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6" in result.output
+    assert FakeAkShareMarketProvider.calls == [["000001", "600000"]]
+
+
 def test_plan_generate_and_latest_commands(tmp_path) -> None:
     run_cli(
         tmp_path,
