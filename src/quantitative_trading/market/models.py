@@ -28,7 +28,7 @@ def _must_be_timezone_aware(value: datetime | None) -> datetime | None:
 class QuoteSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    symbol: str = Field(pattern=r"^\d{6}$")
+    symbol: str = Field(pattern=r"^[0-9]{6}$")
     name: str = ""
     current_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     change_pct: float | None = Field(default=None, allow_inf_nan=False)

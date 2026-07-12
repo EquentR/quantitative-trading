@@ -192,6 +192,12 @@ def test_quote_snapshot_rejects_invalid_symbol() -> None:
         )
 
 
+@pytest.mark.parametrize("symbol", ["６０００００", "٦٠٠٠٠٠"])
+def test_quote_snapshot_rejects_unicode_digit_symbol(symbol: str) -> None:
+    with pytest.raises(ValidationError):
+        QuoteSnapshot.model_validate(valid_quote_payload(symbol=symbol))
+
+
 @pytest.mark.parametrize("source", ["", "   "])
 def test_quote_snapshot_rejects_blank_source(source: str) -> None:
     with pytest.raises(ValidationError):
