@@ -4,7 +4,11 @@ from math import inf, nan
 import pytest
 from pydantic import ValidationError
 
-from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
+from quantitative_trading.market.models import (
+    MarketInputSnapshot,
+    QuoteSnapshot,
+    QuoteStatus,
+)
 
 
 def valid_quote_payload(**overrides: object) -> dict[str, object]:
@@ -21,6 +25,88 @@ def valid_quote_payload(**overrides: object) -> dict[str, object]:
     }
     payload.update(overrides)
     return payload
+
+
+def valid_market_input_snapshot_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "universe_snapshot_id": 1,
+        "quote_snapshot_refs": {"600000": 10},
+        "history_snapshot_refs": {},
+        "money_flow_snapshot_refs": {},
+        "intraday_strength_snapshot_refs": {},
+        "data_time": datetime(2026, 7, 12, 6, 0, tzinfo=UTC),
+        "fetched_at": datetime(2026, 7, 12, 6, 0, 5, tzinfo=UTC),
+        "warnings": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_market_input_snapshot_accepts_quote_snapshot_refs() -> None:
+    snapshot = MarketInputSnapshot(
+        universe_snapshot_id=1,
+        quote_snapshot_refs={"600000": 10},
+        history_snapshot_refs={},
+        money_flow_snapshot_refs={},
+        intraday_strength_snapshot_refs={},
+        data_time=datetime(2026, 7, 12, 6, 0, tzinfo=UTC),
+        fetched_at=datetime(2026, 7, 12, 6, 0, 5, tzinfo=UTC),
+        warnings=[],
+    )
+
+    assert snapshot.quote_snapshot_refs == {"600000": 10}
+
+
+@pytest.mark.parametrize("field", ["data_time", "fetched_at"])
+def test_market_input_snapshot_rejects_naive_datetimes(field: str) -> None:
+    payload = valid_market_input_snapshot_payload()
+    payload[field] = datetime(2026, 7, 12, 6, 0)
+
+    with pytest.raises(ValidationError):
+        MarketInputSnapshot.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "quote_snapshot_refs",
+        "history_snapshot_refs",
+        "money_flow_snapshot_refs",
+        "intraday_strength_snapshot_refs",
+    ],
+)
+def test_market_input_snapshot_rejects_invalid_reference_symbols(field: str) -> None:
+    payload = valid_market_input_snapshot_payload(**{field: {"SH600000": 10}})
+
+    with pytest.raises(ValidationError):
+        MarketInputSnapshot.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "quote_snapshot_refs",
+        "history_snapshot_refs",
+        "money_flow_snapshot_refs",
+        "intraday_strength_snapshot_refs",
+    ],
+)
+@pytest.mark.parametrize("reference_id", [0, -1])
+def test_market_input_snapshot_rejects_nonpositive_reference_ids(
+    field: str,
+    reference_id: int,
+) -> None:
+    payload = valid_market_input_snapshot_payload(**{field: {"600000": reference_id}})
+
+    with pytest.raises(ValidationError):
+        MarketInputSnapshot.model_validate(payload)
+
+
+def test_market_input_snapshot_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        MarketInputSnapshot.model_validate(
+            valid_market_input_snapshot_payload(unexpected="value")
+        )
 
 
 def test_quote_snapshot_accepts_ok_quote() -> None:

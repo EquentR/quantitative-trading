@@ -335,6 +335,33 @@ def test_migrate_creates_universe_snapshots_table(tmp_path) -> None:
     assert row is not None
 
 
+def test_migrate_twice_creates_quote_snapshots_table(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        migrate(connection)
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'quote_snapshots'"
+        ).fetchone()
+
+    assert row is not None
+
+
+def test_migrate_twice_creates_quote_snapshots_symbol_id_index(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        migrate(connection)
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_quote_snapshots_symbol_id'"
+        ).fetchone()
+
+    assert row is not None
+
+
 def test_migrate_creates_market_input_snapshots_table(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "app.db")
     with connect(settings) as connection:

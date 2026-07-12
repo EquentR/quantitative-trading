@@ -63,3 +63,35 @@ class QuoteSnapshot(BaseModel):
         elif self.status is QuoteStatus.FAILED and not self.warning:
             raise ValueError("failed quote requires warning")
         return self
+
+
+class MarketInputSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    universe_snapshot_id: int = Field(gt=0)
+    quote_snapshot_refs: dict[str, int]
+    history_snapshot_refs: dict[str, int]
+    money_flow_snapshot_refs: dict[str, int]
+    intraday_strength_snapshot_refs: dict[str, int]
+    data_time: datetime | None = None
+    fetched_at: datetime
+    warnings: list[str]
+
+    @field_validator("data_time", "fetched_at")
+    @classmethod
+    def datetimes_must_be_timezone_aware(cls, value: datetime | None) -> datetime | None:
+        return _must_be_timezone_aware(value)
+
+    @field_validator(
+        "quote_snapshot_refs",
+        "history_snapshot_refs",
+        "money_flow_snapshot_refs",
+        "intraday_strength_snapshot_refs",
+    )
+    @classmethod
+    def references_must_be_valid(cls, value: dict[str, int]) -> dict[str, int]:
+        if any(len(symbol) != 6 or not symbol.isdigit() for symbol in value):
+            raise ValueError("snapshot reference symbols must contain six digits")
+        if any(reference_id <= 0 for reference_id in value.values()):
+            raise ValueError("snapshot reference ids must be positive")
+        return value
