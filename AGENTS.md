@@ -14,14 +14,9 @@
 Equent <ryq2836@qq.com>
 ```
 
-提交前应确认本地仓库配置或提交命令使用该身份。不得使用系统默认 git 身份提交。
+提交前应确认本地仓库配置或提交命令使用该身份。不得使用系统默认 git 身份提交。也不应将系统默认的 git config 修改为指定身份。避免其他项目提交信息被污染。
 
-推荐本地仓库配置：
 
-```bash
-git config user.name "Equent"
-git config user.email "ryq2836@qq.com"
-```
 
 ## 安全边界
 
