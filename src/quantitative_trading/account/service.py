@@ -193,7 +193,11 @@ class AccountService:
                 quote=quote,
             )
 
-        if quote.status is QuoteStatus.FAILED or quote.current_price is None:
+        if (
+            quote.status is QuoteStatus.FAILED
+            or quote.current_price is None
+            or quote.data_time is None
+        ):
             return self._unavailable_position(
                 position,
                 position_cost,
@@ -247,6 +251,12 @@ class AccountService:
 
     @staticmethod
     def _failed_warning(quote: QuoteSnapshot) -> str:
+        if quote.data_time is None:
+            return (
+                redact_sensitive_text(quote.warning)
+                if quote.warning
+                else "quote market time unavailable"
+            )
         if quote.warning:
             return f"quote unavailable: {redact_sensitive_text(quote.warning)}"
         return "quote unavailable"

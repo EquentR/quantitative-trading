@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from threading import Lock
 from typing import Any
 
 from quantitative_trading.audit.models import AuditLog
@@ -8,6 +9,9 @@ from quantitative_trading.config import Settings
 from quantitative_trading.notification.models import NotificationSummary
 from quantitative_trading.recommendation.models import Recommendation
 from quantitative_trading.sanitization import sanitize_sensitive_data
+
+
+_JSONL_APPEND_LOCK = Lock()
 
 
 class JsonlNotificationWriter:
@@ -39,7 +43,7 @@ class JsonlNotificationWriter:
             "recommendation": recommendation.model_dump(mode="json"),
             "audit": audit_ref.model_dump(mode="json"),
         }
-        self._append(payload)
+        self._append(payload, dedup_key=summary.notification_id)
 
     def write_system_alert(
         self,
@@ -61,16 +65,35 @@ class JsonlNotificationWriter:
                     "details": details,
                 },
                 "audit": audit_ref.model_dump(mode="json"),
-            }
+            },
+            dedup_key=summary.notification_id,
         )
 
-    def _append(self, payload: dict[str, Any]) -> None:
+    def _append(self, payload: dict[str, Any], *, dedup_key: str) -> None:
         self.settings.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.settings.log_dir / "notifications.jsonl"
         sanitized = sanitize_sensitive_data(
             payload,
             configured_secret_texts=self._configured_secrets,
         )
-        with log_path.open("a", encoding="utf-8") as log_file:
-            log_file.write(json.dumps(sanitized, ensure_ascii=False))
-            log_file.write("\n")
+        with _JSONL_APPEND_LOCK:
+            with log_path.open("a+", encoding="utf-8") as log_file:
+                log_file.seek(0)
+                existing_text = log_file.read()
+                for line in existing_text.splitlines():
+                    try:
+                        existing = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    summary = existing.get("summary")
+                    if (
+                        isinstance(summary, dict)
+                        and summary.get("notification_id") == dedup_key
+                    ):
+                        return
+                log_file.seek(0, 2)
+                if existing_text and not existing_text.endswith("\n"):
+                    log_file.write("\n")
+                log_file.write(json.dumps(sanitized, ensure_ascii=False))
+                log_file.write("\n")
+                log_file.flush()

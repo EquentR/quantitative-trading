@@ -12,6 +12,7 @@ export function useNotificationsQuery() {
     queryFn: async () => pageItems(
       await client.get<PaginatedResponse<NotificationSummary> | NotificationSummary[]>('/notifications'),
     ),
+    refetchInterval: 30_000,
     retry: false,
   })
 }

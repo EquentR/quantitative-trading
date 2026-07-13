@@ -31,18 +31,6 @@ export function useStopSchedulerMutation() {
   })
 }
 
-export function useRunOnceMutation() {
-  const client = useApiClient()
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: () => client.post<ServiceStatus>('/service/run-once'),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: serviceStatusQueryKey })
-      queryClient.invalidateQueries({ queryKey: ['account', 'snapshot'] })
-    },
-  })
-}
-
 export function useRunIntradayWorkflowMutation() {
   const client = useApiClient()
   const queryClient = useQueryClient()

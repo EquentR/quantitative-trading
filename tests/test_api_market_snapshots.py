@@ -281,7 +281,7 @@ def test_market_snapshot_detail_rejects_ids_above_sqlite_integer_max_before_look
     assert lookup_calls == []
 
 
-def test_unsupported_provider_matches_account_snapshot_validation_error(
+def test_unsupported_provider_only_affects_active_market_snapshot_writer(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -294,8 +294,10 @@ def test_unsupported_provider_matches_account_snapshot_validation_error(
     account_response = client.post("/api/v1/account/snapshots", headers=headers)
     market_response = client.post("/api/v1/market/snapshots", headers=headers)
 
-    assert market_response.status_code == account_response.status_code == 422
-    assert market_response.json() == account_response.json() == {
+    assert account_response.status_code == 410
+    assert account_response.json()["error"]["code"] == "account_snapshot_create_retired"
+    assert market_response.status_code == 422
+    assert market_response.json() == {
         "error": {
             "code": "validation_error",
             "message": "unsupported market provider",

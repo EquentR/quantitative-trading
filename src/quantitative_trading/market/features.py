@@ -460,8 +460,27 @@ def calculate_intraday_strength(
         prior = sum(bar.volume for bar in ordered[-25:-5]) / 20
         if prior > 0:
             minute_volume_ratio = recent / prior
+            volume_reason = "recent 5-minute average volume versus prior 20 minutes"
+        else:
+            volume_reason = "prior 20-minute average volume is zero"
+    else:
+        volume_reason = "requires 25 complete minutes"
+    components.append(
+        _component(
+            "minute_volume_ratio",
+            minute_volume_ratio,
+            rules.volume_high,
+            volume_reason,
+            direction=0,
+            source="minute_bars" if ordered else "",
+        )
+    )
 
-    available = [component for component in components if component.available]
+    available = [
+        component
+        for component in components
+        if component.name != "minute_volume_ratio" and component.available
+    ]
     direction_sum = sum(component.direction for component in available)
     degraded = len(available) < 4
     degradation_reasons = [] if not degraded else ["fewer than four direction components available"]

@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -86,7 +87,7 @@ def test_akshare_provider_maps_sparse_dataframe_to_partial_quote() -> None:
     assert quotes["600000"].name == "浦发银行"
     assert quotes["600000"].current_price == 10.5
     assert quotes["600000"].change_pct == 1.2
-    assert quotes["600000"].data_time == fetched_at
+    assert quotes["600000"].data_time is None
     assert quotes["600000"].fetched_at == fetched_at
     assert quotes["600000"].source == "akshare"
     assert quotes["600000"].status is QuoteStatus.PARTIAL
@@ -206,6 +207,34 @@ def test_akshare_provider_falls_back_to_single_quote_fetch_when_batch_fetch_fail
     assert len(requested_urls) == 3
 
 
+def test_eastmoney_single_quote_maps_source_timestamp() -> None:
+    fetched_at = datetime(2026, 7, 7, 7, 5, tzinfo=UTC)
+    source_time = datetime(2026, 7, 7, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    def single_quote_fetcher(url: str, *, timeout: float):
+        assert "f124" in url
+        return {
+            "data": {
+                "f57": "600000",
+                "f58": "浦发银行",
+                "f43": 1050,
+                "f170": 120,
+                "f124": int(source_time.timestamp()),
+            }
+        }
+
+    provider = AkShareMarketProvider(
+        akshare_module=FailingAkShare,
+        now=lambda: fetched_at,
+        eastmoney_single_quote_fetcher=single_quote_fetcher,
+    )
+
+    quote = provider.get_quotes(["600000"])["600000"]
+
+    assert quote.data_time == source_time
+    assert quote.status is QuoteStatus.PARTIAL
+
+
 def test_akshare_provider_falls_back_to_tencent_quotes_when_eastmoney_single_quote_fails() -> None:
     fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
 
@@ -253,6 +282,76 @@ def test_akshare_provider_falls_back_to_tencent_quotes_when_eastmoney_single_quo
     assert quotes["603459"].current_price == 89.72
     assert quotes["603459"].change_pct == -0.02
     assert all(quote.source == "tencent_quote" for quote in quotes.values())
+
+
+def test_tencent_quote_maps_source_timestamp() -> None:
+    fetched_at = datetime(2026, 7, 7, 7, 5, tzinfo=UTC)
+
+    def failing_single_quote_fetcher(url: str, *, timeout: float):
+        raise RuntimeError("eastmoney disconnected")
+
+    def tencent_quote_fetcher(url: str, *, timeout: float):
+        fields = [""] * 88
+        fields[1] = "浦发银行"
+        fields[2] = "600000"
+        fields[3] = "10.50"
+        fields[30] = "20260707150000"
+        fields[32] = "1.20"
+        return 'v_sh600000="' + "~".join(fields) + '";'
+
+    provider = AkShareMarketProvider(
+        akshare_module=FailingAkShare,
+        now=lambda: fetched_at,
+        eastmoney_single_quote_fetcher=failing_single_quote_fetcher,
+        tencent_quote_fetcher=tencent_quote_fetcher,
+    )
+
+    quote = provider.get_quotes(["600000"])["600000"]
+
+    assert quote.data_time == datetime(
+        2026, 7, 7, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+    )
+    assert quote.status is QuoteStatus.PARTIAL
+
+
+def test_tencent_quote_isolates_invalid_source_timestamp_to_its_symbol() -> None:
+    fetched_at = datetime(2026, 7, 7, 7, 5, tzinfo=UTC)
+
+    def failing_single_quote_fetcher(url: str, *, timeout: float):
+        raise RuntimeError("eastmoney disconnected")
+
+    def tencent_line(symbol: str, name: str, data_time: str) -> str:
+        fields = [""] * 88
+        fields[1] = name
+        fields[2] = symbol
+        fields[3] = "10.50"
+        fields[30] = data_time
+        fields[32] = "1.20"
+        return f'v_{symbol}="' + "~".join(fields) + '";'
+
+    def tencent_quote_fetcher(url: str, *, timeout: float):
+        return "\n".join(
+            [
+                tencent_line("600000", "浦发银行", "20260707150000"),
+                tencent_line("000001", "平安银行", "invalid-time"),
+            ]
+        )
+
+    provider = AkShareMarketProvider(
+        akshare_module=FailingAkShare,
+        now=lambda: fetched_at,
+        eastmoney_single_quote_fetcher=failing_single_quote_fetcher,
+        tencent_quote_fetcher=tencent_quote_fetcher,
+    )
+
+    quotes = provider.get_quotes(["600000", "000001"])
+
+    assert quotes["600000"].status is QuoteStatus.PARTIAL
+    assert quotes["600000"].data_time == datetime(
+        2026, 7, 7, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+    )
+    assert quotes["000001"].status is QuoteStatus.FAILED
+    assert "tencent quote mapping failed" in quotes["000001"].warning
 
 
 def test_akshare_provider_sanitizes_fetch_failure_warning() -> None:
@@ -315,7 +414,7 @@ def test_akshare_provider_returns_partial_quote_when_name_is_missing_or_blank() 
         assert quotes[symbol].name == ""
         assert quotes[symbol].current_price in {10.5, 12.3}
         assert quotes[symbol].change_pct in {1.2, -0.5}
-        assert quotes[symbol].data_time == fetched_at
+        assert quotes[symbol].data_time is None
         assert quotes[symbol].fetched_at == fetched_at
         assert quotes[symbol].source == "akshare"
         assert "名称" in quotes[symbol].warning
@@ -343,7 +442,7 @@ def test_akshare_provider_returns_partial_quote_when_change_pct_is_missing_or_ba
         assert quotes[symbol].name in {"浦发银行", "平安银行"}
         assert quotes[symbol].current_price in {10.5, 12.3}
         assert quotes[symbol].change_pct is None
-        assert quotes[symbol].data_time == fetched_at
+        assert quotes[symbol].data_time is None
         assert quotes[symbol].fetched_at == fetched_at
         assert quotes[symbol].source == "akshare"
         assert "涨跌幅" in quotes[symbol].warning
@@ -367,7 +466,7 @@ def test_akshare_provider_combines_partial_warnings_when_name_and_change_pct_are
     assert quote.name == ""
     assert quote.current_price == 10.5
     assert quote.change_pct is None
-    assert quote.data_time == fetched_at
+    assert quote.data_time is None
     assert "名称" in quote.warning
     assert "涨跌幅" in quote.warning
 

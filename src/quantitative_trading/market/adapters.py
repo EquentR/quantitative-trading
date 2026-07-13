@@ -37,6 +37,10 @@ class IntradayProvider(Protocol):
     ) -> Sequence[MinuteBar]: ...
 
 
+class MarketProviderError(RuntimeError):
+    """External provider request failed before normalized mapping completed."""
+
+
 def _require_symbol(symbol: str) -> None:
     if len(symbol) != 6 or not symbol.isascii() or not symbol.isdigit():
         raise ValueError("symbol must contain six ASCII digits")
@@ -109,13 +113,16 @@ class AkShareDailyBarProvider(_AkShareAdapter):
         if start_date > end_date:
             raise ValueError("start_date must not exceed end_date")
         fetched_at = self._fetched_at()
-        frame = self._module().stock_zh_a_hist(
-            symbol=symbol,
-            period="daily",
-            start_date=start_date.strftime("%Y%m%d"),
-            end_date=end_date.strftime("%Y%m%d"),
-            adjust="qfq",
-        )
+        try:
+            frame = self._module().stock_zh_a_hist(
+                symbol=symbol,
+                period="daily",
+                start_date=start_date.strftime("%Y%m%d"),
+                end_date=end_date.strftime("%Y%m%d"),
+                adjust="qfq",
+            )
+        except Exception as exc:
+            raise MarketProviderError("daily market provider request failed") from exc
         bars: list[DailyBar] = []
         for _, row in frame.iterrows():
             trade_date = _date_value(row, "日期")
@@ -164,10 +171,13 @@ class AkShareMoneyFlowProvider(_AkShareAdapter):
         if start_date > end_date:
             raise ValueError("start_date must not exceed end_date")
         fetched_at = self._fetched_at()
-        frame = self._module().stock_individual_fund_flow(
-            stock=symbol,
-            market=_akshare_market(symbol),
-        )
+        try:
+            frame = self._module().stock_individual_fund_flow(
+                stock=symbol,
+                market=_akshare_market(symbol),
+            )
+        except Exception as exc:
+            raise MarketProviderError("money-flow provider request failed") from exc
         flows: list[DailyMoneyFlow] = []
         for _, row in frame.iterrows():
             trade_date = _date_value(row, "日期")
@@ -201,13 +211,16 @@ class AkShareIntradayProvider(_AkShareAdapter):
         if not self.calendar.is_trading_day(trade_date):
             raise ValueError("trade_date is not an XSHG trading day")
         fetched_at = self._fetched_at()
-        frame = self._module().stock_zh_a_hist_min_em(
-            symbol=symbol,
-            start_date=f"{trade_date.isoformat()} 09:30:00",
-            end_date=f"{trade_date.isoformat()} 15:00:00",
-            period="1",
-            adjust="",
-        )
+        try:
+            frame = self._module().stock_zh_a_hist_min_em(
+                symbol=symbol,
+                start_date=f"{trade_date.isoformat()} 09:30:00",
+                end_date=f"{trade_date.isoformat()} 15:00:00",
+                period="1",
+                adjust="",
+            )
+        except Exception as exc:
+            raise MarketProviderError("intraday market provider request failed") from exc
         bars: list[MinuteBar] = []
         for _, row in frame.iterrows():
             raw_minute = row["时间"]

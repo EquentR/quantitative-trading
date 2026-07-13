@@ -53,6 +53,7 @@ class NotificationService:
         *,
         dedup_key: str | None = None,
         now: datetime | None = None,
+        commit: bool = True,
     ) -> NotificationSummary:
         if dedup_key is not None:
             existing = self.repository.get_by_dedup_key(dedup_key)
@@ -65,7 +66,7 @@ class NotificationService:
             now=now,
         )
         try:
-            return self.repository.save(summary)
+            return self.repository.save(summary, commit=commit)
         except sqlite3.IntegrityError:
             if dedup_key is None:
                 raise

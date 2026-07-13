@@ -1,13 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useApiClient } from '@/api/client-provider'
-import { pageItems } from '@/api/pagination'
+import { fetchAllPages } from '@/api/pagination'
 import type {
   EmailConnectionTestResult,
   EmailDelivery,
   EmailNotificationSettings,
   EmailNotificationSettingsUpdate,
   EmailTestResult,
-  PaginatedResponse,
 } from '@/api/types'
 
 export const emailSettingsQueryKey = ['settings', 'notifications', 'email'] as const
@@ -59,8 +58,10 @@ export function useEmailDeliveriesQuery() {
   const client = useApiClient()
   return useQuery({
     queryKey: emailDeliveriesQueryKey,
-    queryFn: async () => pageItems(
-      await client.get<PaginatedResponse<EmailDelivery> | EmailDelivery[]>('/notifications/email-deliveries'),
+    queryFn: () => fetchAllPages<EmailDelivery>(
+      client,
+      '/notifications/email-deliveries',
+      { pageSize: 100 },
     ),
     refetchInterval: 30_000,
     retry: false,

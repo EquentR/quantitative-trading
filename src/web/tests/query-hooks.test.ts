@@ -1,4 +1,4 @@
-import { VueQueryPlugin, type VueQueryPluginOptions } from '@tanstack/vue-query'
+import { QueryClient, VueQueryPlugin, type VueQueryPluginOptions } from '@tanstack/vue-query'
 import { render, screen, waitFor } from '@testing-library/vue'
 import { createPinia } from 'pinia'
 import { defineComponent } from 'vue'
@@ -12,6 +12,7 @@ import { useRecommendationsQuery } from '@/queries/recommendations'
 import { useNotificationsQuery } from '@/queries/notifications'
 import { useAuditLogQuery } from '@/queries/audit'
 import { useFeedbackQuery } from '@/queries/feedback'
+import { notificationsQueryKey } from '@/queries/notifications'
 
 const queryPlugin: VueQueryPluginOptions = {}
 
@@ -130,6 +131,23 @@ test('通过 query hook 读取通知列表', async () => {
   render(Component, { global: { plugins: [createPinia(), [VueQueryPlugin, queryPlugin]] } })
 
   await waitFor(() => expect(screen.getByText('notif-001-unread')).toBeInTheDocument())
+})
+
+test('通知 query 使用独立短轮询周期', () => {
+  const queryClient = new QueryClient()
+  const Component = defineComponent({
+    setup() {
+      useNotificationsQuery()
+      return () => null
+    },
+  })
+  render(Component, {
+    global: { plugins: [createPinia(), [VueQueryPlugin, { queryClient }]] },
+  })
+
+  const options = queryClient.getQueryCache()
+    .find({ queryKey: notificationsQueryKey })?.options as { refetchInterval?: number } | undefined
+  expect(options?.refetchInterval).toBe(30_000)
 })
 
 test('通过 query hook 读取审计日志列表', async () => {

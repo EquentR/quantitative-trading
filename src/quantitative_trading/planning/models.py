@@ -57,6 +57,8 @@ class PlanSymbolContext(BaseModel):
     allowed_actions: list[PlanAction] = Field(default_factory=list)
     prohibited_actions: list[PlanAction] = Field(default_factory=list)
     position_constraint: dict[str, Any] = Field(default_factory=dict)
+    position_context: dict[str, Any] = Field(default_factory=dict)
+    account_context: dict[str, Any] = Field(default_factory=dict)
     risks: list[str] = Field(default_factory=list)
     invalid_if: list[str] = Field(default_factory=list)
     data_quality: PlanDataQuality = "degraded"
@@ -87,6 +89,8 @@ class MarketPlanSymbolInput(BaseModel):
     daily_feature_facts: dict[str, dict[str, Any]] = Field(default_factory=dict)
     market_structure: dict[str, Any]
     money_flow: dict[str, Any]
+    position_context: dict[str, Any] = Field(default_factory=dict)
+    account_context: dict[str, Any] = Field(default_factory=dict)
     data_quality: PlanDataQuality
     warnings: list[str] = Field(default_factory=list)
 

@@ -111,7 +111,7 @@ test('行情页消费 symbol query 并通过 router 导航到对应计划', asyn
   expect(router.currentRoute.value.query.plan_id).toBe('plan-20260713')
 })
 
-test('行情百分点字段直接展示后端百分点值而不重复乘以 100', async () => {
+test('行情百分点字段直接展示，持仓浮盈比例按 0-1 格式化', async () => {
   const user = userEvent.setup()
   server.use(
     http.get('/api/v1/market/symbols', () => HttpResponse.json({
@@ -123,7 +123,7 @@ test('行情百分点字段直接展示后端百分点值而不重复乘以 100'
     })),
     http.get('/api/v1/market/symbols/600000/overview', () => HttpResponse.json({
       ...mockMarketOverview,
-      position: { ...mockMarketOverview.position!, floating_pnl_pct: 6.5 },
+      position: { ...mockMarketOverview.position!, floating_pnl_pct: 0.065 },
     })),
     http.get('/api/v1/market/symbols/600000/money-flow', () => HttpResponse.json({
       ...mockMoneyFlow,
@@ -147,6 +147,20 @@ test('行情百分点字段直接展示后端百分点值而不重复乘以 100'
       .find((option) => option.series?.some((series: { name?: string }) => series.name === '主力净占比'))
     expect(moneyOption.yAxis[1].axisLabel.formatter(5.2)).toBe('5%')
   })
+})
+
+test('强弱组件失败时仍保留分钟行情图', async () => {
+  const user = userEvent.setup()
+  server.use(
+    http.get('/api/v1/market/symbols/600000/intraday-strength/latest', () =>
+      HttpResponse.json({ error: { code: 'strength_unavailable' } }, { status: 503 }),
+    ),
+  )
+  await renderMarket()
+
+  await user.click(await screen.findByRole('tab', { name: '分时强弱' }))
+  expect(await screen.findByText('强弱组件加载失败，分钟行情仍可查看')).toBeInTheDocument()
+  expect(screen.getByRole('img', { name: '分时价格、VWAP 与成交量图' })).toBeInTheDocument()
 })
 
 test('K线、资金流、分时图和数据引用标签读取后端事实并保持稳定图表容器', async () => {

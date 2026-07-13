@@ -18,8 +18,11 @@ from quantitative_trading.email.outbox import (
 )
 from quantitative_trading.email.repository import SmtpSettingsRepository
 from quantitative_trading.email.service import SmtpSettingsService
+from quantitative_trading.market.adapters import MarketProviderError
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
+    CaptureDataset,
+    CaptureResultStatus,
     CaptureRunStatus,
     DailyBar,
     DailyMoneyFlow,
@@ -27,6 +30,7 @@ from quantitative_trading.market.models import (
     MinuteBar,
     QuoteSnapshot,
     QuoteStatus,
+    MarketCaptureResult,
 )
 from quantitative_trading.market.repositories import (
     MarketCaptureResultRepository,
@@ -40,6 +44,7 @@ from quantitative_trading.notification.models import (
 from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.planning.repository import TradingPlanRepository
 from quantitative_trading.storage.sqlite import connect, migrate
+from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
 from tests.planning_fixtures import persist_test_plan
 
 
@@ -322,6 +327,74 @@ def test_service_run_command_is_registered(tmp_path) -> None:
     assert "unified http api" in result.output.lower()
 
 
+def test_service_status_reports_persisted_scheduler_state_in_human_and_json(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    started_at = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
+    finished_at = datetime(2026, 7, 14, 2, 1, tzinfo=UTC)
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = SchedulerStateRepository(connection)
+        repository.set_enabled(
+            True,
+            interval_seconds=180,
+            run_on_start=False,
+            now=started_at,
+        )
+        repository.record_result(
+            started_at=started_at,
+            finished_at=finished_at,
+            status="degraded",
+            reason="scheduled_intraday",
+            error="minute data incomplete",
+            snapshot_id=17,
+            task_type="intraday",
+            plan_id="plan-20260714-v1",
+            recommendation_ids=["rec-1"],
+            now=finished_at,
+        )
+
+    human = run_cli(tmp_path, "service", "status")
+    machine = run_cli(tmp_path, "service", "status", "--json")
+
+    assert human.exit_code == machine.exit_code == 0
+    assert "scheduler_enabled=true" in human.output
+    assert "last_task_type=intraday" in human.output
+    assert "last_status=degraded" in human.output
+    assert "last_snapshot_id=17" in human.output
+    payload = json.loads(machine.output)
+    assert payload == {
+        "scheduler_enabled": True,
+        "interval_seconds": 180,
+        "run_on_start": False,
+        "last_started_at": started_at.isoformat(),
+        "last_finished_at": finished_at.isoformat(),
+        "last_status": "degraded",
+        "last_reason": "scheduled_intraday",
+        "last_error": "minute data incomplete",
+        "last_snapshot_id": 17,
+        "last_task_type": "intraday",
+        "last_plan_id": "plan-20260714-v1",
+        "last_recommendation_ids": ["rec-1"],
+        "overrun_count": 0,
+        "skipped_count": 0,
+        "updated_at": finished_at.isoformat(),
+    }
+
+
+def test_service_status_does_not_create_database_when_missing(tmp_path) -> None:
+    database_path = tmp_path / "ledger.db"
+
+    human = run_cli(tmp_path, "service", "status")
+    machine = run_cli(tmp_path, "service", "status", "--json")
+
+    assert human.exit_code == machine.exit_code == 0
+    assert "scheduler_state=missing" in human.output
+    assert json.loads(machine.output) == {"scheduler_state": "missing"}
+    assert not database_path.exists()
+
+
 def test_service_run_starts_api_service(monkeypatch, tmp_path) -> None:
     starts = []
 
@@ -353,7 +426,7 @@ def test_service_run_starts_api_service(monkeypatch, tmp_path) -> None:
     ]
 
 
-def test_service_run_once_outputs_status_and_writes_log(tmp_path) -> None:
+def test_service_debug_run_is_retired_without_writing_log(tmp_path) -> None:
     log_dir = tmp_path / "logs"
 
     result = run_cli(
@@ -364,48 +437,16 @@ def test_service_run_once_outputs_status_and_writes_log(tmp_path) -> None:
         env={"QT_LOG_DIR": str(log_dir)},
     )
 
-    assert result.exit_code == 0
-    assert "status=cash_not_initialized" in result.output
-    log_path = log_dir / "account-snapshots.jsonl"
-    payload = json.loads(log_path.read_text(encoding="utf-8"))
-    assert payload["reason"] == "startup"
-    assert payload["snapshot"]["status"] == "cash_not_initialized"
-    assert payload["snapshot"]["warnings"] == ["cash account not initialized"]
+    assert result.exit_code != 0
+    assert "qt workflow intraday" in result.output
+    assert not (log_dir / "account-snapshots.jsonl").exists()
 
 
-def test_service_run_polling_passes_interval_timezone_and_uses_snapshot_factory(
+def test_service_debug_run_does_not_start_legacy_runner(
     monkeypatch,
     tmp_path,
 ) -> None:
-    starts = []
-    reasons = []
-    factory_statuses = []
-
-    class FakeDebugServiceRunner:
-        def __init__(
-            self, *, snapshot_factory, account_service=None, log_dir=None
-        ) -> None:
-            assert account_service is None
-            self.snapshot_factory = snapshot_factory
-            self.log_dir = log_dir
-
-        def run_once(self, *, reason: str):
-            reasons.append(reason)
-            snapshot = self.snapshot_factory()
-            factory_statuses.append(snapshot.status.value)
-            return snapshot
-
-        def start(self, *, interval_seconds: int, timezone: str) -> None:
-            starts.append(
-                {
-                    "interval_seconds": interval_seconds,
-                    "timezone": timezone,
-                }
-            )
-            snapshot = self.snapshot_factory()
-            factory_statuses.append(snapshot.status.value)
-
-    monkeypatch.setattr(cli, "DebugServiceRunner", FakeDebugServiceRunner)
+    del monkeypatch
 
     result = run_cli(
         tmp_path,
@@ -417,12 +458,8 @@ def test_service_run_polling_passes_interval_timezone_and_uses_snapshot_factory(
         },
     )
 
-    assert result.exit_code == 0
-    assert "debug service started status=cash_not_initialized" in result.output
-    assert "debug service polling interval=7s timezone=Asia/Shanghai" in result.output
-    assert reasons == ["startup"]
-    assert factory_statuses == ["cash_not_initialized", "cash_not_initialized"]
-    assert starts == [{"interval_seconds": 7, "timezone": "Asia/Shanghai"}]
+    assert result.exit_code != 0
+    assert "qt workflow intraday" in result.output
 
 
 def test_cash_init_show_and_transfer_commands(tmp_path) -> None:
@@ -638,23 +675,7 @@ def test_cash_transactions_limit_uses_repository_order(tmp_path) -> None:
     assert "cash_after=51000.00" in lines[1]
 
 
-def test_account_snapshot_reports_cash_not_initialized(tmp_path) -> None:
-    result = run_cli(tmp_path, "account", "snapshot")
-
-    assert result.exit_code == 0
-    assert "cash_not_initialized" in result.output
-
-
-def test_account_snapshot_json_outputs_status(tmp_path) -> None:
-    result = run_cli(tmp_path, "account", "snapshot", "--json")
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["status"] == "cash_not_initialized"
-    assert payload["warnings"] == ["cash account not initialized"]
-
-
-def test_account_snapshot_with_position_uses_configured_akshare_provider(
+def test_account_snapshot_is_retired_without_calling_market_provider(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -679,71 +700,11 @@ def test_account_snapshot_with_position_uses_configured_akshare_provider(
     monkeypatch.setattr(
         cli, "AkShareMarketProvider", FakeAkShareProvider, raising=False
     )
-    run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
-    add_result = run_cli(
-        tmp_path,
-        "ledger",
-        "add",
-        "--symbol",
-        "600000",
-        "--name",
-        "娴﹀彂閾惰",
-        "--quantity",
-        "1000",
-        "--available-quantity",
-        "800",
-        "--cost-price",
-        "9.5",
-        "--opened-at",
-        "2026-07-06",
-    )
-
     result = run_cli(tmp_path, "account", "snapshot", "--json")
 
-    assert add_result.exit_code == 0
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["status"] == "ok"
-    assert payload["market_value"] == 10500
-    assert payload["position_cost"] == 9500
-    assert payload["floating_pnl"] == 1000
-    assert payload["total_assets"] == 60500
-    assert payload["total_pnl"] == 10500
-    assert payload["positions"][0]["current_price"] == 10.5
-    assert FakeAkShareProvider.calls == [["600000"]]
-
-
-def test_account_snapshot_with_market_fetch_disabled_reports_warning(tmp_path) -> None:
-    run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
-    add_result = run_cli(
-        tmp_path,
-        "ledger",
-        "add",
-        "--symbol",
-        "600000",
-        "--name",
-        "娴﹀彂閾惰",
-        "--quantity",
-        "1000",
-        "--available-quantity",
-        "800",
-        "--cost-price",
-        "9.5",
-        "--opened-at",
-        "2026-07-06",
-    )
-
-    result = run_cli(
-        tmp_path,
-        "account",
-        "snapshot",
-        env={"QT_ENABLE_MARKET_FETCH": "false"},
-    )
-
-    assert add_result.exit_code == 0
-    assert result.exit_code == 0
-    assert "market_data_unavailable" in result.output
-    assert "market fetch disabled" in result.output
+    assert result.exit_code != 0
+    assert "qt workflow intraday" in result.output
+    assert FakeAkShareProvider.calls == []
 
 
 def test_market_snapshot_captures_decision_enabled_symbols(
@@ -939,7 +900,7 @@ def test_recommendation_scan_retirement_has_no_traceback(tmp_path) -> None:
     assert "Traceback" not in scan_result.output
 
 
-def test_service_run_once_uses_configured_akshare_provider(
+def test_retired_service_debug_run_does_not_use_configured_akshare_provider(
     monkeypatch, tmp_path
 ) -> None:
     class FakeAkShareProvider:
@@ -991,13 +952,10 @@ def test_service_run_once_uses_configured_akshare_provider(
         env={"QT_LOG_DIR": str(log_dir)},
     )
 
-    assert result.exit_code == 0
-    assert "debug service started status=ok" in result.output
-    log_path = log_dir / "account-snapshots.jsonl"
-    payload = json.loads(log_path.read_text(encoding="utf-8"))
-    assert payload["snapshot"]["status"] == "ok"
-    assert payload["snapshot"]["market_value"] == 10500
-    assert FakeAkShareProvider.calls == [["600000"]]
+    assert result.exit_code != 0
+    assert "qt workflow intraday" in result.output
+    assert not (log_dir / "account-snapshots.jsonl").exists()
+    assert FakeAkShareProvider.calls == []
 
 
 def test_services_closes_connection_when_migrate_fails(monkeypatch) -> None:
@@ -1347,6 +1305,17 @@ def test_market_runs_lists_latest_run_with_limit_and_json(tmp_path) -> None:
                     processed_symbols=1,
                 )
             )
+        MarketCaptureResultRepository(connection).upsert(
+            MarketCaptureResult(
+                run_id="run-1",
+                symbol="600000",
+                dataset=CaptureDataset.DAILY_BAR,
+                status=CaptureResultStatus.DEGRADED,
+                fetched_at=datetime(2026, 7, 13, 7, 1, tzinfo=UTC),
+                source="fake",
+                warning="short window",
+            )
+        )
 
     result = run_cli(tmp_path, "market", "runs", "--limit", "1", "--json")
 
@@ -1355,6 +1324,17 @@ def test_market_runs_lists_latest_run_with_limit_and_json(tmp_path) -> None:
     assert payload["count"] == 1
     assert payload["runs"][0]["run_id"] == "run-1"
     assert payload["runs"][0]["status"] == "succeeded"
+    assert payload["runs"][0]["dataset_counts"] == {
+        "daily_bar": {
+            "complete": 0,
+            "degraded": 1,
+            "failed": 0,
+            "stale": 0,
+        }
+    }
+
+    human = run_cli(tmp_path, "market", "runs", "--limit", "1")
+    assert "daily_bar=complete:0,degraded:1,failed:0,stale:0" in human.output
 
 
 def test_market_backfill_failure_is_sanitized_without_database_path(
@@ -1452,7 +1432,7 @@ def test_market_backfill_provider_failures_persist_failed_run_and_safe_errors(
             pass
 
         def get_daily_bars(self, *args, **kwargs):
-            raise RuntimeError(
+            raise MarketProviderError(
                 "daily failed token=synthetic-token-secret at /tmp/private-market.csv"
             )
 
@@ -1461,7 +1441,7 @@ def test_market_backfill_provider_failures_persist_failed_run_and_safe_errors(
             pass
 
         def get_daily_money_flow(self, *args, **kwargs):
-            raise RuntimeError(
+            raise MarketProviderError(
                 "flow failed password=synthetic-password at /tmp/private-flow.csv"
             )
 
@@ -1786,6 +1766,27 @@ def test_workflow_intraday_cli_uses_shared_decision_workflow(
     assert calls == ["intraday"]
     assert "run_id=intraday-20260714-1000" in result.output
     assert "recommendations=1" in result.output
+
+
+def test_plan_read_command_supports_json(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    plan = persist_test_plan(settings, trading_day=date(2026, 7, 14))
+
+    latest = run_cli(tmp_path, "plan", "latest", "--json")
+
+    assert latest.exit_code == 0
+    assert json.loads(latest.output)["plan_id"] == plan.plan_id
+
+
+def test_empty_plan_and_recommendation_json_commands_return_stable_empty_values(
+    tmp_path,
+) -> None:
+    latest = run_cli(tmp_path, "plan", "latest", "--json")
+    listed = run_cli(tmp_path, "recommendations", "list", "--json")
+
+    assert latest.exit_code == listed.exit_code == 0
+    assert json.loads(latest.output) is None
+    assert json.loads(listed.output) == []
 
 
 def test_workflow_close_cli_requires_reason_for_calendar_override_and_audits(

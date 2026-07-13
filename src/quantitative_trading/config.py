@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +14,16 @@ class Settings(BaseSettings):
     market_provider: str = Field(default="akshare")
     intraday_interval_seconds: int = Field(default=180, ge=1)
     market_stale_trading_minutes: int = Field(default=6, ge=1, le=60)
+    market_strength_rule_version: str = Field(default="intraday-strength-v1", min_length=1)
+    market_strength_previous_close_pct: float = Field(default=0.5, gt=0)
+    market_strength_open_pct: float = Field(default=0.3, gt=0)
+    market_strength_vwap_pct: float = Field(default=0.2, gt=0)
+    market_strength_momentum_5_pct: float = Field(default=0.3, gt=0)
+    market_strength_momentum_15_pct: float = Field(default=0.6, gt=0)
+    market_strength_position_high: float = Field(default=0.70, ge=0, le=1)
+    market_strength_position_low: float = Field(default=0.30, ge=0, le=1)
+    market_strength_volume_high: float = Field(default=1.5, gt=0)
+    market_strength_volume_low: float = Field(default=0.8, ge=0)
     timezone: str = Field(default="Asia/Shanghai")
     enable_market_fetch: bool = Field(default=True)
     api_host: str = Field(default="0.0.0.0")
@@ -32,6 +42,14 @@ class Settings(BaseSettings):
         if isinstance(value, str) and value.strip() == "":
             return None
         return value
+
+    @model_validator(mode="after")
+    def strength_threshold_ranges_must_be_ordered(self) -> "Settings":
+        if self.market_strength_position_high <= self.market_strength_position_low:
+            raise ValueError("strength position high must exceed position low")
+        if self.market_strength_volume_high <= self.market_strength_volume_low:
+            raise ValueError("strength volume high must exceed volume low")
+        return self
 
 
 def load_settings() -> Settings:

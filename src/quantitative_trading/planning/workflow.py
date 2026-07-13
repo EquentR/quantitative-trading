@@ -81,6 +81,8 @@ def build_market_trading_plan(
                 "max_total_position_ratio": 0.80,
                 "max_daily_new_buy_ratio": 0.20,
             },
+            position_context=dict(item.position_context),
+            account_context=dict(item.account_context),
             risks=["市场数据可能延迟", "盘中风险信号可以覆盖收盘计划"],
             invalid_if=symbol_invalid_if,
             data_quality=item.data_quality,
@@ -94,7 +96,7 @@ def build_market_trading_plan(
 
     plan_quality = (
         "complete"
-        if all(item.data_quality == "complete" for item in symbols)
+        if symbols and all(item.data_quality == "complete" for item in symbols)
         else "degraded"
     )
     return TradingPlan(

@@ -199,6 +199,7 @@ class _DatasetSnapshotRepository(Generic[SnapshotT, MemberT]):
         if snapshot.row_count != len(member_ids):
             raise sqlite3.IntegrityError("snapshot row_count does not match members")
         rows = []
+        facts: list[DailyBar | DailyMoneyFlow] = []
         for member_id in member_ids:
             row = self.connection.execute(
                 f"SELECT symbol, payload_json FROM {self.fact_table} WHERE id=?", (member_id,)
@@ -206,6 +207,24 @@ class _DatasetSnapshotRepository(Generic[SnapshotT, MemberT]):
             if row is None or row["symbol"] != snapshot.symbol:
                 raise sqlite3.IntegrityError("snapshot member symbol mismatch")
             rows.append(row)
+            model = DailyBar if self.fact_table == "daily_bars" else DailyMoneyFlow
+            facts.append(model.model_validate_json(row["payload_json"]))
+        dates = [fact.trade_date for fact in facts]
+        if dates != sorted(dates) or len(dates) != len(set(dates)):
+            raise sqlite3.IntegrityError("snapshot member order is invalid")
+        expected_start = None if not dates else dates[0]
+        expected_end = None if not dates else dates[-1]
+        if snapshot.data_start != expected_start or snapshot.data_end != expected_end:
+            raise sqlite3.IntegrityError("snapshot range does not match members")
+        hashes = [fact.content_hash for fact in facts]
+        if snapshot.content_digest != content_digest(hashes):
+            raise sqlite3.IntegrityError("snapshot content digest does not match members")
+        if isinstance(snapshot, HistorySnapshot) and any(
+            fact.adjustment != snapshot.adjustment
+            for fact in facts
+            if isinstance(fact, DailyBar)
+        ):
+            raise sqlite3.IntegrityError("history snapshot adjustment mismatch")
         started_transaction = not self.connection.in_transaction
         if started_transaction:
             self.connection.execute("BEGIN")
@@ -437,6 +456,9 @@ class MarketCaptureRunRepository:
             existing = self._get_by_idempotency_key(run.idempotency_key)
             if existing is not None:
                 return existing, False
+            active = self.active_for_workflow(run.workflow_type)
+            if active is not None:
+                raise CaptureRunAlreadyActiveError(active.run_id) from None
             raise
         return (
             run.model_copy(
@@ -450,6 +472,38 @@ class MarketCaptureRunRepository:
             "SELECT * FROM market_capture_runs WHERE run_id=?", (run_id,)
         ).fetchone()
         return None if row is None else self._from_row(row)
+
+    def active_for_workflow(self, workflow_type: str) -> MarketCaptureRun | None:
+        row = self.connection.execute(
+            """SELECT * FROM market_capture_runs
+               WHERE workflow_type=? AND status='running'
+               ORDER BY started_at DESC LIMIT 1""",
+            (workflow_type,),
+        ).fetchone()
+        return None if row is None else self._from_row(row)
+
+    def fail_expired_workflow_runs(
+        self,
+        workflow_type: str,
+        *,
+        started_before: datetime,
+        finished_at: datetime,
+    ) -> int:
+        error_summary = f"{workflow_type} run lease expired before retry"
+        cursor = self.connection.execute(
+            """UPDATE market_capture_runs SET
+                 status='failed', finished_at=?, failure_count=failure_count+1,
+                 error_summary=?
+               WHERE workflow_type=? AND status='running' AND started_at <= ?""",
+            (
+                finished_at.isoformat(),
+                error_summary,
+                workflow_type,
+                started_before.isoformat(),
+            ),
+        )
+        self.connection.commit()
+        return cursor.rowcount
 
     def update(self, run: MarketCaptureRun) -> None:
         cursor = self.connection.execute(
@@ -538,6 +592,31 @@ class MarketCaptureRunRepository:
         )
         self.connection.commit()
         return self.get(run_id) if cursor.rowcount == 1 else None
+
+    def fail_expired_intraday_runs(
+        self,
+        *,
+        period_ended_by: datetime,
+        lease_started_before: datetime,
+        finished_at: datetime,
+    ) -> int:
+        error_summary = "intraday run lease expired before the next intraday period"
+        cursor = self.connection.execute(
+            """UPDATE market_capture_runs SET
+                 status='failed', finished_at=?, failure_count=failure_count+1,
+                 error_summary=?
+               WHERE workflow_type='intraday' AND status='running'
+                 AND period_end IS NOT NULL AND period_end <= ?
+                 AND started_at <= ?""",
+            (
+                finished_at.isoformat(),
+                error_summary,
+                period_ended_by.isoformat(),
+                lease_started_before.isoformat(),
+            ),
+        )
+        self.connection.commit()
+        return cursor.rowcount
 
     def _get_by_idempotency_key(self, key: str) -> MarketCaptureRun | None:
         row = self.connection.execute(

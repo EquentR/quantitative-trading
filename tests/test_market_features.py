@@ -181,6 +181,48 @@ def test_intraday_strength_degrades_below_four_direction_components() -> None:
     assert snapshot.confidence is StrengthConfidence.LOW
     assert snapshot.degraded is True
     assert len([component for component in snapshot.components if component.available]) < 4
+    volume_ratio = next(
+        component for component in snapshot.components if component.name == "minute_volume_ratio"
+    )
+    assert volume_ratio.available is False
+    assert volume_ratio.direction == 0
+    assert "25" in volume_ratio.reason
+
+
+def test_intraday_strength_volume_ratio_zero_baseline_has_explainable_component() -> None:
+    bars = minute_series(rising=True, volume_spike=False)[:25]
+    bars = [
+        bar.model_copy(update={"volume": 0.0, "amount": 0.0})
+        if index < 20
+        else bar
+        for index, bar in enumerate(bars)
+    ]
+    quote = QuoteSnapshot(
+        symbol="600000",
+        previous_close=9.9,
+        current_price=bars[-1].close,
+        data_time=bars[-1].minute,
+        fetched_at=FETCHED_AT,
+        source="fake",
+        status=QuoteStatus.PARTIAL,
+        warning="optional fields unavailable",
+    )
+
+    snapshot = calculate_intraday_strength(
+        "run-zero-volume",
+        quote,
+        bars,
+        XSHGTradingCalendar(),
+        fetched_at=FETCHED_AT,
+    )
+
+    volume_ratio = next(
+        component for component in snapshot.components if component.name == "minute_volume_ratio"
+    )
+    assert snapshot.minute_volume_ratio is None
+    assert volume_ratio.available is False
+    assert volume_ratio.direction == 0
+    assert "zero" in volume_ratio.reason.lower()
 
 
 def test_daily_features_mark_insufficient_windows_and_zero_volume_unavailable() -> None:

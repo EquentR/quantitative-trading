@@ -426,6 +426,7 @@ export const mockMarketTrace: MarketSnapshotTrace = {
   snapshot_id: 'snapshot-101',
   plan_id: 'plan-20260713',
   recommendation_id: 'rec-600000-001',
+  audit_id: 'audit-001',
   data_time: '2026-07-13T10:21:00+08:00',
   fetched_at: '2026-07-13T10:22:00+08:00',
   status: 'partial',
@@ -521,7 +522,6 @@ export const handlers = [
   http.post('/api/v1/service/scheduler/stop', () =>
     HttpResponse.json({ ...mockServiceStatus, scheduler_enabled: false, scheduler_running: false }),
   ),
-  http.post('/api/v1/service/run-once', () => HttpResponse.json({ ...mockServiceStatus, last_snapshot_id: 2 })),
   http.post('/api/v1/auth/setup-password', () => HttpResponse.json({ auth_status: 'configured' })),
   http.post('/api/v1/auth/login', () =>
     HttpResponse.json({
@@ -550,9 +550,6 @@ export const handlers = [
   http.post('/api/v1/cash/adjustments', () => HttpResponse.json(mockCashAccount)),
   http.get('/api/v1/cash/transactions', () => HttpResponse.json(mockCashTransactions)),
   http.get('/api/v1/account/snapshots/latest', () => HttpResponse.json(mockAccountSnapshot)),
-  http.post('/api/v1/account/snapshots', () =>
-    HttpResponse.json({ snapshot_id: 2, snapshot: mockAccountSnapshot }, { status: 201 }),
-  ),
   http.get('/api/v1/watchlist/pinned', () => HttpResponse.json(mockWatchPinned)),
   http.post('/api/v1/watchlist/pinned', async ({ request }) =>
     HttpResponse.json(await request.json(), { status: 201 }),

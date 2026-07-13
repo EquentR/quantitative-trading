@@ -48,10 +48,6 @@ class LocalAlertDispatcher:
             configured_secret_texts=self.configured_secret_texts,
         )
         dedup_key = f"notification:system-alert:{sanitized_alert_key}"
-        existing = self.notification_service.get_by_dedup_key(dedup_key)
-        if existing is not None:
-            return existing
-
         sanitized_message = sanitize_sensitive_data(
             message,
             configured_secret_texts=self.configured_secret_texts,
@@ -60,23 +56,30 @@ class LocalAlertDispatcher:
             details or {},
             configured_secret_texts=self.configured_secret_texts,
         )
-        audit = audit_ref or self.audit_service.record_event(
-            event_type=event_type,
-            recommendation_id=None,
-            payload={
-                "alert_key": sanitized_alert_key,
-                "message": sanitized_message,
-                "details": sanitized_details,
-            },
-            now=dispatched_at,
-        )
-        summary = self.notification_service.create_system_alert(
-            alert_key=sanitized_alert_key,
-            message=sanitized_message,
-            audit_ref=audit,
-            dedup_key=dedup_key,
-            now=dispatched_at,
-        )
+        existing = self.notification_service.get_by_dedup_key(dedup_key)
+        if existing is not None:
+            audit = self.audit_service.get(existing.audit_id)
+            if audit is None:
+                raise RuntimeError("system alert audit reference is missing")
+            summary = existing
+        else:
+            audit = audit_ref or self.audit_service.record_event(
+                event_type=event_type,
+                recommendation_id=None,
+                payload={
+                    "alert_key": sanitized_alert_key,
+                    "message": sanitized_message,
+                    "details": sanitized_details,
+                },
+                now=dispatched_at,
+            )
+            summary = self.notification_service.create_system_alert(
+                alert_key=sanitized_alert_key,
+                message=sanitized_message,
+                audit_ref=audit,
+                dedup_key=dedup_key,
+                now=dispatched_at,
+            )
         LOGGER.error(
             "system_alert event_type=%s alert_key=%s notification_id=%s message=%s",
             event_type,

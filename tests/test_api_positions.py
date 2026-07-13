@@ -1,10 +1,15 @@
 import csv
+import logging
 from io import StringIO
 
 from fastapi.testclient import TestClient
 
+import quantitative_trading.api.app as api_app
 from quantitative_trading.api.app import create_app
+from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.config import Settings
+from quantitative_trading.ledger.repository import PositionRepository
+from quantitative_trading.storage.sqlite import connect
 
 
 def authenticated_client(tmp_path) -> tuple[TestClient, dict[str, str]]:
@@ -54,6 +59,61 @@ def test_positions_crud(tmp_path) -> None:
     assert update_response.json()["quantity"] == 1200
     assert delete_response.status_code == 204
     assert empty_response.json() == []
+    with connect(Settings(database_path=tmp_path / "api.db")) as connection:
+        write_audits = AuditLogRepository(connection).list(
+            event_type="api.write.succeeded",
+            limit=20,
+        )
+    operations = [item.payload["operation"] for item in write_audits]
+    assert operations.count("create_position") == 1
+    assert operations.count("update_position") == 1
+    assert operations.count("delete_position") == 1
+    assert all("body" not in item.payload for item in write_audits)
+
+
+def test_success_audit_failure_does_not_replace_committed_api_response(
+    tmp_path,
+    monkeypatch,
+    caplog,
+) -> None:
+    settings = Settings(database_path=tmp_path / "audit-failure.db")
+    client = TestClient(create_app(settings), raise_server_exceptions=False)
+    client.post(
+        "/api/v1/auth/setup-password",
+        json={"password": "local-password"},
+    )
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"password": "local-password"},
+    )
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    class FailingAuditService:
+        def __init__(self, repository) -> None:  # noqa: ANN001
+            del repository
+
+        def record_event(self, **kwargs) -> None:  # noqa: ANN003
+            del kwargs
+            raise RuntimeError(
+                "audit unavailable token=synthetic-secret /tmp/private.db"
+            )
+
+    monkeypatch.setattr(api_app, "AuditService", FailingAuditService)
+    caplog.set_level(logging.WARNING, logger="quantitative_trading.api.app")
+
+    response = client.post(
+        "/api/v1/positions",
+        json=position_payload(),
+        headers=headers,
+    )
+
+    with connect(settings) as connection:
+        saved = PositionRepository(connection).get("600000")
+    assert response.status_code == 201
+    assert saved is not None
+    assert "api success audit failed" in caplog.text
+    assert "synthetic-secret" not in caplog.text
+    assert "/tmp/private.db" not in caplog.text
 
 
 def test_positions_preserve_three_decimal_cost_price(tmp_path) -> None:

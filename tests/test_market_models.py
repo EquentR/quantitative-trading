@@ -249,13 +249,27 @@ def test_ok_quote_requires_price_and_data_time(missing_field: str) -> None:
         QuoteSnapshot.model_validate(payload)
 
 
-@pytest.mark.parametrize("overrides", [{"current_price": None}, {"data_time": None}, {"warning": ""}])
+@pytest.mark.parametrize("overrides", [{"current_price": None}, {"warning": ""}])
 def test_partial_quote_requires_price_data_time_and_warning(overrides: dict[str, object]) -> None:
     payload = valid_quote_payload(status="partial", warning="missing name")
     payload.update(overrides)
 
     with pytest.raises(ValidationError):
         QuoteSnapshot.model_validate(payload)
+
+
+def test_partial_quote_allows_unknown_market_time_without_using_fetch_time() -> None:
+    payload = valid_quote_payload(
+        status="partial",
+        warning="market source time unavailable",
+    )
+    payload["data_time"] = None
+
+    quote = QuoteSnapshot.model_validate(payload)
+
+    assert quote.current_price is not None
+    assert quote.data_time is None
+    assert quote.fetched_at is not None
 
 
 @pytest.mark.parametrize("overrides", [{"current_price": None}, {"data_time": None}, {"warning": ""}])

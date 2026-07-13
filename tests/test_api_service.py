@@ -81,8 +81,8 @@ def test_configured_public_status_hides_scheduler_and_last_error(
 
     response = client.get("/api/v1/service/status")
 
-    assert run_response.status_code == 200
-    assert run_response.json()["last_error"]
+    assert run_response.status_code == 410
+    assert run_response.json()["error"]["code"] == "service_run_once_retired"
     assert response.status_code == 200
     assert response.json() == {"auth_status": "configured"}
 
@@ -174,13 +174,10 @@ def test_create_app_restores_enabled_scheduler(tmp_path) -> None:
     assert status.json()["scheduler_running"] is True
 
 
-def test_run_api_service_records_startup_scheduler_result(
+def test_run_api_service_records_startup_intraday_workflow_result(
     tmp_path, monkeypatch
 ) -> None:
     import quantitative_trading.runtime.service_app as service_app
-
-    class CreatedSnapshot:
-        snapshot_id = 42
 
     class FakeSchedulerManager:
         def __init__(self, *, interval_seconds, timezone, job) -> None:
@@ -203,7 +200,7 @@ def test_run_api_service_records_startup_scheduler_result(
             return True
 
     schedulers = []
-    snapshot_calls = []
+    workflow_calls = []
     uvicorn_calls = []
     settings = Settings(
         database_path=tmp_path / "api.db",
@@ -222,19 +219,26 @@ def test_run_api_service_records_startup_scheduler_result(
             now=datetime.now(UTC),
         )
 
-    def fake_create_and_save_account_snapshot(received_settings):
-        snapshot_calls.append(received_settings.database_path)
-        return CreatedSnapshot()
-
     def fake_uvicorn_run(app, *, host: str, port: int) -> None:
         uvicorn_calls.append({"app": app, "host": host, "port": port})
 
     monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
-    monkeypatch.setattr(service_app, "_startup_recovery_reason", lambda now: "startup")
+    monkeypatch.setattr(
+        service_app, "_startup_recovery_reason", lambda now: "intraday_decision"
+    )
     monkeypatch.setattr(
         service_app,
-        "create_and_save_account_snapshot",
-        fake_create_and_save_account_snapshot,
+        "_run_scheduler_task",
+        lambda received_settings, reason: (
+            workflow_calls.append((received_settings.database_path, reason))
+            or service_app.SchedulerJobResult(
+                task_type="intraday",
+                reason="intraday_completed",
+                snapshot_id=42,
+                recommendation_ids=["rec-1"],
+                run_id="intraday-20260714-1000",
+            )
+        ),
     )
     monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
 
@@ -249,10 +253,12 @@ def test_run_api_service_records_startup_scheduler_result(
 
     assert schedulers[0]["interval_seconds"] == 7
     assert schedulers[0]["timezone"] == "Asia/Shanghai"
-    assert snapshot_calls == [settings.database_path]
+    assert workflow_calls == [(settings.database_path, "intraday_decision")]
     assert state.last_status == "success"
-    assert state.last_reason == "startup"
+    assert state.last_reason == "intraday_completed"
+    assert state.last_task_type == "intraday"
     assert state.last_snapshot_id == 42
+    assert state.last_recommendation_ids == ["rec-1"]
     assert uvicorn_calls[0]["host"] == "127.0.0.1"
     assert uvicorn_calls[0]["port"] == 8123
 
@@ -307,6 +313,71 @@ def test_run_api_service_alerts_and_records_scheduler_overrun(
     assert alerts[0]["reason"] == "scheduler_overrun:decision_intraday"
     assert alerts[0]["event_type"] == "workflow.overrun"
     assert "already running" in alerts[0]["error"]
+
+
+def test_run_api_service_alerts_when_workflow_returns_failed_status(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    captured_jobs = []
+    alerts = []
+
+    class FakeSchedulerManager:
+        def __init__(self, *, interval_seconds, timezone, job) -> None:
+            del interval_seconds, timezone
+            captured_jobs.append(job)
+            self.is_running = False
+            self.next_run_time = None
+
+        def start(self) -> bool:
+            self.is_running = True
+            return True
+
+        def stop(self) -> bool:
+            self.is_running = False
+            return True
+
+    settings = Settings(
+        database_path=tmp_path / "failed-result.db",
+        enable_market_fetch=False,
+    )
+    monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
+    monkeypatch.setattr(service_app.uvicorn, "run", lambda app, *, host, port: None)
+    monkeypatch.setattr(
+        service_app,
+        "_run_scheduler_task",
+        lambda settings, reason: service_app.SchedulerJobResult(
+            task_type="intraday",
+            reason="intraday_completed",
+            status="failed",
+            error="all requested quotes unavailable",
+            recommendation_ids=[],
+        ),
+    )
+    monkeypatch.setattr(
+        service_app,
+        "_dispatch_runtime_alert",
+        lambda settings, **kwargs: alerts.append(kwargs),
+    )
+
+    service_app.run_api_service(settings)
+    captured_jobs[0]("intraday_decision")
+
+    with connect(settings) as connection:
+        state = SchedulerStateRepository(connection).get()
+    assert state is not None
+    assert state.last_status == "failed"
+    assert state.last_task_type == "intraday"
+    assert alerts == [
+        {
+            "reason": "intraday_completed",
+            "error": "all requested quotes unavailable",
+            "now": state.last_started_at,
+            "event_type": "workflow.failed",
+        }
+    ]
 
 
 def test_run_api_service_maps_external_workflow_concurrency_to_overrun(
@@ -408,12 +479,8 @@ def test_run_api_service_recovers_close_window_when_run_on_start_is_false(
             now=datetime.now(UTC),
         )
 
-    snapshot_calls = []
     recovery_calls = []
     uvicorn_calls = []
-
-    def fake_create_and_save_account_snapshot(received_settings):
-        snapshot_calls.append(received_settings.database_path)
 
     def fake_uvicorn_run(app, *, host: str, port: int) -> None:
         uvicorn_calls.append({"app": app, "host": host, "port": port})
@@ -435,11 +502,6 @@ def test_run_api_service_recovers_close_window_when_run_on_start_is_false(
             )
         ),
     )
-    monkeypatch.setattr(
-        service_app,
-        "create_and_save_account_snapshot",
-        fake_create_and_save_account_snapshot,
-    )
     monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
 
     service_app.run_api_service(settings)
@@ -451,7 +513,6 @@ def test_run_api_service_recovers_close_window_when_run_on_start_is_false(
             now=datetime.now(UTC),
         )
 
-    assert snapshot_calls == []
     assert recovery_calls == ["close_readiness"]
     assert uvicorn_calls
     assert state.enabled is True
@@ -461,14 +522,11 @@ def test_run_api_service_recovers_close_window_when_run_on_start_is_false(
     assert state.last_status == "success"
 
 
-def test_run_api_service_reconciles_current_run_on_start_true_before_startup(
+def test_run_api_service_reconciles_run_on_start_before_intraday_recovery(
     tmp_path,
     monkeypatch,
 ) -> None:
     import quantitative_trading.runtime.service_app as service_app
-
-    class CreatedSnapshot:
-        snapshot_id = 24
 
     class FakeSchedulerManager:
         def __init__(self, *, interval_seconds, timezone, job) -> None:
@@ -498,22 +556,29 @@ def test_run_api_service_reconciles_current_run_on_start_true_before_startup(
             now=datetime.now(UTC),
         )
 
-    snapshot_calls = []
+    workflow_calls = []
     uvicorn_calls = []
-
-    def fake_create_and_save_account_snapshot(received_settings):
-        snapshot_calls.append(received_settings.database_path)
-        return CreatedSnapshot()
 
     def fake_uvicorn_run(app, *, host: str, port: int) -> None:
         uvicorn_calls.append({"app": app, "host": host, "port": port})
 
     monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
-    monkeypatch.setattr(service_app, "_startup_recovery_reason", lambda now: "startup")
+    monkeypatch.setattr(
+        service_app, "_startup_recovery_reason", lambda now: "intraday_decision"
+    )
     monkeypatch.setattr(
         service_app,
-        "create_and_save_account_snapshot",
-        fake_create_and_save_account_snapshot,
+        "_run_scheduler_task",
+        lambda received_settings, reason: (
+            workflow_calls.append((received_settings.database_path, reason))
+            or service_app.SchedulerJobResult(
+                task_type="intraday",
+                reason="intraday_completed",
+                snapshot_id=24,
+                recommendation_ids=[],
+                run_id="intraday-20260714-1000",
+            )
+        ),
     )
     monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
 
@@ -526,24 +591,22 @@ def test_run_api_service_reconciles_current_run_on_start_true_before_startup(
             now=datetime.now(UTC),
         )
 
-    assert snapshot_calls == [settings.database_path]
+    assert workflow_calls == [(settings.database_path, "intraday_decision")]
     assert uvicorn_calls
     assert state.enabled is True
     assert state.interval_seconds == 13
     assert state.run_on_start is True
     assert state.last_status == "success"
-    assert state.last_reason == "startup"
+    assert state.last_reason == "intraday_completed"
+    assert state.last_task_type == "intraday"
     assert state.last_snapshot_id == 24
 
 
-def test_run_api_service_runs_startup_snapshot_before_restored_scheduler(
+def test_run_api_service_runs_startup_recovery_before_restored_scheduler(
     tmp_path,
     monkeypatch,
 ) -> None:
     import quantitative_trading.runtime.service_app as service_app
-
-    class CreatedSnapshot:
-        snapshot_id = 42
 
     class FakeSchedulerManager:
         def __init__(self, *, interval_seconds, timezone, job) -> None:
@@ -571,22 +634,28 @@ def test_run_api_service_runs_startup_snapshot_before_restored_scheduler(
 
     events = []
 
-    def fake_create_and_save_account_snapshot(received_settings):
-        events.append("startup_snapshot")
-        return CreatedSnapshot()
-
     monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
-    monkeypatch.setattr(service_app, "_startup_recovery_reason", lambda now: "startup")
+    monkeypatch.setattr(
+        service_app, "_startup_recovery_reason", lambda now: "intraday_decision"
+    )
     monkeypatch.setattr(
         service_app,
-        "create_and_save_account_snapshot",
-        fake_create_and_save_account_snapshot,
+        "_run_scheduler_task",
+        lambda settings, reason: (
+            events.append("intraday_workflow")
+            or service_app.SchedulerJobResult(
+                task_type="intraday",
+                reason="intraday_completed",
+                snapshot_id=42,
+                recommendation_ids=[],
+            )
+        ),
     )
     monkeypatch.setattr(service_app.uvicorn, "run", lambda app, *, host, port: None)
 
     service_app.run_api_service(settings)
 
-    assert events == ["startup_snapshot", "scheduler_start"]
+    assert events == ["intraday_workflow", "scheduler_start"]
 
 
 def test_run_api_service_starts_http_when_startup_result_recording_fails(
@@ -594,9 +663,6 @@ def test_run_api_service_starts_http_when_startup_result_recording_fails(
     monkeypatch,
 ) -> None:
     import quantitative_trading.runtime.service_app as service_app
-
-    class CreatedSnapshot:
-        snapshot_id = 42
 
     class FailingRecordSchedulerStateRepository:
         def __init__(self, connection) -> None:
@@ -640,7 +706,9 @@ def test_run_api_service_starts_http_when_startup_result_recording_fails(
         uvicorn_calls.append({"app": app, "host": host, "port": port})
 
     monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
-    monkeypatch.setattr(service_app, "_startup_recovery_reason", lambda now: "startup")
+    monkeypatch.setattr(
+        service_app, "_startup_recovery_reason", lambda now: "intraday_decision"
+    )
     monkeypatch.setattr(
         service_app,
         "SchedulerStateRepository",
@@ -648,8 +716,13 @@ def test_run_api_service_starts_http_when_startup_result_recording_fails(
     )
     monkeypatch.setattr(
         service_app,
-        "create_and_save_account_snapshot",
-        lambda received_settings: CreatedSnapshot(),
+        "_run_scheduler_task",
+        lambda settings, reason: service_app.SchedulerJobResult(
+            task_type="intraday",
+            reason="intraday_completed",
+            snapshot_id=42,
+            recommendation_ids=[],
+        ),
     )
     monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
 
@@ -664,9 +737,6 @@ def test_run_api_service_starts_http_when_startup_result_get_or_create_fails(
     caplog,
 ) -> None:
     import quantitative_trading.runtime.service_app as service_app
-
-    class CreatedSnapshot:
-        snapshot_id = 42
 
     class FailingStartupGetOrCreateSchedulerStateRepository:
         get_or_create_calls = 0
@@ -717,7 +787,9 @@ def test_run_api_service_starts_http_when_startup_result_get_or_create_fails(
         uvicorn_calls.append({"app": app, "host": host, "port": port})
 
     monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
-    monkeypatch.setattr(service_app, "_startup_recovery_reason", lambda now: "startup")
+    monkeypatch.setattr(
+        service_app, "_startup_recovery_reason", lambda now: "intraday_decision"
+    )
     monkeypatch.setattr(
         service_app,
         "SchedulerStateRepository",
@@ -725,8 +797,13 @@ def test_run_api_service_starts_http_when_startup_result_get_or_create_fails(
     )
     monkeypatch.setattr(
         service_app,
-        "create_and_save_account_snapshot",
-        lambda received_settings: CreatedSnapshot(),
+        "_run_scheduler_task",
+        lambda settings, reason: service_app.SchedulerJobResult(
+            task_type="intraday",
+            reason="intraday_completed",
+            snapshot_id=42,
+            recommendation_ids=[],
+        ),
     )
     monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
 
@@ -741,14 +818,11 @@ def test_run_api_service_starts_http_when_startup_result_get_or_create_fails(
     assert "secret" not in caplog.text
 
 
-def test_background_snapshot_job_propagates_result_persistence_failure(
+def test_background_intraday_job_propagates_result_persistence_failure(
     tmp_path,
     monkeypatch,
 ) -> None:
     import quantitative_trading.runtime.service_app as service_app
-
-    class CreatedSnapshot:
-        snapshot_id = 42
 
     class FailingBackgroundSchedulerStateRepository:
         fail_get_or_create = False
@@ -798,8 +872,13 @@ def test_background_snapshot_job_propagates_result_persistence_failure(
     )
     monkeypatch.setattr(
         service_app,
-        "create_and_save_account_snapshot",
-        lambda received_settings: CreatedSnapshot(),
+        "_run_scheduler_task",
+        lambda settings, reason: service_app.SchedulerJobResult(
+            task_type="intraday",
+            reason="intraday_completed",
+            snapshot_id=42,
+            recommendation_ids=[],
+        ),
     )
     monkeypatch.setattr(service_app.uvicorn, "run", fake_uvicorn_run)
 
@@ -808,7 +887,96 @@ def test_background_snapshot_job_propagates_result_persistence_failure(
     assert uvicorn_calls
     FailingBackgroundSchedulerStateRepository.fail_get_or_create = True
     with pytest.raises(sqlite3.OperationalError, match="database is locked"):
-        captured_jobs[0]("intraday")
+        captured_jobs[0]("intraday_decision")
+
+
+@pytest.mark.parametrize(
+    ("now", "expected_status", "expected_reason", "expected_error"),
+    [
+        (
+            datetime(2026, 7, 14, 8, 25, tzinfo=UTC),
+            "degraded",
+            "close_not_ready",
+            None,
+        ),
+        (
+            datetime(2026, 7, 14, 8, 30, 30, tzinfo=UTC),
+            "failed",
+            "close_deadline_not_ready",
+            "close workflow data was not ready by the 16:30 deadline",
+        ),
+    ],
+)
+def test_close_not_ready_becomes_failed_only_at_hard_deadline(
+    tmp_path,
+    monkeypatch,
+    now: datetime,
+    expected_status: str,
+    expected_reason: str,
+    expected_error: str | None,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    class NotReadyWorkflow:
+        def run_close(self, trade_date):  # noqa: ANN001
+            del trade_date
+
+            class Result:
+                ready = False
+                reused = False
+                market_input_snapshot_id = 17
+                plan_id = None
+                run_id = "close-20260714"
+
+            return Result()
+
+    monkeypatch.setattr(
+        service_app,
+        "_build_decision_workflow",
+        lambda connection, settings, task_now: NotReadyWorkflow(),
+    )
+    settings = Settings(
+        database_path=tmp_path / "close-deadline.db",
+        enable_market_fetch=False,
+    )
+
+    result = service_app._run_scheduler_task(
+        settings,
+        "close_readiness",
+        now=now,
+    )
+
+    assert result.status == expected_status
+    assert result.reason == expected_reason
+    assert result.error == expected_error
+
+
+@pytest.mark.parametrize("reason", ["intraday", "startup", "manual_api"])
+def test_legacy_snapshot_reasons_are_stably_unknown(
+    tmp_path,
+    monkeypatch,
+    reason: str,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    legacy_calls = []
+    monkeypatch.setattr(
+        service_app,
+        "create_and_save_account_snapshot",
+        lambda settings: legacy_calls.append(settings.database_path),
+        raising=False,
+    )
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
+
+    with pytest.raises(ValueError, match="unknown scheduler task"):
+        service_app._run_scheduler_task(
+            settings,
+            reason,
+            now=datetime(2026, 7, 14, 2, 0, tzinfo=UTC),
+        )
+
+    assert legacy_calls == []
+    assert service_app._task_type_for_reason(reason) == "unknown"
 
 
 @pytest.mark.parametrize(
@@ -836,28 +1004,19 @@ def test_scheduler_control_without_live_scheduler_requires_auth_and_returns_erro
     assert status_response.json()[field] is False
 
 
-def test_run_once_records_latest_result(tmp_path) -> None:
+def test_run_once_is_retired_without_recording_scheduler_state(tmp_path) -> None:
     client, headers = authenticated_client(tmp_path)
 
     run_response = client.post("/api/v1/service/run-once", headers=headers)
     status_response = client.get("/api/v1/service/status", headers=headers)
 
-    assert run_response.status_code == 200
-    assert run_response.json()["last_status"] == "success"
-    assert run_response.json()["last_reason"] == "manual_api"
-    assert run_response.json()["last_task_type"] == "account_snapshot"
-    assert run_response.json()["last_plan_id"] is None
-    assert run_response.json()["last_recommendation_ids"] == []
-    assert status_response.json()["last_status"] == "success"
-    assert status_response.json()["last_reason"] == "manual_api"
-    assert status_response.json()["last_snapshot_id"] == 1
-    assert status_response.json()["last_task_type"] == "account_snapshot"
-    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
-    with connect(settings) as connection:
-        audits = AuditLogRepository(connection).list_recent(limit=20)
-    run_audit = next(item for item in audits if item.event_type == "service.run_once")
-    assert run_audit.payload["status"] == "success"
-    assert run_audit.payload["snapshot_id"] == 1
+    assert run_response.status_code == 410
+    assert run_response.json()["error"]["code"] == "service_run_once_retired"
+    assert run_response.json()["error"]["details"]["replacement"] == (
+        "/api/v1/service/workflows/intraday/run"
+    )
+    assert status_response.json()["last_status"] is None
+    assert status_response.json()["last_snapshot_id"] is None
 
 
 def test_service_control_endpoints_require_auth_after_setup(tmp_path) -> None:
@@ -876,7 +1035,7 @@ def test_service_control_endpoints_require_auth_after_setup(tmp_path) -> None:
         assert response.json()["error"]["code"] == "unauthorized"
 
 
-def test_run_once_failure_records_failed_state_without_500(
+def test_run_once_retirement_does_not_call_legacy_snapshot_factory(
     tmp_path, monkeypatch
 ) -> None:
     import quantitative_trading.api.routes.service as service_routes
@@ -896,13 +1055,10 @@ def test_run_once_failure_records_failed_state_without_500(
 
     response = client.post("/api/v1/service/run-once", headers=headers)
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["last_status"] == "failed"
-    assert payload["last_reason"] == "manual_api"
-    assert payload["last_error"]
-    assert "/tmp/private" not in payload["last_error"]
-    assert "token=secret" not in payload["last_error"]
+    assert response.status_code == 410
+    assert response.json()["error"]["code"] == "service_run_once_retired"
+    assert "/tmp/private" not in response.text
+    assert "token=secret" not in response.text
 
 
 def test_scheduler_start_and_stop_call_injected_scheduler(tmp_path) -> None:
@@ -1124,10 +1280,9 @@ def test_run_once_state_record_failure_returns_uniform_internal_error(
 
     response = client.post("/api/v1/service/run-once", headers=headers)
 
-    assert response.status_code == 500
+    assert response.status_code == 410
     assert response.headers["content-type"].startswith("application/json")
-    assert response.json()["error"]["code"] == "internal_error"
-    assert response.json()["error"]["message"] == "service state storage failed"
+    assert response.json()["error"]["code"] == "service_run_once_retired"
     assert "/tmp/private" not in response.text
 
 

@@ -420,8 +420,9 @@ def test_close_skip_calendar_integrates_real_decision_workflow(
     assert body["task"] == "close"
     assert body["run_id"] == "close-20260718"
     assert body["snapshot_id"] > 0
-    assert body["plan_id"] == "plan-20260720-v1"
+    assert body["plan_id"] is None
     assert body["recommendation_ids"] == []
+    assert body["warnings"] == ["决策启用集合为空"]
 
 
 def test_close_outside_window_and_non_trading_day_need_explicit_override(

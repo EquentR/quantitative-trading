@@ -394,3 +394,20 @@ def test_partial_quote_with_warning_is_still_valued() -> None:
     assert snapshot.positions[0].status is PositionValuationStatus.OK
     assert snapshot.positions[0].warning == "quote missing change_pct"
     assert snapshot.warnings == ["600000: quote missing change_pct"]
+
+
+def test_partial_quote_without_market_time_is_not_usable_for_account_valuation() -> None:
+    unknown_time = quote(
+        status=QuoteStatus.PARTIAL,
+        warning="market source time unavailable",
+    ).model_copy(update={"data_time": None})
+
+    snapshot = service(
+        account=cash_account(),
+        positions=[position()],
+        market=FakeMarketProvider({"600000": unknown_time}),
+    ).create_snapshot()
+
+    assert snapshot.status is AccountSnapshotStatus.MARKET_DATA_UNAVAILABLE
+    assert snapshot.positions[0].status is PositionValuationStatus.FAILED
+    assert snapshot.positions[0].current_price is None

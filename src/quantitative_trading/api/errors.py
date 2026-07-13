@@ -104,6 +104,12 @@ def _sanitize_details(value: Any, *, current_key: str | None = None) -> Any:
         }
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
         return [_sanitize_details(item, current_key=current_key) for item in value]
+    if (
+        isinstance(value, str)
+        and current_key == "replacement"
+        and value.startswith("/api/v1/")
+    ):
+        return value
     if isinstance(value, str):
         return redact_sensitive_text(value)
     return value

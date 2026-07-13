@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { Play, Square, Camera } from 'lucide-vue-next'
+import { Play, Square, RefreshCw } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
 import Alert from '@/components/ui/Alert.vue'
 import StatusBadges from '@/components/domain/StatusBadges.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
 import { ApiError } from '@/api/client'
 import {
-  useRunOnceMutation,
+  useRunIntradayWorkflowMutation,
   useServiceStatusQuery,
   useStartSchedulerMutation,
   useStopSchedulerMutation,
@@ -19,7 +19,7 @@ const serviceQuery = useServiceStatusQuery()
 const snapshotQuery = useLatestSnapshotQuery()
 const startMutation = useStartSchedulerMutation()
 const stopMutation = useStopSchedulerMutation()
-const runOnceMutation = useRunOnceMutation()
+const runIntradayMutation = useRunIntradayWorkflowMutation()
 const marketRunsQuery = useMarketRunsQuery()
 
 const service = () => serviceQuery.data.value
@@ -67,6 +67,7 @@ const snapshotErrorMessage = () => {
 }
 
 const runMessage = ref('')
+const runError = ref('')
 
 function formatDuration(value: number | null): string {
   if (value === null) return '进行中'
@@ -102,8 +103,14 @@ function formatDatasetCounts(run: ReturnType<typeof marketRuns>[number]): string
 }
 
 async function onGenerate() {
-  await runOnceMutation.mutateAsync()
-  runMessage.value = '已请求生成账户快照'
+  runMessage.value = ''
+  runError.value = ''
+  try {
+    await runIntradayMutation.mutateAsync()
+    runMessage.value = '已请求运行盘中决策工作流'
+  } catch {
+    runError.value = '盘中决策工作流运行失败，请稍后重试'
+  }
 }
 </script>
 
@@ -130,12 +137,13 @@ async function onGenerate() {
           <Square class="size-4" />
           停止工作流调度
         </Button>
-        <Button variant="secondary" :loading="runOnceMutation.isPending.value" @click="onGenerate">
-          <Camera class="size-4" />
-          生成一次账户快照
+        <Button variant="secondary" :loading="runIntradayMutation.isPending.value" @click="onGenerate">
+          <RefreshCw class="size-4" />
+          运行盘中工作流
         </Button>
       </div>
       <p v-if="runMessage" class="text-sm text-emerald-700">{{ runMessage }}</p>
+      <Alert v-if="runError" variant="danger">{{ runError }}</Alert>
     </section>
 
     <section class="space-y-2">

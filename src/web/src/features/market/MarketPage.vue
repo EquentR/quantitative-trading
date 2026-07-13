@@ -109,6 +109,11 @@ function formatPercent(value: number | null | undefined): string {
   return `${value.toFixed(2)}%`
 }
 
+function formatRatioPercent(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '不可用'
+  return `${(value * 100).toFixed(2)}%`
+}
+
 function componentDirection(component: MarketStrengthComponent): string {
   if (component.direction === 1) return '偏强'
   if (component.direction === -1) return '偏弱'
@@ -347,7 +352,7 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
                 <div v-if="overview.position" class="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
                   <span class="text-muted-foreground">持仓 / 可用</span><span>{{ overview.position.quantity }} / {{ overview.position.available_quantity }}</span>
                   <span class="text-muted-foreground">成本价</span><span>{{ formatNumber(overview.position.cost_price, 3) }}</span>
-                  <span class="text-muted-foreground">浮动盈亏</span><span>{{ formatPercent(overview.position.floating_pnl_pct) }}</span>
+                  <span class="text-muted-foreground">浮动盈亏</span><span>{{ formatRatioPercent(overview.position.floating_pnl_pct) }}</span>
                 </div>
                 <p v-else class="text-sm text-muted-foreground">非持仓标的</p>
                 <div v-if="overview.plan" class="space-y-1 text-sm">
@@ -432,6 +437,13 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
           </div>
           <p v-if="dailyQuery.isPending.value" class="text-sm text-muted-foreground">正在加载日 K 数据</p>
           <Alert v-else-if="dailyQuery.error.value" variant="danger">日 K 数据加载失败</Alert>
+          <Alert
+            v-else-if="dailyBars.length === 0 && dailyQuery.data.value?.status !== 'complete' && dailyQuery.data.value?.status !== 'ok'"
+            :variant="dailyQuery.data.value?.status === 'failed' || dailyQuery.data.value?.status === 'unavailable' ? 'danger' : 'warning'"
+          >
+            {{ qualityText(dailyQuery.data.value!.status) }}
+            <span v-for="warning in dailyQuery.data.value!.warnings" :key="warning" class="ml-1 break-words">{{ warning }}</span>
+          </Alert>
           <p v-else-if="dailyBars.length === 0" class="text-sm text-muted-foreground">暂无日 K 数据</p>
           <template v-else>
             <Alert v-if="dailyQuery.data.value!.status !== 'complete' && dailyQuery.data.value!.status !== 'ok'" variant="warning">
@@ -457,6 +469,13 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
           </div>
           <p v-if="moneyQuery.isPending.value" class="text-sm text-muted-foreground">正在加载资金流数据</p>
           <Alert v-else-if="moneyQuery.error.value" variant="danger">资金流数据加载失败</Alert>
+          <Alert
+            v-else-if="moneyRows.length === 0 && moneyQuery.data.value?.status !== 'complete' && moneyQuery.data.value?.status !== 'ok'"
+            :variant="moneyQuery.data.value?.status === 'failed' || moneyQuery.data.value?.status === 'unavailable' ? 'danger' : 'warning'"
+          >
+            {{ qualityText(moneyQuery.data.value!.status) }}
+            <span v-for="warning in moneyQuery.data.value!.warnings" :key="warning" class="ml-1 break-words">{{ warning }}</span>
+          </Alert>
           <p v-else-if="moneyRows.length === 0" class="text-sm text-muted-foreground">暂无资金流数据</p>
           <template v-else>
             <Alert v-if="moneyQuery.data.value!.status !== 'complete' && moneyQuery.data.value!.status !== 'ok'" variant="warning">
@@ -487,11 +506,19 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
 
         <div v-else-if="activeTab === 'intraday'" class="space-y-3 pt-4" role="tabpanel">
           <h3 class="text-sm font-medium">当日分时强弱</h3>
-          <p v-if="minuteQuery.isPending.value || strengthQuery.isPending.value" class="text-sm text-muted-foreground">正在加载分时数据</p>
+          <p v-if="minuteQuery.isPending.value" class="text-sm text-muted-foreground">正在加载分时数据</p>
           <Alert v-else-if="minuteQuery.error.value" variant="danger">分钟行情加载失败</Alert>
-          <Alert v-else-if="strengthQuery.error.value" variant="warning">强弱组件加载失败，分钟行情仍可查看</Alert>
+          <Alert
+            v-else-if="minuteBars.length === 0 && minuteQuery.data.value?.status !== 'complete' && minuteQuery.data.value?.status !== 'ok'"
+            :variant="minuteQuery.data.value?.status === 'failed' || minuteQuery.data.value?.status === 'unavailable' ? 'danger' : 'warning'"
+          >
+            {{ qualityText(minuteQuery.data.value!.status) }}
+            <span v-for="warning in minuteQuery.data.value!.warnings" :key="warning" class="ml-1 break-words">{{ warning }}</span>
+          </Alert>
           <p v-else-if="minuteBars.length === 0" class="text-sm text-muted-foreground">暂无当日分钟行情</p>
           <template v-else>
+            <p v-if="strengthQuery.isPending.value" class="text-sm text-muted-foreground">正在加载强弱组件</p>
+            <Alert v-else-if="strengthQuery.error.value" variant="warning">强弱组件加载失败，分钟行情仍可查看</Alert>
             <Alert v-if="minuteQuery.data.value!.status !== 'complete' && minuteQuery.data.value!.status !== 'ok'" variant="warning">
               {{ qualityText(minuteQuery.data.value!.status) }}
             </Alert>
@@ -531,6 +558,7 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
         <div v-else class="space-y-3 pt-4" role="tabpanel">
           <h3 class="text-sm font-medium">决策数据引用</h3>
           <p v-if="snapshotId === null && overviewQuery.isPending.value" class="text-sm text-muted-foreground">正在解析输入快照</p>
+          <Alert v-else-if="overviewQuery.error.value" variant="danger">概览加载失败，无法解析数据引用</Alert>
           <Alert v-else-if="traceQuery.error.value" variant="danger">数据引用加载失败</Alert>
           <p v-else-if="snapshotId === null" class="text-sm text-muted-foreground">当前概览没有输入快照引用</p>
           <template v-else-if="traceQuery.data.value">
@@ -543,6 +571,7 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
               <dt class="text-muted-foreground">snapshot_id</dt><dd class="break-all">{{ traceQuery.data.value.snapshot_id }}</dd>
               <dt class="text-muted-foreground">plan_id</dt><dd class="break-all">{{ traceQuery.data.value.plan_id ?? '不可用' }}</dd>
               <dt class="text-muted-foreground">recommendation_id</dt><dd class="break-all">{{ traceQuery.data.value.recommendation_id ?? '不可用' }}</dd>
+              <dt class="text-muted-foreground">audit_id</dt><dd class="break-all">{{ traceQuery.data.value.audit_id ?? '不可用' }}</dd>
               <dt class="text-muted-foreground">数据时间</dt><dd><FormatValues kind="time" :value="traceQuery.data.value.data_time" /></dd>
               <dt class="text-muted-foreground">Stale 阈值</dt><dd>{{ traceQuery.data.value.thresholds.stale_trading_minutes ?? '不可用' }} 个有效交易分钟</dd>
             </dl>

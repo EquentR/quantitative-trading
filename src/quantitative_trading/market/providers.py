@@ -5,6 +5,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from math import isfinite
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -61,7 +62,7 @@ AKSHARE_LOW_FIELD = "最低"
 AKSHARE_VOLUME_FIELD = "成交量"
 AKSHARE_AMOUNT_FIELD = "成交额"
 EASTMONEY_SINGLE_QUOTE_URL = "https://82.push2.eastmoney.com/api/qt/stock/get"
-EASTMONEY_SINGLE_QUOTE_FIELDS = "f57,f58,f43,f170"
+EASTMONEY_SINGLE_QUOTE_FIELDS = "f57,f58,f43,f170,f124"
 EASTMONEY_SINGLE_QUOTE_TIMEOUT_SECONDS = 10.0
 EASTMONEY_SINGLE_QUOTE_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -143,6 +144,7 @@ class AkShareMarketProvider:
             )
 
         warnings: list[str] = [
+            "market source time unavailable; data_time kept unknown",
             "trading_status unavailable; kept unknown",
             "limit_status unavailable; kept unknown",
         ]
@@ -185,7 +187,7 @@ class AkShareMarketProvider:
             change_pct=change_pct,
             trading_status=TradingStatus.UNKNOWN,
             limit_status=LimitStatus.UNKNOWN,
-            data_time=fetched_at,
+            data_time=None,
             fetched_at=fetched_at,
             source="akshare",
             status=QuoteStatus.PARTIAL,
@@ -265,12 +267,13 @@ class AkShareMarketProvider:
         current_price = _eastmoney_current_price(data, "f43", symbol=symbol)
         name = _required_text(data, "f58")
         change_pct = _scaled_eastmoney_quote_float(data, "f170", positive=False)
+        data_time = _optional_eastmoney_timestamp(data, "f124")
         return QuoteSnapshot(
             symbol=symbol,
             name=name,
             current_price=current_price,
             change_pct=change_pct,
-            data_time=fetched_at,
+            data_time=data_time,
             fetched_at=fetched_at,
             source="eastmoney_single_quote",
             status=QuoteStatus.PARTIAL,
@@ -295,27 +298,38 @@ class AkShareMarketProvider:
         quotes: dict[str, QuoteSnapshot] = {}
         for match in TENCENT_QUOTE_PATTERN.finditer(text):
             parts = match.group(1).split("~")
-            data = _tencent_parts_to_quote_data(parts)
-            symbol = _required_text(data, "symbol")
+            try:
+                data = _tencent_parts_to_quote_data(parts)
+                symbol = _required_text(data, "symbol")
+            except Exception:
+                continue
             if symbol not in requested:
                 continue
-            current_price = _required_float(data, "current_price", positive=True)
-            name = _required_text(data, "name")
-            change_pct = _required_float(data, "change_pct", positive=False)
-            quotes[symbol] = QuoteSnapshot(
-                symbol=symbol,
-                name=name,
-                current_price=current_price,
-                change_pct=change_pct,
-                data_time=fetched_at,
-                fetched_at=fetched_at,
-                source="tencent_quote",
-                status=QuoteStatus.PARTIAL,
-                warning=(
-                    "standard OHLC/volume/amount unavailable; "
-                    "trading_status and limit_status kept unknown"
-                ),
-            )
+            try:
+                current_price = _required_float(data, "current_price", positive=True)
+                name = _required_text(data, "name")
+                change_pct = _required_float(data, "change_pct", positive=False)
+                data_time = _optional_tencent_timestamp(data, "data_time")
+                quotes[symbol] = QuoteSnapshot(
+                    symbol=symbol,
+                    name=name,
+                    current_price=current_price,
+                    change_pct=change_pct,
+                    data_time=data_time,
+                    fetched_at=fetched_at,
+                    source="tencent_quote",
+                    status=QuoteStatus.PARTIAL,
+                    warning=(
+                        "standard OHLC/volume/amount unavailable; "
+                        "trading_status and limit_status kept unknown"
+                    ),
+                )
+            except Exception as exc:
+                quotes[symbol] = self._failed_quote(
+                    symbol=symbol,
+                    fetched_at=fetched_at,
+                    warning=f"tencent quote mapping failed: {safe_error_summary(exc)}",
+                )
         return quotes
 
 
@@ -348,6 +362,25 @@ def _eastmoney_current_price(row: Any, field: str, *, symbol: str) -> float:
 
 def _scaled_eastmoney_quote_float(row: Any, field: str, *, positive: bool) -> float:
     return _required_float(row, field, positive=positive) / 100
+
+
+def _optional_eastmoney_timestamp(row: Any, field: str) -> datetime | None:
+    value = row.get(field) if isinstance(row, dict) else row[field]
+    if value in (None, "", "-"):
+        return None
+    return datetime.fromtimestamp(
+        _required_float(row, field, positive=True),
+        tz=ZoneInfo("Asia/Shanghai"),
+    )
+
+
+def _optional_tencent_timestamp(row: Any, field: str) -> datetime | None:
+    value = row.get(field) if isinstance(row, dict) else row[field]
+    if value in (None, "", "-"):
+        return None
+    return datetime.strptime(str(value).strip(), "%Y%m%d%H%M%S").replace(
+        tzinfo=ZoneInfo("Asia/Shanghai")
+    )
 
 
 def _eastmoney_price_divisor(symbol: str) -> int:
@@ -385,6 +418,7 @@ def _tencent_parts_to_quote_data(parts: list[str]) -> dict[str, str]:
             "name": parts[1],
             "symbol": parts[2],
             "current_price": parts[3],
+            "data_time": parts[30],
             "change_pct": parts[32],
         }
     except IndexError as exc:

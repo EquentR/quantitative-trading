@@ -118,6 +118,24 @@ class TradingPlanRepository:
             return None
         return TradingPlan.model_validate_json(row["payload_json"])
 
+    def mark_stale(self, plan: TradingPlan, *, warning: str) -> TradingPlan:
+        if plan.status is not TradingPlanStatus.ACTIVE:
+            return plan
+        stale = plan.model_copy(
+            update={
+                "status": TradingPlanStatus.STALE,
+                "data_quality": "stale",
+                "warnings": list(dict.fromkeys([*plan.warnings, warning])),
+            }
+        )
+        return self.save(stale)
+
+    def mark_expired(self, plan: TradingPlan) -> TradingPlan:
+        if plan.status is not TradingPlanStatus.ACTIVE:
+            return plan
+        expired = plan.model_copy(update={"status": TradingPlanStatus.EXPIRED})
+        return self.save(expired)
+
     def next_version(self, trading_day: date) -> int:
         rows = self.connection.execute(
             """

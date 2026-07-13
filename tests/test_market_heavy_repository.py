@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 
+from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
     CaptureDataset,
     CaptureResultStatus,
@@ -28,6 +29,7 @@ from quantitative_trading.market.repositories import (
     MinuteBarRepository,
     MoneyFlowRepository,
     MoneyFlowSnapshotRepository,
+    content_digest,
 )
 from quantitative_trading.market.schema import MARKET_DECISION_SCHEMA_SQL
 
@@ -107,7 +109,7 @@ def test_dataset_snapshot_members_remain_bound_to_original_fact_versions(connect
             data_start=date(2026, 7, 10),
             data_end=date(2026, 7, 10),
             row_count=1,
-            content_digest="a" * 64,
+            content_digest=content_digest([daily_bar(10.5).content_hash]),
             status=CaptureResultStatus.COMPLETE,
             fetched_at=FETCHED_AT,
         ),
@@ -126,12 +128,49 @@ def test_dataset_snapshot_members_remain_bound_to_original_fact_versions(connect
                 data_start=date(2026, 7, 10),
                 data_end=date(2026, 7, 10),
                 row_count=1,
-                content_digest="b" * 64,
+                content_digest=content_digest([daily_bar(10.5).content_hash]),
                 status=CaptureResultStatus.COMPLETE,
                 fetched_at=FETCHED_AT,
             ),
             [daily_id],
         )
+
+
+def test_dataset_snapshot_rejects_forged_digest_range_and_member_order(connection) -> None:
+    calendar = XSHGTradingCalendar()
+    days = calendar.sessions_ending(date(2026, 7, 13), 2)
+    repository = DailyBarRepository(connection)
+    member_ids = [
+        repository.save(daily_bar(10.5).model_copy(update={"trade_date": day}))
+        for day in days
+    ]
+    snapshots = HistorySnapshotRepository(connection)
+
+    def snapshot(**overrides):
+        payload = {
+            "run_id": "run-invalid",
+            "symbol": "600000",
+            "data_start": days[0],
+            "data_end": days[1],
+            "row_count": 2,
+            "content_digest": content_digest(
+                [
+                    repository.get(member_id).bar.content_hash
+                    for member_id in member_ids
+                ]
+            ),
+            "status": CaptureResultStatus.COMPLETE,
+            "fetched_at": FETCHED_AT,
+        }
+        payload.update(overrides)
+        return HistorySnapshot(**payload)
+
+    with pytest.raises(sqlite3.IntegrityError, match="digest"):
+        snapshots.save(snapshot(content_digest="f" * 64), member_ids)
+    with pytest.raises(sqlite3.IntegrityError, match="range"):
+        snapshots.save(snapshot(data_start=days[1]), member_ids)
+    with pytest.raises(sqlite3.IntegrityError, match="order"):
+        snapshots.save(snapshot(), list(reversed(member_ids)))
 
 
 def test_money_flow_snapshot_members_and_minute_upsert_are_idempotent(connection) -> None:
@@ -144,7 +183,7 @@ def test_money_flow_snapshot_members_and_minute_upsert_are_idempotent(connection
             data_start=date(2026, 7, 10),
             data_end=date(2026, 7, 10),
             row_count=1,
-            content_digest="c" * 64,
+            content_digest=content_digest([money_flow(100).content_hash]),
             status=CaptureResultStatus.COMPLETE,
             fetched_at=FETCHED_AT,
         ),
@@ -376,7 +415,7 @@ def test_dataset_snapshot_commit_is_persistent_and_caller_can_roll_back(tmp_path
         data_start=date(2026, 7, 10),
         data_end=date(2026, 7, 10),
         row_count=1,
-        content_digest="a" * 64,
+        content_digest=content_digest([daily_bar(10.5).content_hash]),
         status=CaptureResultStatus.COMPLETE,
         fetched_at=FETCHED_AT,
     )

@@ -72,21 +72,34 @@ class NotificationDispatcher:
         plan_version: str | int | None,
         now: datetime | None = None,
     ) -> RecommendationDispatchResult:
+        local = self.persist_local_recommendation(
+            recommendation,
+            plan_version=plan_version,
+            now=now,
+        )
+        return self.project_recommendation(
+            recommendation,
+            local,
+            plan_version=plan_version,
+            now=now,
+        )
+
+    def persist_local_recommendation(
+        self,
+        recommendation: Recommendation,
+        *,
+        plan_version: str | int | None,
+        now: datetime | None = None,
+        commit: bool = True,
+    ) -> RecommendationDispatchResult:
         dispatched_at = now or datetime.now(UTC)
         dedup_key = self._notification_dedup_key(recommendation, plan_version)
         existing = self.notification_service.get_by_dedup_key(dedup_key)
         if existing is not None:
-            delivery, warning = self._enqueue_immediate(
-                recommendation,
-                existing,
-                dedup_key=dedup_key,
-                now=dispatched_at,
-            )
             return RecommendationDispatchResult(
                 notification=existing,
-                email_delivery=delivery,
+                email_delivery=None,
                 created=False,
-                warnings=() if warning is None else (warning,),
             )
 
         audit = self.audit_service.record_event(
@@ -100,13 +113,35 @@ class NotificationDispatcher:
                 "condition_fingerprint": self.condition_fingerprint(recommendation),
             },
             now=dispatched_at,
+            commit=commit,
         )
         notification = self.notification_service.create_from_recommendation(
             recommendation,
             audit,
             dedup_key=dedup_key,
             now=dispatched_at,
+            commit=commit,
         )
+        return RecommendationDispatchResult(
+            notification=notification,
+            email_delivery=None,
+            created=True,
+        )
+
+    def project_recommendation(
+        self,
+        recommendation: Recommendation,
+        local: RecommendationDispatchResult,
+        *,
+        plan_version: str | int | None,
+        now: datetime | None = None,
+    ) -> RecommendationDispatchResult:
+        dispatched_at = now or datetime.now(UTC)
+        dedup_key = self._notification_dedup_key(recommendation, plan_version)
+        notification = local.notification
+        audit = self.audit_service.get(notification.audit_id)
+        if audit is None:
+            raise RuntimeError("notification audit reference is missing")
         LOGGER.info(
             "recommendation notification_id=%s symbol=%s action=%s confidence=%s data_time=%s",
             notification.notification_id,
@@ -143,7 +178,7 @@ class NotificationDispatcher:
         return RecommendationDispatchResult(
             notification=notification,
             email_delivery=delivery,
-            created=True,
+            created=local.created,
             warnings=tuple(warnings),
         )
 

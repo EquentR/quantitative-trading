@@ -28,6 +28,9 @@ SnapshotT = TypeVar("SnapshotT", HistorySnapshot, MoneyFlowSnapshot)
 class CreatedDatasetSnapshot(Generic[SnapshotT]):
     snapshot_id: int
     snapshot: SnapshotT
+    provider_calls: int
+    rows_received: int
+    rows_written: int
 
     @property
     def row_count(self) -> int:
@@ -69,16 +72,33 @@ class HeavyDataBackfillService:
             for stored in self.daily_repository.current(symbol)
             if stored.bar.trade_date in desired
         }
-        start = self._fetch_start(desired, set(existing))
-        fetched = list(
-            self.daily_provider.get_daily_bars(symbol, start, desired[-1], "forward")
-        )
+        ranges = self._fetch_ranges(desired, set(existing))
+        fetched = [
+            bar
+            for start, end in ranges
+            for bar in self.daily_provider.get_daily_bars(
+                symbol, start, end, "forward"
+            )
+        ]
         connection = self.daily_repository.connection
         connection.execute("SAVEPOINT daily_backfill_dataset")
         try:
+            rows_written = 0
             for bar in fetched:
                 if bar.trade_date in desired:
+                    known = connection.execute(
+                        """SELECT 1 FROM daily_bars
+                           WHERE symbol=? AND trade_date=? AND adjustment=?
+                             AND content_hash=?""",
+                        (
+                            bar.symbol,
+                            bar.trade_date.isoformat(),
+                            bar.adjustment,
+                            bar.content_hash,
+                        ),
+                    ).fetchone()
                     self.daily_repository.save(bar, commit=False)
+                    rows_written += int(known is None)
             current = [
                 stored
                 for stored in self.daily_repository.current(symbol, limit=self.DAILY_WINDOW)
@@ -114,7 +134,13 @@ class HeavyDataBackfillService:
             connection.execute("ROLLBACK TO SAVEPOINT daily_backfill_dataset")
             connection.execute("RELEASE SAVEPOINT daily_backfill_dataset")
             raise
-        return CreatedDatasetSnapshot(snapshot_id, snapshot)
+        return CreatedDatasetSnapshot(
+            snapshot_id,
+            snapshot,
+            provider_calls=len(ranges),
+            rows_received=len(fetched),
+            rows_written=rows_written,
+        )
 
     def backfill_money_flow(
         self, run_id: str, symbol: str, as_of: date
@@ -125,16 +151,31 @@ class HeavyDataBackfillService:
             for stored in self.money_flow_repository.current(symbol)
             if stored.flow.trade_date in desired
         }
-        start = self._fetch_start(desired, set(existing))
-        fetched = list(
-            self.money_flow_provider.get_daily_money_flow(symbol, start, desired[-1])
-        )
+        ranges = self._fetch_ranges(desired, set(existing))
+        fetched = [
+            flow
+            for start, end in ranges
+            for flow in self.money_flow_provider.get_daily_money_flow(
+                symbol, start, end
+            )
+        ]
         connection = self.money_flow_repository.connection
         connection.execute("SAVEPOINT money_flow_backfill_dataset")
         try:
+            rows_written = 0
             for flow in fetched:
                 if flow.trade_date in desired:
+                    known = connection.execute(
+                        """SELECT 1 FROM daily_money_flows
+                           WHERE symbol=? AND trade_date=? AND content_hash=?""",
+                        (
+                            flow.symbol,
+                            flow.trade_date.isoformat(),
+                            flow.content_hash,
+                        ),
+                    ).fetchone()
                     self.money_flow_repository.save(flow, commit=False)
+                    rows_written += int(known is None)
             current = [
                 stored
                 for stored in self.money_flow_repository.current(
@@ -172,12 +213,37 @@ class HeavyDataBackfillService:
             connection.execute("ROLLBACK TO SAVEPOINT money_flow_backfill_dataset")
             connection.execute("RELEASE SAVEPOINT money_flow_backfill_dataset")
             raise
-        return CreatedDatasetSnapshot(snapshot_id, snapshot)
+        return CreatedDatasetSnapshot(
+            snapshot_id,
+            snapshot,
+            provider_calls=len(ranges),
+            rows_received=len(fetched),
+            rows_written=rows_written,
+        )
 
-    def _fetch_start(self, desired: list[date], existing_dates: set[date]) -> date:
-        correction = desired[-self.CORRECTION_WINDOW :]
-        missing = [day for day in desired if day not in existing_dates]
-        return min([*correction, *missing])
+    def _fetch_ranges(
+        self,
+        desired: list[date],
+        existing_dates: set[date],
+    ) -> list[tuple[date, date]]:
+        requested = set(desired[-self.CORRECTION_WINDOW :]) | {
+            day for day in desired if day not in existing_dates
+        }
+        ranges: list[tuple[date, date]] = []
+        start: date | None = None
+        end: date | None = None
+        for day in desired:
+            if day not in requested:
+                if start is not None and end is not None:
+                    ranges.append((start, end))
+                    start = end = None
+                continue
+            if start is None:
+                start = day
+            end = day
+        if start is not None and end is not None:
+            ranges.append((start, end))
+        return ranges
 
     def _fetched_at(self) -> datetime:
         value = self.now()

@@ -21,6 +21,7 @@ from quantitative_trading.market.adapters import (
 )
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import DailyBar, DailyMoneyFlow, MinuteBar
+from quantitative_trading.market.features import IntradayStrengthRules
 from quantitative_trading.market.providers import (
     AkShareMarketProvider,
     DisabledMarketProvider,
@@ -94,6 +95,18 @@ def build_decision_workflow(
         intraday_provider=intraday_provider,
         now=clock,
         stale_trading_minutes=settings.market_stale_trading_minutes,
+        strength_rules=IntradayStrengthRules(
+            previous_close_pct=settings.market_strength_previous_close_pct,
+            open_pct=settings.market_strength_open_pct,
+            vwap_pct=settings.market_strength_vwap_pct,
+            momentum_5_pct=settings.market_strength_momentum_5_pct,
+            momentum_15_pct=settings.market_strength_momentum_15_pct,
+            position_high=settings.market_strength_position_high,
+            position_low=settings.market_strength_position_low,
+            volume_high=settings.market_strength_volume_high,
+            volume_low=settings.market_strength_volume_low,
+            rule_version=settings.market_strength_rule_version,
+        ),
         notification_dispatcher=build_notification_dispatcher(connection, settings),
     )
 

@@ -23,6 +23,7 @@ from quantitative_trading.market.features import (
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
     CaptureDataset,
+    CaptureResultStatus,
     ComponentStatus,
     DailyBar,
     DatasetQuality,
@@ -481,6 +482,40 @@ def _quality_status(
     return "complete"
 
 
+def _merge_persisted_quality(
+    status: QualityStatus,
+    warnings: list[str],
+    quality_by_dataset: dict[CaptureDataset, DatasetQuality],
+) -> tuple[QualityStatus, list[str]]:
+    """Overlay latest capture quality without hiding already stored market facts."""
+    failed = False
+    stale = False
+    degraded = False
+    merged_warnings = list(warnings)
+    for dataset, quality in sorted(
+        quality_by_dataset.items(), key=lambda item: item[0].value
+    ):
+        if quality.status is CaptureResultStatus.COMPLETE:
+            continue
+        merged_warnings.extend(
+            [
+                f"persisted {dataset.value} quality is {quality.status.value}",
+                quality.warning,
+            ]
+        )
+        failed = failed or quality.status is CaptureResultStatus.FAILED
+        stale = stale or quality.status is CaptureResultStatus.STALE
+        degraded = degraded or quality.status is CaptureResultStatus.DEGRADED
+
+    if failed:
+        status = "failed"
+    elif stale:
+        status = "stale"
+    elif degraded:
+        status = "degraded"
+    return status, _deduplicate(merged_warnings)
+
+
 def _unread_count(connection: sqlite3.Connection, symbol: str) -> int:
     row = connection.execute(
         "SELECT COUNT(*) AS count FROM notifications WHERE symbol = ? AND status = ?",
@@ -498,6 +533,7 @@ def _scanner_item(
     strength = IntradayStrengthSnapshotRepository(connection).latest_for_symbol(
         member.symbol
     )
+    _, market_snapshot = _latest_market_snapshot_for_symbol(connection, member.symbol)
     recommendation = RecommendationRepository(connection).latest_for_symbol(
         member.symbol
     )
@@ -515,6 +551,13 @@ def _scanner_item(
         warnings.append("intraday strength unavailable")
     elif strength.degraded:
         warnings.extend(strength.degradation_reasons)
+    status, warnings = _merge_persisted_quality(
+        _quality_status(quote, strength),
+        warnings,
+        {}
+        if market_snapshot is None
+        else market_snapshot.dataset_quality.get(member.symbol, {}),
+    )
     return MarketSymbolSummary(
         symbol=member.symbol,
         name=member.name,
@@ -526,7 +569,7 @@ def _scanner_item(
         ),
         intraday_strength=("unavailable" if strength is None else strength.label.value),
         plan_status=None if applicable_plan is None else applicable_plan.status.value,
-        quality_status=_quality_status(quote, strength),
+        quality_status=status,
         unread_count=_unread_count(connection, member.symbol),
         data_time=None if quote is None else quote.data_time,
         warnings=_deduplicate(warnings),
@@ -676,6 +719,11 @@ def get_market_overview(
             status = "partial"
         elif status == "complete" and (not bars or warnings):
             status = "partial"
+        status, warnings = _merge_persisted_quality(
+            status,
+            warnings,
+            {} if snapshot is None else snapshot.dataset_quality.get(symbol, {}),
+        )
         fetched_times = [
             value
             for value in (
@@ -847,7 +895,38 @@ def _time_series_quality(
             )
 
     warnings = _deduplicate(warnings)
+    if quality is not None and quality.status in {
+        CaptureResultStatus.STALE,
+        CaptureResultStatus.FAILED,
+    }:
+        return quality.status.value, warnings
     return ("degraded" if warnings else "complete"), warnings
+
+
+def _empty_dataset_quality(
+    quality: DatasetQuality | None,
+    *,
+    unavailable_warning: str,
+    range_label: str,
+) -> tuple[QualityStatus, list[str]]:
+    """Keep persisted terminal quality visible even when no rows were stored."""
+    if quality is None:
+        return "unavailable", [unavailable_warning]
+
+    warnings = _deduplicate(
+        [
+            unavailable_warning,
+            f"persisted {range_label} quality is {quality.status.value}",
+            quality.warning,
+        ]
+    )
+    if quality.status in {
+        CaptureResultStatus.STALE,
+        CaptureResultStatus.FAILED,
+        CaptureResultStatus.DEGRADED,
+    }:
+        return quality.status.value, warnings
+    return "unavailable", warnings
 
 
 @router.get("/symbols/{symbol}/daily-bars", response_model=DailyBarsResponse)
@@ -861,12 +940,17 @@ def get_daily_bars(
         bars = [item.bar for item in stored]
         quality = _latest_dataset_quality(connection, symbol, CaptureDataset.DAILY_BAR)
     if not bars:
+        status, warnings = _empty_dataset_quality(
+            quality,
+            unavailable_warning="daily bar data unavailable",
+            range_label="daily bar",
+        )
         return DailyBarsResponse(
             symbol=symbol,
-            status="unavailable",
+            status=status,
             data_time=None,
             fetched_at=_now(),
-            warnings=["daily bar data unavailable"],
+            warnings=warnings,
             bars=[],
         )
 
@@ -925,12 +1009,17 @@ def get_money_flow(
         stored = MoneyFlowRepository(connection).current(symbol, limit=limit)
         quality = _latest_dataset_quality(connection, symbol, CaptureDataset.MONEY_FLOW)
     if not stored:
+        status, warnings = _empty_dataset_quality(
+            quality,
+            unavailable_warning="money-flow data unavailable",
+            range_label="money-flow",
+        )
         return MoneyFlowResponse(
             symbol=symbol,
-            status="unavailable",
+            status=status,
             data_time=None,
             fetched_at=_now(),
-            warnings=["money-flow data unavailable"],
+            warnings=warnings,
             rows=[],
         )
     flows = [item.flow for item in stored]
@@ -1044,16 +1133,24 @@ def get_minute_bars(
             if selected_date is None
             else _recommendation_markers(connection, symbol, selected_date)
         )
+        quality = _latest_dataset_quality(
+            connection, symbol, CaptureDataset.MINUTE_BAR
+        )
 
     if not bars:
+        status, warnings = _empty_dataset_quality(
+            quality,
+            unavailable_warning="minute bar data unavailable",
+            range_label="minute bar",
+        )
         return MinuteBarsResponse(
             symbol=symbol,
             trade_date=selected_date,
-            status="unavailable",
+            status=status,
             data_time=None,
             fetched_at=_now(),
             previous_close=previous_close,
-            warnings=["minute bar data unavailable"],
+            warnings=warnings,
             bars=[],
             recommendation_markers=markers,
         )
@@ -1080,14 +1177,24 @@ def get_minute_bars(
                 ),
             )
         )
+    status: QualityStatus = "complete"
+    warnings: list[str] = []
+    if quality is not None and quality.status is not CaptureResultStatus.COMPLETE:
+        status = quality.status.value
+        warnings = _deduplicate(
+            [
+                f"persisted minute bar quality is {quality.status.value}",
+                quality.warning,
+            ]
+        )
     return MinuteBarsResponse(
         symbol=symbol,
         trade_date=selected_date,
-        status="complete",
+        status=status,
         data_time=max(bar.minute for bar in bars),
         fetched_at=max(bar.fetched_at for bar in bars),
         previous_close=previous_close,
-        warnings=[],
+        warnings=warnings,
         bars=response_bars,
         recommendation_markers=markers,
     )
@@ -1105,25 +1212,38 @@ def get_latest_intraday_strength(
         snapshot = IntradayStrengthSnapshotRepository(connection).latest_for_symbol(
             symbol
         )
+        quality = _latest_dataset_quality(
+            connection, symbol, CaptureDataset.INTRADAY_STRENGTH
+        )
     if snapshot is None:
+        status, warnings = _empty_dataset_quality(
+            quality,
+            unavailable_warning="intraday strength unavailable",
+            range_label="intraday strength",
+        )
         return IntradayStrengthResponse(
             symbol=symbol,
-            status="unavailable",
+            status=status,
             label="unavailable",
             confidence="low",
             data_time=None,
             fetched_at=_now(),
             coverage_ratio=None,
             last_minute=None,
-            degraded_reason="intraday strength unavailable",
+            degraded_reason="; ".join(warnings),
             rule_version="",
             components=[],
-            warnings=["intraday strength unavailable"],
+            warnings=warnings,
         )
     warnings = list(snapshot.degradation_reasons) if snapshot.degraded else []
+    status, warnings = _merge_persisted_quality(
+        "degraded" if snapshot.degraded else "complete",
+        warnings,
+        {} if quality is None else {CaptureDataset.INTRADAY_STRENGTH: quality},
+    )
     return IntradayStrengthResponse(
         symbol=symbol,
-        status="degraded" if snapshot.degraded else "complete",
+        status=status,
         label=snapshot.label.value,
         confidence=snapshot.confidence.value,
         data_time=snapshot.data_time,

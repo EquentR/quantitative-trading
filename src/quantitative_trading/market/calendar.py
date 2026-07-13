@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
@@ -104,10 +104,14 @@ class XSHGTradingCalendar:
     def expected_minutes_through(self, value: datetime) -> int:
         local = value.astimezone(self.timezone)
         session = self.session(local.date())
-        cursor = session.open_at
-        count = 0
-        while cursor <= min(local, session.close_at):
-            if self.is_trading_minute(cursor):
-                count += 1
-            cursor += timedelta(minutes=1)
-        return count
+        if local <= session.open_at:
+            return 0
+        morning_minutes = int(
+            (min(local, session.break_start) - session.open_at).total_seconds() // 60
+        )
+        if local <= session.break_end:
+            return max(0, morning_minutes)
+        afternoon_minutes = int(
+            (min(local, session.close_at) - session.break_end).total_seconds() // 60
+        )
+        return max(0, morning_minutes) + max(0, afternoon_minutes)

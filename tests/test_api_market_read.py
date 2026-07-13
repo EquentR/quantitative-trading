@@ -17,6 +17,7 @@ from quantitative_trading.market.models import (
     CaptureRunStatus,
     DailyBar,
     DailyMoneyFlow,
+    DatasetQuality,
     HistorySnapshot,
     IntradayStrengthSnapshot,
     MarketCaptureResult,
@@ -32,6 +33,7 @@ from quantitative_trading.market.models import (
     ComponentStatus,
 )
 from quantitative_trading.market.repositories import (
+    content_digest,
     DailyBarRepository,
     HistorySnapshotRepository,
     IntradayStrengthSnapshotRepository,
@@ -189,7 +191,12 @@ def seed_market_data(settings: Settings) -> int:
                 data_start=trade_dates[0],
                 data_end=trade_dates[-1],
                 row_count=len(daily_ids),
-                content_digest="a" * 64,
+                content_digest=content_digest(
+                    [
+                        item.bar.content_hash
+                        for item in daily_repository.current("600000")
+                    ]
+                ),
                 status=CaptureResultStatus.COMPLETE,
                 fetched_at=FETCHED_AT,
             ),
@@ -221,7 +228,7 @@ def seed_market_data(settings: Settings) -> int:
                 data_start=flow.trade_date,
                 data_end=flow.trade_date,
                 row_count=1,
-                content_digest="b" * 64,
+                content_digest=content_digest([flow.content_hash]),
                 status=CaptureResultStatus.COMPLETE,
                 fetched_at=FETCHED_AT,
             ),
@@ -430,18 +437,50 @@ def test_market_read_validation_rejects_bad_symbols_windows_and_pagination(
 
 
 def test_empty_market_datasets_return_explicit_unavailable_responses(tmp_path) -> None:
-    client, headers, _settings = authenticated_client(tmp_path)
+    client, headers, settings = authenticated_client(tmp_path)
+
+    snapshot_id = seed_market_data(settings)
+    with connect(settings) as connection:
+        repository = MarketInputSnapshotRepository(connection)
+        snapshot = repository.get(snapshot_id)
+        assert snapshot is not None
+        repository.save(
+            snapshot.model_copy(
+                update={
+                    "dataset_quality": {
+                        "000001": {
+                            CaptureDataset.DAILY_BAR: DatasetQuality(
+                                status=CaptureResultStatus.STALE,
+                                warning="empty daily source is stale",
+                            ),
+                            CaptureDataset.MONEY_FLOW: DatasetQuality(
+                                status=CaptureResultStatus.FAILED,
+                                warning="empty money-flow source failed",
+                            ),
+                            CaptureDataset.MINUTE_BAR: DatasetQuality(
+                                status=CaptureResultStatus.STALE,
+                                warning="empty minute source is stale",
+                            ),
+                            CaptureDataset.INTRADAY_STRENGTH: DatasetQuality(
+                                status=CaptureResultStatus.FAILED,
+                                warning="empty strength source failed",
+                            ),
+                        }
+                    }
+                }
+            )
+        )
 
     symbols = client.get("/api/v1/market/symbols", headers=headers)
-    daily = client.get("/api/v1/market/symbols/600000/daily-bars", headers=headers)
-    flow = client.get("/api/v1/market/symbols/600000/money-flow", headers=headers)
-    minute = client.get("/api/v1/market/symbols/600000/minute-bars", headers=headers)
+    daily = client.get("/api/v1/market/symbols/000001/daily-bars", headers=headers)
+    flow = client.get("/api/v1/market/symbols/000001/money-flow", headers=headers)
+    minute = client.get("/api/v1/market/symbols/000001/minute-bars", headers=headers)
     strength = client.get(
-        "/api/v1/market/symbols/600000/intraday-strength/latest", headers=headers
+        "/api/v1/market/symbols/000001/intraday-strength/latest", headers=headers
     )
-    overview = client.get("/api/v1/market/symbols/600000/overview", headers=headers)
+    overview = client.get("/api/v1/market/symbols/000001/overview", headers=headers)
 
-    assert symbols.json() == {"items": [], "total": 0, "page": 1, "page_size": 50}
+    assert symbols.status_code == 200
     assert (
         daily.status_code
         == flow.status_code
@@ -449,18 +488,21 @@ def test_empty_market_datasets_return_explicit_unavailable_responses(tmp_path) -
         == strength.status_code
         == 200
     )
-    assert daily.json()["status"] == "unavailable"
+    assert daily.json()["status"] == "stale"
     assert daily.json()["data_time"] is None
     assert daily.json()["bars"] == []
-    assert daily.json()["warnings"]
-    assert flow.json()["status"] == "unavailable"
+    assert "empty daily source is stale" in daily.json()["warnings"]
+    assert flow.json()["status"] == "failed"
     assert flow.json()["rows"] == []
-    assert minute.json()["status"] == "unavailable"
+    assert "empty money-flow source failed" in flow.json()["warnings"]
+    assert minute.json()["status"] == "stale"
     assert minute.json()["bars"] == []
-    assert strength.json()["status"] == "unavailable"
+    assert "empty minute source is stale" in minute.json()["warnings"]
+    assert strength.json()["status"] == "failed"
     assert strength.json()["components"] == []
+    assert "empty strength source failed" in strength.json()["warnings"]
     assert overview.status_code == 200
-    assert overview.json()["status"] == "unavailable"
+    assert overview.json()["status"] == "failed"
     assert overview.json()["data_time"] is None
     assert overview.json()["warnings"]
 
@@ -555,6 +597,47 @@ def test_daily_and_money_flow_windows_degrade_when_requested_coverage_is_short(
     assert "requested 10 daily bars, found 6" in daily.json()["warnings"]
     assert flow.json()["status"] == "degraded"
     assert "requested 2 money-flow rows, found 1" in flow.json()["warnings"]
+
+
+def test_time_series_endpoints_preserve_persisted_stale_and_failed_statuses(
+    tmp_path,
+) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    snapshot_id = seed_market_data(settings)
+    with connect(settings) as connection:
+        repository = MarketInputSnapshotRepository(connection)
+        snapshot = repository.get(snapshot_id)
+        assert snapshot is not None
+        repository.save(
+            snapshot.model_copy(
+                update={
+                    "dataset_quality": {
+                        "600000": {
+                            CaptureDataset.DAILY_BAR: DatasetQuality(
+                                status=CaptureResultStatus.STALE,
+                                warning="daily source is stale",
+                            ),
+                            CaptureDataset.MONEY_FLOW: DatasetQuality(
+                                status=CaptureResultStatus.FAILED,
+                                warning="money-flow source failed",
+                            ),
+                        }
+                    }
+                }
+            )
+        )
+
+    daily = client.get(
+        "/api/v1/market/symbols/600000/daily-bars?limit=2", headers=headers
+    )
+    flow = client.get(
+        "/api/v1/market/symbols/600000/money-flow?limit=1", headers=headers
+    )
+
+    assert daily.json()["status"] == "stale"
+    assert "daily source is stale" in daily.json()["warnings"]
+    assert flow.json()["status"] == "failed"
+    assert "money-flow source failed" in flow.json()["warnings"]
 
 
 def test_daily_window_degrades_when_trading_date_range_has_a_gap(tmp_path) -> None:
@@ -656,6 +739,101 @@ def test_latest_intraday_strength_maps_components_and_quality(tmp_path) -> None:
     assert body["degraded_reason"] is None
     assert body["components"][0]["key"] == "vwap_position"
     assert body["components"][0]["status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    ("quality_status", "quality_warning"),
+    [
+        (CaptureResultStatus.FAILED, "latest strength capture failed"),
+        (CaptureResultStatus.STALE, "latest strength capture is stale"),
+    ],
+)
+def test_strength_scanner_and_overview_preserve_latest_persisted_quality(
+    tmp_path,
+    quality_status: CaptureResultStatus,
+    quality_warning: str,
+) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    snapshot_id = seed_market_data(settings)
+    with connect(settings) as connection:
+        repository = MarketInputSnapshotRepository(connection)
+        snapshot = repository.get(snapshot_id)
+        assert snapshot is not None
+        repository.save(
+            snapshot.model_copy(
+                update={
+                    "dataset_quality": {
+                        "600000": {
+                            CaptureDataset.INTRADAY_STRENGTH: DatasetQuality(
+                                status=quality_status,
+                                warning=quality_warning,
+                            )
+                        }
+                    }
+                }
+            )
+        )
+
+    strength = client.get(
+        "/api/v1/market/symbols/600000/intraday-strength/latest", headers=headers
+    )
+    scanner = client.get("/api/v1/market/symbols", headers=headers)
+    overview = client.get(
+        "/api/v1/market/symbols/600000/overview", headers=headers
+    )
+
+    expected_status = quality_status.value
+    scanner_item = next(
+        item for item in scanner.json()["items"] if item["symbol"] == "600000"
+    )
+    assert strength.json()["status"] == expected_status
+    assert scanner_item["quality_status"] == expected_status
+    assert overview.json()["status"] == expected_status
+    assert quality_warning in strength.json()["warnings"]
+    assert quality_warning in scanner_item["warnings"]
+    assert quality_warning in overview.json()["warnings"]
+    assert strength.json()["label"] == "strong"
+    assert scanner_item["intraday_strength"] == "strong"
+    assert overview.json()["intraday_strength"]["label"] == "strong"
+
+
+def test_old_minute_and_strength_data_are_marked_stale(tmp_path, monkeypatch) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    snapshot_id = seed_market_data(settings)
+    with connect(settings) as connection:
+        repository = MarketInputSnapshotRepository(connection)
+        snapshot = repository.get(snapshot_id)
+        assert snapshot is not None
+        repository.save(
+            snapshot.model_copy(
+                update={
+                    "dataset_quality": {
+                        "600000": {
+                            CaptureDataset.MINUTE_BAR: DatasetQuality(
+                                status=CaptureResultStatus.STALE,
+                                data_time=datetime(2026, 7, 13, 10, 2, tzinfo=SHANGHAI),
+                                warning="minute data is stale",
+                            ),
+                            CaptureDataset.INTRADAY_STRENGTH: DatasetQuality(
+                                status=CaptureResultStatus.STALE,
+                                data_time=datetime(2026, 7, 13, 10, 2, tzinfo=SHANGHAI),
+                                warning="strength data is stale",
+                            ),
+                        }
+                    }
+                }
+            )
+        )
+
+    minute = client.get("/api/v1/market/symbols/600000/minute-bars", headers=headers)
+    strength = client.get(
+        "/api/v1/market/symbols/600000/intraday-strength/latest", headers=headers
+    )
+
+    assert minute.json()["status"] == "stale"
+    assert "minute data is stale" in minute.json()["warnings"]
+    assert strength.json()["status"] == "stale"
+    assert "strength data is stale" in strength.json()["warnings"]
 
 
 def test_market_run_list_detail_results_and_missing_error(tmp_path) -> None:

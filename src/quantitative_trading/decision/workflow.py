@@ -11,10 +11,12 @@ from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.decision.models import DecisionSymbolInput
 from quantitative_trading.decision.service import decide_symbol
 from quantitative_trading.feedback.repository import FeedbackRepository
+from quantitative_trading.cash.repository import CashAccountRepository
 from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.market.adapters import (
     DailyBarProvider,
     IntradayProvider,
+    MarketProviderError,
     MoneyFlowProvider,
 )
 from quantitative_trading.market.backfill import HeavyDataBackfillService
@@ -24,6 +26,7 @@ from quantitative_trading.market.cli_service import (
     MarketCliService,
 )
 from quantitative_trading.market.features import (
+    IntradayStrengthRules,
     calculate_daily_features,
     calculate_intraday_strength,
     select_market_structure,
@@ -130,6 +133,9 @@ class WorkflowAlreadyRunningError(CaptureRunAlreadyActiveError):
 
 
 class DecisionWorkflow:
+    CLOSE_LEASE = timedelta(minutes=10)
+    INTRADAY_LEASE = timedelta(minutes=10)
+
     def __init__(
         self,
         connection: sqlite3.Connection,
@@ -141,6 +147,7 @@ class DecisionWorkflow:
         intraday_provider: IntradayProvider,
         now: Callable[[], datetime],
         stale_trading_minutes: int = 6,
+        strength_rules: IntradayStrengthRules | None = None,
         notification_dispatcher: RecommendationDispatcher | None = None,
     ) -> None:
         self.connection = connection
@@ -153,6 +160,7 @@ class DecisionWorkflow:
         if stale_trading_minutes < 1:
             raise ValueError("stale trading minute threshold must be positive")
         self.stale_trading_minutes = stale_trading_minutes
+        self.strength_rules = strength_rules or IntradayStrengthRules()
         self.notification_dispatcher = notification_dispatcher
 
     def run_backfill(
@@ -184,6 +192,11 @@ class DecisionWorkflow:
             money_flow_provider=self.money_flow_provider,
             now=self.now,
         )
+
+    @staticmethod
+    def _require_provider_capture_error(exc: Exception) -> None:
+        if not isinstance(exc, MarketProviderError):
+            raise exc
 
     def _claim_retry_or_raise(
         self,
@@ -239,6 +252,11 @@ class DecisionWorkflow:
         started_at = self._now()
         run_id = f"close-{trade_date:%Y%m%d}"
         run_repository = MarketCaptureRunRepository(self.connection)
+        run_repository.fail_expired_workflow_runs(
+            "close",
+            started_before=started_at - self.CLOSE_LEASE,
+            finished_at=started_at,
+        )
         run, created = run_repository.get_or_create(
             MarketCaptureRun(
                 run_id=run_id,
@@ -249,12 +267,6 @@ class DecisionWorkflow:
                 started_at=started_at,
             )
         )
-        if (
-            not created
-            and run.status is CaptureRunStatus.RUNNING
-            and started_at - run.started_at < timedelta(minutes=45)
-        ):
-            raise WorkflowAlreadyRunningError(run.run_id)
         if not created:
             existing_plan = TradingPlanRepository(self.connection).active_for_day(
                 self.calendar.next_trading_day(trade_date)
@@ -289,12 +301,33 @@ class DecisionWorkflow:
                     plan_id=existing_plan.plan_id,
                     warnings=tuple(existing_plan.warnings),
                 )
+            if (
+                run.status is CaptureRunStatus.SUCCEEDED
+                and run.requested_symbols == 0
+                and run.plan_count == 0
+            ):
+                snapshot_id = self._market_input_id_for_run(run.run_id)
+                snapshot = MarketInputSnapshotRepository(self.connection).get(snapshot_id)
+                return CloseWorkflowResult(
+                    run_id=run.run_id,
+                    ready=True,
+                    reused=True,
+                    market_input_snapshot_id=snapshot_id,
+                    plan_id=None,
+                    warnings=() if snapshot is None else tuple(snapshot.warnings),
+                )
+        if (
+            not created
+            and run.status is CaptureRunStatus.RUNNING
+            and started_at - run.started_at < self.CLOSE_LEASE
+        ):
+            raise WorkflowAlreadyRunningError(run.run_id)
         if not created:
             run = self._claim_retry_or_raise(
                 run_repository,
                 run,
                 started_at=started_at,
-                stale_after=timedelta(minutes=45),
+                stale_after=self.CLOSE_LEASE,
                 retryable_statuses={
                     CaptureRunStatus.FAILED,
                     CaptureRunStatus.DEGRADED,
@@ -367,7 +400,14 @@ class DecisionWorkflow:
         flow_refs: dict[str, int] = {}
         dataset_quality: dict[str, dict[CaptureDataset, DatasetQuality]] = {}
         result_repository = MarketCaptureResultRepository(self.connection)
-        hard_ready = True
+        session_close = (
+            self.calendar.session(trade_date).close_at
+            if self.calendar.is_trading_day(trade_date)
+            else None
+        )
+        hard_ready = session_close is None or started_at >= session_close
+        if symbols and not hard_ready:
+            warnings.append("交易时段尚未收盘，不能发布次日计划")
         provider_calls = 1 if symbols else 0
         rows_received = len(quotes)
         rows_written = len(quote_refs)
@@ -375,6 +415,85 @@ class DecisionWorkflow:
         for symbol in symbols:
             quality: dict[CaptureDataset, DatasetQuality] = {}
             quote = quotes[symbol]
+            try:
+                provider_started = perf_counter()
+                history = backfill.backfill_daily(run_id, symbol, trade_date)
+            except Exception as exc:
+                self._require_provider_capture_error(exc)
+                warning = f"{symbol} 日 K 采集失败: {safe_error_summary(exc)}"
+                warnings.append(warning)
+                hard_ready = False
+                quality[CaptureDataset.DAILY_BAR] = DatasetQuality(
+                    status=CaptureResultStatus.FAILED,
+                    expected_rows=250,
+                    actual_rows=0,
+                    source="daily_provider",
+                    warning=warning,
+                )
+                result_repository.upsert(
+                    MarketCaptureResult(
+                        run_id=run_id,
+                        symbol=symbol,
+                        dataset=CaptureDataset.DAILY_BAR,
+                        status=CaptureResultStatus.FAILED,
+                        fetched_at=started_at,
+                        expected_rows=250,
+                        source="daily_provider",
+                        error_summary=warning,
+                    )
+                )
+            else:
+                provider_calls += history.provider_calls
+                rows_received += history.rows_received
+                rows_written += history.rows_written
+                history_refs[symbol] = history.snapshot_id
+                history_ready = (
+                    history.snapshot.data_end == trade_date
+                    and history.snapshot.row_count >= 20
+                )
+                if not history_ready:
+                    hard_ready = False
+                quality[CaptureDataset.DAILY_BAR] = DatasetQuality(
+                    status=(
+                        history.snapshot.status
+                        if history_ready
+                        else CaptureResultStatus.FAILED
+                    ),
+                    data_start=history.snapshot.data_start,
+                    data_end=history.snapshot.data_end,
+                    expected_rows=250,
+                    actual_rows=history.row_count,
+                    source="daily_provider",
+                    warning=history.snapshot.warning,
+                )
+                result_repository.upsert(
+                    MarketCaptureResult(
+                        run_id=run_id,
+                        symbol=symbol,
+                        dataset=CaptureDataset.DAILY_BAR,
+                        status=quality[CaptureDataset.DAILY_BAR].status,
+                        data_start=history.snapshot.data_start,
+                        data_end=history.snapshot.data_end,
+                        fetched_at=history.snapshot.fetched_at,
+                        expected_rows=250,
+                        actual_rows=history.row_count,
+                        source="daily_provider",
+                        warning=history.snapshot.warning,
+                    )
+                )
+            finally:
+                provider_duration_ms += (perf_counter() - provider_started) * 1000
+
+            quote = self._verify_close_quote_from_daily_bar(
+                quote,
+                trade_date=trade_date,
+                daily_repository=daily_repository,
+                observed_at=started_at,
+            )
+            if quote is not quotes[symbol]:
+                quote_refs[symbol] = QuoteSnapshotRepository(self.connection).save(quote)
+                quotes[symbol] = quote
+                rows_written += 1
             quote_usable = (
                 quote.status in {QuoteStatus.OK, QuoteStatus.PARTIAL}
                 and quote.data_time is not None
@@ -417,78 +536,10 @@ class DecisionWorkflow:
                 hard_ready = False
 
             try:
-                provider_calls += 1
-                provider_started = perf_counter()
-                history = backfill.backfill_daily(run_id, symbol, trade_date)
-            except Exception as exc:
-                warning = f"{symbol} 日 K 采集失败: {safe_error_summary(exc)}"
-                warnings.append(warning)
-                hard_ready = False
-                quality[CaptureDataset.DAILY_BAR] = DatasetQuality(
-                    status=CaptureResultStatus.FAILED,
-                    expected_rows=250,
-                    actual_rows=0,
-                    source="daily_provider",
-                    warning=warning,
-                )
-                result_repository.upsert(
-                    MarketCaptureResult(
-                        run_id=run_id,
-                        symbol=symbol,
-                        dataset=CaptureDataset.DAILY_BAR,
-                        status=CaptureResultStatus.FAILED,
-                        fetched_at=started_at,
-                        expected_rows=250,
-                        source="daily_provider",
-                        error_summary=warning,
-                    )
-                )
-            else:
-                rows_received += history.row_count
-                rows_written += history.row_count
-                history_refs[symbol] = history.snapshot_id
-                history_ready = (
-                    history.snapshot.data_end == trade_date
-                    and history.snapshot.row_count >= 20
-                )
-                if not history_ready:
-                    hard_ready = False
-                quality[CaptureDataset.DAILY_BAR] = DatasetQuality(
-                    status=(
-                        history.snapshot.status
-                        if history_ready
-                        else CaptureResultStatus.FAILED
-                    ),
-                    data_start=history.snapshot.data_start,
-                    data_end=history.snapshot.data_end,
-                    expected_rows=250,
-                    actual_rows=history.row_count,
-                    source="daily_provider",
-                    warning=history.snapshot.warning,
-                )
-                result_repository.upsert(
-                    MarketCaptureResult(
-                        run_id=run_id,
-                        symbol=symbol,
-                        dataset=CaptureDataset.DAILY_BAR,
-                        status=quality[CaptureDataset.DAILY_BAR].status,
-                        data_start=history.snapshot.data_start,
-                        data_end=history.snapshot.data_end,
-                        fetched_at=history.snapshot.fetched_at,
-                        expected_rows=250,
-                        actual_rows=history.row_count,
-                        source="daily_provider",
-                        warning=history.snapshot.warning,
-                    )
-                )
-            finally:
-                provider_duration_ms += (perf_counter() - provider_started) * 1000
-
-            try:
-                provider_calls += 1
                 provider_started = perf_counter()
                 flow = backfill.backfill_money_flow(run_id, symbol, trade_date)
             except Exception as exc:
+                self._require_provider_capture_error(exc)
                 warning = f"{symbol} 资金流采集失败: {safe_error_summary(exc)}"
                 warnings.append(warning)
                 quality[CaptureDataset.MONEY_FLOW] = DatasetQuality(
@@ -511,8 +562,9 @@ class DecisionWorkflow:
                     )
                 )
             else:
-                rows_received += flow.row_count
-                rows_written += flow.row_count
+                provider_calls += flow.provider_calls
+                rows_received += flow.rows_received
+                rows_written += flow.rows_written
                 flow_refs[symbol] = flow.snapshot_id
                 quality[CaptureDataset.MONEY_FLOW] = DatasetQuality(
                     status=flow.snapshot.status,
@@ -557,8 +609,8 @@ class DecisionWorkflow:
                 "stale_trading_minutes": float(self.stale_trading_minutes),
             },
             data_time=(
-                self.calendar.session(trade_date).close_at
-                if symbols and hard_ready
+                session_close
+                if symbols and hard_ready and session_close is not None
                 else min(data_times)
                 if data_times
                 else None
@@ -569,6 +621,26 @@ class DecisionWorkflow:
         market_input_snapshot_id = MarketInputSnapshotRepository(self.connection).save(
             market_input
         )
+
+        if not symbols:
+            run_repository.update_claimed(
+                run.model_copy(
+                    update={
+                        "status": CaptureRunStatus.SUCCEEDED,
+                        "finished_at": self._now(),
+                        "warning_count": len(warnings),
+                    }
+                ),
+                claim_started_at=run.started_at,
+            )
+            return CloseWorkflowResult(
+                run_id=run_id,
+                ready=True,
+                reused=False,
+                market_input_snapshot_id=market_input_snapshot_id,
+                plan_id=None,
+                warnings=tuple(warnings),
+            )
 
         if not hard_ready:
             finished = self._now()
@@ -621,6 +693,14 @@ class DecisionWorkflow:
             daily_repository,
             flow_repository,
             dataset_quality,
+            positions=positions,
+            account_snapshot_id=account_created.snapshot_id,
+            account_snapshot=account_created.snapshot,
+            cash_updated_at=(
+                None
+                if CashAccountRepository(self.connection).get() is None
+                else CashAccountRepository(self.connection).get().updated_at
+            ),
         )
         plan_symbols = [
             item.model_copy(
@@ -664,18 +744,22 @@ class DecisionWorkflow:
             now=started_at,
         )
 
-        has_optional_degradation = any(
-            quality.get(CaptureDataset.MONEY_FLOW) is None
-            or quality[CaptureDataset.MONEY_FLOW].status
-            is not CaptureResultStatus.COMPLETE
+        has_degradation = any(
+            item.status is not CaptureResultStatus.COMPLETE
             for quality in dataset_quality.values()
+            for item in quality.values()
+        )
+        failure_count = sum(
+            item.status is CaptureResultStatus.FAILED
+            for quality in dataset_quality.values()
+            for item in quality.values()
         )
         run_repository.update_claimed(
             run.model_copy(
                 update={
                     "status": (
                         CaptureRunStatus.DEGRADED
-                        if has_optional_degradation
+                        if has_degradation
                         else CaptureRunStatus.SUCCEEDED
                     ),
                     "finished_at": self._now(),
@@ -687,7 +771,7 @@ class DecisionWorkflow:
                     "plan_count": 1,
                     "email_outbox_count": int(summary_delivery is not None),
                     "warning_count": len(warnings),
-                    "failure_count": 0,
+                    "failure_count": failure_count,
                 }
             ),
             claim_started_at=run.started_at,
@@ -711,18 +795,31 @@ class DecisionWorkflow:
         period_start = local_now.replace(minute=period_minute, second=0, microsecond=0)
         run_id = f"intraday-{trade_date:%Y%m%d}-{period_start:%H%M}"
         run_repository = MarketCaptureRunRepository(self.connection)
-        run, created = run_repository.get_or_create(
-            MarketCaptureRun(
-                run_id=run_id,
-                workflow_type="intraday",
-                trade_date=trade_date,
-                period_start=period_start,
-                period_end=period_start + timedelta(minutes=3),
-                idempotency_key=f"intraday:{trade_date.isoformat()}:{period_start:%H%M}",
-                status=CaptureRunStatus.RUNNING,
-                started_at=started_at,
-            )
+        run_repository.fail_expired_intraday_runs(
+            period_ended_by=period_start,
+            lease_started_before=started_at - self.INTRADAY_LEASE,
+            finished_at=started_at,
         )
+        run_repository.fail_expired_workflow_runs(
+            "intraday",
+            started_before=started_at - self.INTRADAY_LEASE,
+            finished_at=started_at,
+        )
+        try:
+            run, created = run_repository.get_or_create(
+                MarketCaptureRun(
+                    run_id=run_id,
+                    workflow_type="intraday",
+                    trade_date=trade_date,
+                    period_start=period_start,
+                    period_end=period_start + timedelta(minutes=3),
+                    idempotency_key=f"intraday:{trade_date.isoformat()}:{period_start:%H%M}",
+                    status=CaptureRunStatus.RUNNING,
+                    started_at=started_at,
+                )
+            )
+        except CaptureRunAlreadyActiveError as exc:
+            raise WorkflowAlreadyRunningError(exc.run_id) from exc
         if not created and run.status in {
             CaptureRunStatus.SUCCEEDED,
             CaptureRunStatus.DEGRADED,
@@ -737,19 +834,58 @@ class DecisionWorkflow:
                 if existing and existing[0].market_input_snapshot_id is not None
                 else self._market_input_id_for_run(run_id)
             )
+            projection_warnings: list[str] = []
+            recovered_notification_count = 0
+            recovered_outbox_count = 0
+            if self.notification_dispatcher is not None:
+                for recommendation in existing:
+                    dispatch = self.notification_dispatcher.dispatch_recommendation(
+                        recommendation,
+                        plan_version=recommendation.plan_version,
+                        now=started_at,
+                    )
+                    if dispatch is None:
+                        continue
+                    recovered_notification_count += int(
+                        bool(getattr(dispatch, "created", False))
+                    )
+                    recovered_outbox_count += int(
+                        getattr(dispatch, "email_delivery", None) is not None
+                    )
+                    projection_warnings.extend(getattr(dispatch, "warnings", ()))
+            notification_count = max(
+                run.notification_count,
+                recovered_notification_count,
+            )
+            email_outbox_count = max(
+                run.email_outbox_count,
+                recovered_outbox_count,
+            )
+            if (
+                notification_count != run.notification_count
+                or email_outbox_count != run.email_outbox_count
+            ):
+                run = run.model_copy(
+                    update={
+                        "notification_count": notification_count,
+                        "email_outbox_count": email_outbox_count,
+                    }
+                )
+                run_repository.update(run)
             return IntradayWorkflowResult(
                 run_id=run_id,
                 reused=True,
                 status=run.status,
                 market_input_snapshot_id=snapshot_id,
                 recommendation_ids=tuple(item.recommendation_id for item in existing),
+                warnings=tuple(projection_warnings),
             )
         if not created:
             run = self._claim_retry_or_raise(
                 run_repository,
                 run,
                 started_at=started_at,
-                stale_after=timedelta(minutes=10),
+                stale_after=self.INTRADAY_LEASE,
                 retryable_statuses={CaptureRunStatus.FAILED},
             )
 
@@ -783,6 +919,15 @@ class DecisionWorkflow:
         positions_by_symbol = {position.symbol: position for position in positions}
         plan_repository = TradingPlanRepository(self.connection)
         plan = plan_repository.active_for_day(trade_date)
+        if plan is not None and started_at > plan.valid_until:
+            plan_repository.mark_expired(plan)
+            plan = None
+        elif plan is not None and self._plan_authority_context_changed(plan, positions):
+            plan_repository.mark_stale(
+                plan,
+                warning="手动持仓台账或手动资金在计划生成后发生变化",
+            )
+            plan = None
         plan_symbols = set() if plan is None else set(plan.symbol_contexts)
         symbols = sorted(set(positions_by_symbol) | plan_symbols)
 
@@ -813,7 +958,10 @@ class DecisionWorkflow:
         result_repository = MarketCaptureResultRepository(self.connection)
         dataset_quality: dict[str, dict[CaptureDataset, DatasetQuality]] = {}
         for symbol, quote in quotes.items():
-            quote_usable = quote.status in {QuoteStatus.OK, QuoteStatus.PARTIAL}
+            quote_usable = (
+                quote.status in {QuoteStatus.OK, QuoteStatus.PARTIAL}
+                and quote.data_time is not None
+            )
             status = (
                 CaptureResultStatus.COMPLETE
                 if quote.status is QuoteStatus.OK
@@ -893,7 +1041,7 @@ class DecisionWorkflow:
                 provider_calls += 1
                 provider_started = perf_counter()
                 try:
-                    minute_bars = list(
+                    fetched_minute_bars = list(
                         self.intraday_provider.get_minute_bars(
                             symbol, trade_date, "1m"
                         )
@@ -902,8 +1050,9 @@ class DecisionWorkflow:
                     provider_duration_ms += (
                         perf_counter() - provider_started
                     ) * 1000
-                rows_received += len(minute_bars)
-                rows_written += minute_repository.upsert_many(minute_bars)
+                rows_received += len(fetched_minute_bars)
+                rows_written += minute_repository.upsert_many(fetched_minute_bars)
+                minute_bars = minute_repository.for_trade_date(symbol, trade_date)
                 daily_bars = daily_repository.current(symbol, limit=2)
                 previous_daily = (
                     None
@@ -923,6 +1072,7 @@ class DecisionWorkflow:
                     minute_bars,
                     self.calendar,
                     previous_daily_bar=previous_daily,
+                    rules=self.strength_rules,
                     fetched_at=started_at,
                 )
                 strength = strength.model_copy(
@@ -958,6 +1108,7 @@ class DecisionWorkflow:
                     )
                 strength_id = strength_repository.save(strength)
             except Exception as exc:
+                self._require_provider_capture_error(exc)
                 warning = f"{symbol} 分时采集或强弱计算失败: {safe_error_summary(exc)}"
                 warnings.append(warning)
                 dataset_quality.setdefault(symbol, {})[CaptureDataset.MINUTE_BAR] = (
@@ -1111,6 +1262,19 @@ class DecisionWorkflow:
             plan_context = None if plan is None else plan.symbol_contexts.get(symbol)
             strength = strength_by_symbol.get(symbol)
             quote = quotes[symbol]
+            verified_price = (
+                quote.current_price
+                if quote.status in {QuoteStatus.OK, QuoteStatus.PARTIAL}
+                and quote.data_time is not None
+                else None
+            )
+            decision_data_time = (
+                quote.data_time
+                or (None if strength is None else strength.data_time)
+                or market_input.data_time
+            )
+            if decision_data_time is None:
+                raise ValueError("decision requires verified market data time")
             current_flows = flow_repository.current(symbol, limit=1)
             money_flow_confirmed = (
                 None
@@ -1118,7 +1282,7 @@ class DecisionWorkflow:
                 else current_flows[-1].flow.main_net_amount > 0
             )
             metrics = {
-                "current_price": quote.current_price,
+                "current_price": verified_price,
                 "intraday_strength": (
                     "neutral" if strength is None else strength.label.value
                 ),
@@ -1210,7 +1374,7 @@ class DecisionWorkflow:
                     else symbol
                 ),
                 is_holding=is_holding,
-                current_price=quote.current_price,
+                current_price=verified_price,
                 support_price=levels.get("support"),
                 stop_loss_price=levels.get("stop_loss"),
                 short_ma=(
@@ -1228,7 +1392,7 @@ class DecisionWorkflow:
                 ),
                 daily_structure_confirmed=_daily_structure_confirmed(
                     plan_context,
-                    quote.current_price,
+                    verified_price,
                 ),
                 intraday_strength=(
                     "neutral" if strength is None else strength.label.value
@@ -1244,14 +1408,14 @@ class DecisionWorkflow:
                     "source": "manual_cash_account_and_market_snapshot",
                 },
                 price_context={
-                    "current_price": quote.current_price,
+                    "current_price": verified_price,
                     "change_pct": quote.change_pct,
                     "key_levels": levels,
                 },
                 data_references=data_references,
                 invalid_if=invalid_if,
                 warnings=_stable_unique([*warnings, *account_snapshot.warnings]),
-                data_time=quote.data_time or started_at,
+                data_time=decision_data_time,
                 valid_until=(
                     plan.valid_until
                     if plan is not None
@@ -1333,13 +1497,69 @@ class DecisionWorkflow:
             }:
                 reserved_trade_count += 1
 
-        recommendations = self._persist_recommendations_with_audits(
-            recommendations,
-            created_at=started_at,
-        )
         notification_count = 0
         email_outbox_count = 0
-        if self.notification_dispatcher is not None:
+        transactional_dispatcher = (
+            self.notification_dispatcher
+            if self.notification_dispatcher is not None
+            and callable(
+                getattr(
+                    self.notification_dispatcher,
+                    "persist_local_recommendation",
+                    None,
+                )
+            )
+            else None
+        )
+        local_dispatches = []
+        if transactional_dispatcher is not None:
+            savepoint = "recommendation_notification_stage"
+            self.connection.execute(f"SAVEPOINT {savepoint}")
+            try:
+                recommendations = self._persist_recommendations_with_audits(
+                    recommendations,
+                    created_at=started_at,
+                    commit=False,
+                )
+                local_dispatches = [
+                    transactional_dispatcher.persist_local_recommendation(
+                        recommendation,
+                        plan_version=None if plan is None else plan.version,
+                        now=started_at,
+                        commit=False,
+                    )
+                    for recommendation in recommendations
+                ]
+                self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                self.connection.commit()
+            except BaseException:
+                if self.connection.in_transaction:
+                    self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                self.connection.rollback()
+                raise
+            for recommendation, local in zip(
+                recommendations,
+                local_dispatches,
+                strict=True,
+            ):
+                dispatch = transactional_dispatcher.project_recommendation(
+                    recommendation,
+                    local,
+                    plan_version=None if plan is None else plan.version,
+                    now=started_at,
+                )
+                notification_count += int(bool(getattr(dispatch, "created", False)))
+                email_outbox_count += int(
+                    getattr(dispatch, "email_delivery", None) is not None
+                )
+                warnings.extend(getattr(dispatch, "warnings", ()))
+        else:
+            recommendations = self._persist_recommendations_with_audits(
+                recommendations,
+                created_at=started_at,
+            )
+        if self.notification_dispatcher is not None and transactional_dispatcher is None:
             for recommendation in recommendations:
                 dispatch = self.notification_dispatcher.dispatch_recommendation(
                     recommendation,
@@ -1401,6 +1621,45 @@ class DecisionWorkflow:
             warnings=tuple(warnings),
         )
 
+    def _verify_close_quote_from_daily_bar(
+        self,
+        quote: QuoteSnapshot,
+        *,
+        trade_date: date,
+        daily_repository: DailyBarRepository,
+        observed_at: datetime,
+    ) -> QuoteSnapshot:
+        if (
+            quote.status not in {QuoteStatus.OK, QuoteStatus.PARTIAL}
+            or quote.data_time is not None
+            or quote.current_price is None
+        ):
+            return quote
+        session_close = self.calendar.session(trade_date).close_at
+        if observed_at < session_close:
+            return quote
+        current_bars = daily_repository.current(quote.symbol, limit=1)
+        if not current_bars:
+            return quote
+        daily_bar = current_bars[-1].bar
+        if daily_bar.trade_date != trade_date or not _prices_match(
+            quote.current_price,
+            daily_bar.close,
+        ):
+            return quote
+        verification_warning = "market time verified against same-day daily close"
+        return quote.model_copy(
+            update={
+                "data_time": session_close,
+                "status": QuoteStatus.PARTIAL,
+                "warning": "; ".join(
+                    value
+                    for value in (quote.warning, verification_warning)
+                    if value
+                ),
+            }
+        )
+
     def _capture_quotes(
         self,
         run_id: str,
@@ -1412,7 +1671,7 @@ class DecisionWorkflow:
         provider_started = perf_counter()
         try:
             returned = self.quote_provider.get_quotes(symbols)
-        except Exception as exc:
+        except MarketProviderError as exc:
             summary = safe_error_summary(exc)
             returned = {}
             provider_warning = f"批量报价失败: {summary}"
@@ -1434,6 +1693,23 @@ class DecisionWorkflow:
                     status=QuoteStatus.FAILED,
                     warning=provider_warning
                     or "provider did not return requested quote",
+                )
+            elif (
+                quote.status in {QuoteStatus.OK, QuoteStatus.PARTIAL}
+                and quote.data_time is None
+            ):
+                quote = quote.model_copy(
+                    update={
+                        "status": QuoteStatus.PARTIAL,
+                        "warning": "; ".join(
+                            value
+                            for value in (
+                                quote.warning,
+                                "market source time unavailable",
+                            )
+                            if value
+                        ),
+                    }
                 )
             elif (
                 quote.status in {QuoteStatus.OK, QuoteStatus.PARTIAL}
@@ -1505,7 +1781,13 @@ class DecisionWorkflow:
         daily_repository: DailyBarRepository,
         flow_repository: MoneyFlowRepository,
         dataset_quality: dict[str, dict[CaptureDataset, DatasetQuality]],
+        *,
+        positions,
+        account_snapshot_id: int,
+        account_snapshot,
+        cash_updated_at: datetime | None,
     ) -> list[MarketPlanSymbolInput]:
+        positions_by_symbol = {position.symbol: position for position in positions}
         results: list[MarketPlanSymbolInput] = []
         for member in members:
             quote = quotes[member.symbol]
@@ -1537,6 +1819,7 @@ class DecisionWorkflow:
             )
             symbol_quality = dataset_quality.get(member.symbol, {})
             relevant_quality = [
+                symbol_quality.get(CaptureDataset.QUOTE),
                 symbol_quality.get(CaptureDataset.DAILY_BAR),
                 symbol_quality.get(CaptureDataset.MONEY_FLOW),
             ]
@@ -1569,17 +1852,87 @@ class DecisionWorkflow:
                     daily_feature_facts=feature_facts,
                     market_structure=asdict(structure),
                     money_flow=money_flow,
+                    position_context=self._plan_position_context(
+                        positions_by_symbol.get(member.symbol)
+                    ),
+                    account_context={
+                        "snapshot_id": account_snapshot_id,
+                        "source": "manual_cash_account_and_market_snapshot",
+                        "status": account_snapshot.status.value,
+                        "created_at": account_snapshot.created_at.isoformat(),
+                        "cash_updated_at": (
+                            None
+                            if cash_updated_at is None
+                            else cash_updated_at.isoformat()
+                        ),
+                        "total_assets": account_snapshot.total_assets,
+                        "position_ratio": account_snapshot.position_ratio,
+                        "available_buying_cash": account_snapshot.available_buying_cash,
+                        "warnings": list(account_snapshot.warnings),
+                    },
                     data_quality=quality,
                     warnings=quality_warnings,
                 )
             )
         return results
 
+    @staticmethod
+    def _plan_position_context(position) -> dict[str, Any]:
+        if position is None:
+            return {
+                "source": "manual_ledger",
+                "status": "no_position",
+                "quantity": 0,
+                "available_quantity": 0,
+                "cost_price": None,
+                "updated_at": None,
+            }
+        return {
+            "source": "manual_ledger",
+            "status": "holding",
+            "symbol": position.symbol,
+            "name": position.name,
+            "quantity": position.quantity,
+            "available_quantity": position.available_quantity,
+            "cost_price": position.cost_price,
+            "opened_at": position.opened_at.isoformat(),
+            "updated_at": position.updated_at.isoformat(),
+            "note": position.note,
+        }
+
+    def _plan_authority_context_changed(self, plan, positions) -> bool:
+        current_positions = {position.symbol: position for position in positions}
+        planned_symbols = set(plan.symbol_contexts)
+        for symbol in planned_symbols | set(current_positions):
+            context = (
+                None
+                if symbol not in plan.symbol_contexts
+                else plan.symbol_contexts[symbol].position_context
+            )
+            current = current_positions.get(symbol)
+            if context is None:
+                return True
+            planned_updated_at = context.get("updated_at")
+            current_updated_at = None if current is None else current.updated_at.isoformat()
+            if planned_updated_at != current_updated_at:
+                return True
+        cash = CashAccountRepository(self.connection).get()
+        current_cash_updated_at = None if cash is None else cash.updated_at.isoformat()
+        planned_cash_times = {
+            context.account_context.get("cash_updated_at")
+            for context in plan.symbol_contexts.values()
+        }
+        return bool(
+            planned_cash_times
+            and planned_cash_times != {current_cash_updated_at}
+        )
+
     def _persist_recommendations_with_audits(
         self,
         recommendations: list[Recommendation],
         *,
         created_at: datetime,
+        commit: bool = True,
     ) -> list[Recommendation]:
         savepoint = "persist_recommendations_with_audits"
         self.connection.execute(f"SAVEPOINT {savepoint}")
@@ -1621,7 +1974,8 @@ class DecisionWorkflow:
             self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
             self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return saved
 
     def _decision_references(
@@ -1730,14 +2084,14 @@ def _trading_minute_lag(
     calendar: XSHGTradingCalendar,
     data_time: datetime,
     now: datetime,
-) -> int:
+) -> float:
     if (
         data_time.tzinfo is None
         or data_time.utcoffset() is None
         or now.tzinfo is None
         or now.utcoffset() is None
     ):
-        return 7
+        return float("inf")
     local_data_time = data_time.astimezone(calendar.timezone)
     local_now = now.astimezone(calendar.timezone)
     if (
@@ -1745,12 +2099,16 @@ def _trading_minute_lag(
         or not calendar.is_trading_day(local_now.date())
         or local_data_time > local_now
     ):
-        return 7
+        return float("inf")
     return max(
         0,
         calendar.expected_minutes_through(local_now)
         - calendar.expected_minutes_through(local_data_time),
     )
+
+
+def _prices_match(left: float, right: float) -> bool:
+    return abs(left - right) <= 1e-9
 
 
 def _risk_context_state(

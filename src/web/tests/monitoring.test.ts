@@ -20,23 +20,44 @@ beforeEach(() => {
   localStorage.clear()
 })
 
-test('展示调度和快照控制按钮及安全文案', async () => {
+test('展示调度和盘中工作流控制按钮及安全文案', async () => {
   renderMonitoring()
 
   expect(screen.getByRole('heading', { name: '监控' })).toBeInTheDocument()
   expect(screen.getByRole('button', { name: '启动工作流调度' })).toBeInTheDocument()
   expect(screen.getByRole('button', { name: '停止工作流调度' })).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '生成一次账户快照' })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '运行盘中工作流' })).toBeInTheDocument()
   expect(screen.getByText(/不执行真实交易/)).toBeInTheDocument()
 })
 
-test('点击生成快照后显示已请求提示', async () => {
+test('点击运行盘中工作流后显示已请求提示', async () => {
   const user = userEvent.setup()
   renderMonitoring()
 
-  await user.click(screen.getByRole('button', { name: '生成一次账户快照' }))
+  await user.click(screen.getByRole('button', { name: '运行盘中工作流' }))
 
-  await waitFor(() => expect(screen.getByText('已请求生成账户快照')).toBeInTheDocument())
+  await waitFor(() => expect(screen.getByText('已请求运行盘中决策工作流')).toBeInTheDocument())
+})
+
+test('盘中工作流请求失败时显示稳定错误且不显示成功提示', async () => {
+  server.use(
+    http.post('/api/v1/service/workflows/intraday/run', () =>
+      HttpResponse.json(
+        { error: { code: 'workflow_failed', message: 'provider token=secret failed', details: {} } },
+        { status: 503 },
+      ),
+    ),
+  )
+  const user = userEvent.setup()
+  renderMonitoring()
+
+  await user.click(screen.getByRole('button', { name: '运行盘中工作流' }))
+
+  await waitFor(() => {
+    expect(screen.getByText('盘中决策工作流运行失败，请稍后重试')).toBeInTheDocument()
+  })
+  expect(screen.queryByText('已请求运行盘中决策工作流')).not.toBeInTheDocument()
+  expect(screen.queryByText(/token=secret/)).not.toBeInTheDocument()
 })
 
 

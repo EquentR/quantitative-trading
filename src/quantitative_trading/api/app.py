@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import logging
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 from quantitative_trading.api import dependencies
 from quantitative_trading.api.dependencies import ApiContainer
@@ -29,7 +30,14 @@ from quantitative_trading.api.routes import (
     watchlist,
 )
 from quantitative_trading.config import Settings
+from quantitative_trading.audit.repository import AuditLogRepository
+from quantitative_trading.audit.service import AuditService
+from quantitative_trading.api.dependencies import connection_scope
+from quantitative_trading.sanitization import safe_error_summary
 from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def create_app(
@@ -52,6 +60,37 @@ def create_app(
         smtp_connection_tester=smtp_connection_tester,
     )
     app.dependency_overrides[dependencies.get_container] = lambda: container
+
+    @app.middleware("http")
+    async def audit_successful_writes(request: Request, call_next):
+        response = await call_next(request)
+        is_write = request.method in {"POST", "PUT", "PATCH", "DELETE"}
+        is_fresh_account_snapshot = (
+            request.method == "GET"
+            and request.url.path == "/api/v1/account/snapshot"
+            and request.query_params.get("fresh", "").lower() == "true"
+        )
+        if response.status_code < 400 and (is_write or is_fresh_account_snapshot):
+            route = request.scope.get("route")
+            operation = getattr(route, "name", "unknown_write")
+            try:
+                with connection_scope(settings) as connection:
+                    AuditService(AuditLogRepository(connection)).record_event(
+                        event_type="api.write.succeeded",
+                        recommendation_id=None,
+                        payload={
+                            "method": request.method,
+                            "operation": operation,
+                            "status_code": response.status_code,
+                        },
+                    )
+            except Exception as exc:
+                LOGGER.warning(
+                    "api success audit failed operation=%s error=%s",
+                    operation,
+                    safe_error_summary(exc),
+                )
+        return response
 
     install_error_handlers(app)
     app.include_router(account.router, prefix="/api/v1")

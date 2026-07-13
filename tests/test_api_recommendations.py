@@ -12,7 +12,7 @@ def test_legacy_recommendation_scan_is_retired_without_writing(tmp_path) -> None
     assert scan_response.json()["error"] == {
         "code": "recommendation_scan_retired",
         "message": "recommendation scan moved to the intraday decision workflow",
-        "details": {"replacement": "[path]"},
+        "details": {"replacement": "/api/v1/service/workflows/intraday/run"},
     }
     assert list_response.status_code == 200
     assert list_response.json() == {

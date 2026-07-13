@@ -15,7 +15,6 @@ from zoneinfo import ZoneInfo
 import typer
 from pydantic import ValidationError
 
-from quantitative_trading.account.service import AccountService
 from quantitative_trading.api.auth import (
     AuthService,
     AuthSetupRequiredError,
@@ -75,10 +74,10 @@ from quantitative_trading.notification.service import NotificationService
 from quantitative_trading.planning.repository import TradingPlanRepository
 from quantitative_trading.recommendation.repository import RecommendationRepository
 from quantitative_trading.runtime.service_app import run_api_service
-from quantitative_trading.runtime.service_runner import DebugServiceRunner
 from quantitative_trading.sanitization import safe_error_summary
 from quantitative_trading.storage.sqlite import connect, migrate
 from quantitative_trading.storage.api_auth import ApiAuthRepository
+from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
 from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
 from quantitative_trading.watchlist.repository import (
     WATCH_PINNED_CSV_COLUMNS,
@@ -657,24 +656,10 @@ def list_cash_transactions(
 def account_snapshot(
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
-    settings = load_settings()
-    with _service_scope() as (_, ledger_read_only, _, cash_read_only):
-        account_service = AccountService(
-            ledger=ledger_read_only,
-            cash=cash_read_only,
-            market=_market_provider(settings),
-        )
-        snapshot = account_service.create_snapshot()
-        if json_output:
-            typer.echo(snapshot.model_dump_json())
-            return
-        typer.echo(
-            f"status={snapshot.status.value} "
-            f"cash_balance={_format_money(snapshot.cash_balance)} "
-            f"total_assets={_format_money(snapshot.total_assets)}"
-        )
-        for warning in snapshot.warnings:
-            typer.echo(f"warning={warning}")
+    del json_output
+    raise typer.BadParameter(
+        "qt account snapshot is retired; use qt workflow intraday"
+    )
 
 
 @market_app.command("snapshot")
@@ -850,19 +835,29 @@ def market_runs(
         typer.echo("no market runs")
         return
     for run in summary.runs:
+        dataset_counts = run.get("dataset_counts", {})
+        rendered_counts = ";".join(
+            f"{dataset}="
+            + ",".join(
+                f"{status}:{counts.get(status, 0)}"
+                for status in ("complete", "degraded", "failed", "stale")
+            )
+            for dataset, counts in sorted(dataset_counts.items())
+        ) or "-"
         typer.echo(
-            f"run_id={run.run_id} workflow={run.workflow_type} "
-            f"date={run.trade_date.isoformat()} status={run.status.value} "
-            f"requested={run.requested_symbols} processed={run.processed_symbols} "
-            f"duration_ms={run.duration_ms if run.duration_ms is not None else '-'} "
-            f"provider_calls={run.provider_calls} "
-            f"provider_duration_ms={run.provider_duration_ms:.2f} "
-            f"rows_received={run.rows_received} rows_written={run.rows_written} "
-            f"cleaned_rows={run.cleaned_rows} plans={run.plan_count} "
-            f"recommendations={run.recommendation_count} "
-            f"notifications={run.notification_count} emails={run.email_outbox_count} "
-            f"retries={run.retry_count} warnings={run.warning_count} "
-            f"failures={run.failure_count} error={run.error_summary or '-'}"
+            f"run_id={run['run_id']} workflow={run['workflow_type']} "
+            f"date={run['trade_date']} status={run['status']} "
+            f"requested={run['requested_symbols']} processed={run['processed_symbols']} "
+            f"duration_ms={run['duration_ms'] if run['duration_ms'] is not None else '-'} "
+            f"provider_calls={run['provider_calls']} "
+            f"provider_duration_ms={float(run['provider_duration_ms']):.2f} "
+            f"rows_received={run['rows_received']} rows_written={run['rows_written']} "
+            f"cleaned_rows={run['cleaned_rows']} plans={run['plan_count']} "
+            f"recommendations={run['recommendation_count']} "
+            f"notifications={run['notification_count']} emails={run['email_outbox_count']} "
+            f"retries={run['retry_count']} warnings={run['warning_count']} "
+            f"failures={run['failure_count']} error={run['error_summary'] or '-'} "
+            f"dataset_counts={rendered_counts}"
         )
 
 
@@ -1128,11 +1123,16 @@ def generate_plan(date_text: Annotated[str, typer.Option("--date")]) -> None:
 
 
 @plan_app.command("latest")
-def latest_plan() -> None:
+def latest_plan(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
     with _database_scope() as (_settings, connection):
         plan = TradingPlanRepository(connection).latest()
     if plan is None:
-        typer.echo("暂无计划")
+        typer.echo("null" if json_output else "暂无计划")
+        return
+    if json_output:
+        typer.echo(plan.model_dump_json())
         return
     typer.echo(
         f"plan_id={plan.plan_id} "
@@ -1153,9 +1153,20 @@ def scan_recommendations() -> None:
 
 
 @recommendations_app.command("list")
-def list_recommendations() -> None:
+def list_recommendations(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
     with _database_scope() as (_settings, connection):
         recommendations = RecommendationRepository(connection).list()
+    if json_output:
+        typer.echo(
+            json.dumps(
+                [item.model_dump(mode="json") for item in recommendations],
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return
     if not recommendations:
         typer.echo("暂无建议")
         return
@@ -1164,11 +1175,17 @@ def list_recommendations() -> None:
 
 
 @recommendations_app.command("show")
-def show_recommendation(recommendation_id: Annotated[str, typer.Argument()]) -> None:
+def show_recommendation(
+    recommendation_id: Annotated[str, typer.Argument()],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
     with _database_scope() as (_settings, connection):
         recommendation = RecommendationRepository(connection).get(recommendation_id)
     if recommendation is None:
         raise typer.BadParameter(f"recommendation not found: {recommendation_id}")
+    if json_output:
+        typer.echo(recommendation.model_dump_json())
+        return
     typer.echo(f"recommendation_id={recommendation.recommendation_id}")
     typer.echo(f"symbol={recommendation.symbol}")
     typer.echo(f"name={recommendation.name}")
@@ -1413,6 +1430,56 @@ def check_service() -> None:
         typer.echo(f"当前持仓数量: {len(positions)}")
 
 
+@service_app.command("status")
+def service_status(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    settings = load_settings()
+    if not settings.database_path.exists():
+        payload = {"scheduler_state": "missing"}
+    else:
+        with _connect_read_only(settings.database_path) as connection:
+            state = SchedulerStateRepository(connection).get()
+        if state is None:
+            payload = {"scheduler_state": "missing"}
+        else:
+            payload = {
+                "scheduler_enabled": state.enabled,
+                "interval_seconds": state.interval_seconds,
+                "run_on_start": state.run_on_start,
+                "last_started_at": _isoformat(state.last_started_at),
+                "last_finished_at": _isoformat(state.last_finished_at),
+                "last_status": state.last_status,
+                "last_reason": state.last_reason,
+                "last_error": state.last_error,
+                "last_snapshot_id": state.last_snapshot_id,
+                "last_task_type": state.last_task_type,
+                "last_plan_id": state.last_plan_id,
+                "last_recommendation_ids": state.last_recommendation_ids,
+                "overrun_count": state.overrun_count,
+                "skipped_count": state.skipped_count,
+                "updated_at": state.updated_at.isoformat(),
+            }
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False))
+        return
+    if payload.get("scheduler_state") == "missing":
+        typer.echo("scheduler_state=missing")
+        return
+    for key, value in payload.items():
+        if isinstance(value, bool):
+            rendered = str(value).lower()
+        elif isinstance(value, list):
+            rendered = ",".join(value) if value else "-"
+        else:
+            rendered = "-" if value is None else str(value)
+        typer.echo(f"{key}={rendered}")
+
+
+def _isoformat(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
 @service_app.command("run", help="Run the unified HTTP API and scheduler service.")
 def run_service() -> None:
     settings = load_settings()
@@ -1423,33 +1490,11 @@ def run_service() -> None:
 
 
 @service_app.command(
-    "debug-run", help="Run the debug foreground account snapshot service."
+    "debug-run", help="Retired; use workflow intraday or service run."
 )
 def debug_run_service(once: Annotated[bool, typer.Option("--once")] = False) -> None:
-    settings = load_settings()
-
-    def snapshot_factory():
-        with _service_scope() as (_, ledger_read_only, _, cash_read_only):
-            account_service = AccountService(
-                ledger=ledger_read_only,
-                cash=cash_read_only,
-                market=_market_provider(settings),
-            )
-            return account_service.create_snapshot()
-
-    runner = DebugServiceRunner(
-        snapshot_factory=snapshot_factory, log_dir=settings.log_dir
-    )
-    snapshot = runner.run_once(reason="startup")
-    typer.echo(f"debug service started status={snapshot.status.value}")
-    if once:
-        return
-    typer.echo(
-        "debug service polling "
-        f"interval={settings.intraday_interval_seconds}s "
-        f"timezone={settings.timezone}"
-    )
-    runner.start(
-        interval_seconds=settings.intraday_interval_seconds,
-        timezone=settings.timezone,
+    del once
+    raise typer.BadParameter(
+        "qt service debug-run is retired; use qt workflow intraday "
+        "for one cycle or qt service run for the unified service"
     )

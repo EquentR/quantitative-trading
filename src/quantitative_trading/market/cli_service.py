@@ -9,7 +9,11 @@ from time import perf_counter
 from pydantic import BaseModel, ConfigDict, Field
 
 from quantitative_trading.ledger.repository import PositionRepository
-from quantitative_trading.market.adapters import DailyBarProvider, MoneyFlowProvider
+from quantitative_trading.market.adapters import (
+    DailyBarProvider,
+    MarketProviderError,
+    MoneyFlowProvider,
+)
 from quantitative_trading.market.backfill import HeavyDataBackfillService
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
@@ -71,7 +75,7 @@ class MarketRunsSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     count: int = Field(ge=0)
-    runs: list[MarketCaptureRun]
+    runs: list[dict[str, object]]
 
 
 class MarketCliService:
@@ -103,6 +107,11 @@ class MarketCliService:
         run_id = f"backfill-{trade_date.isoformat()}-{scope_hash}"
         started_at = self._now()
         run_repository = MarketCaptureRunRepository(self.connection)
+        run_repository.fail_expired_workflow_runs(
+            "backfill",
+            started_before=started_at - timedelta(hours=4),
+            finished_at=started_at,
+        )
         result_repository = MarketCaptureResultRepository(self.connection)
         run, created = run_repository.get_or_create(
             MarketCaptureRun(
@@ -181,32 +190,39 @@ class MarketCliService:
         )
         results: list[MarketCaptureResult] = []
         provider_duration_ms = 0.0
+        provider_calls = 0
+        rows_received = 0
+        rows_written = 0
         for symbol in requested:
             provider_started = perf_counter()
-            results.append(
-                self._capture_dataset(
-                    run.run_id,
-                    symbol,
-                    trade_date,
-                    CaptureDataset.DAILY_BAR,
-                    250,
-                    lambda: backfill.backfill_daily(run.run_id, symbol, trade_date).snapshot,
-                )
+            result, calls, received, written = self._capture_dataset(
+                run.run_id,
+                symbol,
+                trade_date,
+                CaptureDataset.DAILY_BAR,
+                250,
+                lambda: backfill.backfill_daily(run.run_id, symbol, trade_date),
             )
+            results.append(result)
+            provider_calls += calls
+            rows_received += received
+            rows_written += written
             provider_duration_ms += (perf_counter() - provider_started) * 1000
             provider_started = perf_counter()
-            results.append(
-                self._capture_dataset(
-                    run.run_id,
-                    symbol,
-                    trade_date,
-                    CaptureDataset.MONEY_FLOW,
-                    60,
-                    lambda: backfill.backfill_money_flow(
-                        run.run_id, symbol, trade_date
-                    ).snapshot,
-                )
+            result, calls, received, written = self._capture_dataset(
+                run.run_id,
+                symbol,
+                trade_date,
+                CaptureDataset.MONEY_FLOW,
+                60,
+                lambda: backfill.backfill_money_flow(
+                    run.run_id, symbol, trade_date
+                ),
             )
+            results.append(result)
+            provider_calls += calls
+            rows_received += received
+            rows_written += written
             provider_duration_ms += (perf_counter() - provider_started) * 1000
         for result in results:
             result_repository.upsert(result)
@@ -236,16 +252,15 @@ class MarketCliService:
             status = CaptureRunStatus.DEGRADED
         else:
             status = CaptureRunStatus.FAILED
-        rows = sum(result.actual_rows for result in results)
         finished = run.model_copy(
             update={
                 "status": status,
                 "finished_at": self._now(),
                 "processed_symbols": len(requested),
-                "provider_calls": len(requested) * 2,
+                "provider_calls": provider_calls,
                 "provider_duration_ms": provider_duration_ms,
-                "rows_received": rows,
-                "rows_written": rows,
+                "rows_received": rows_received,
+                "rows_written": rows_written,
                 "warning_count": warning_count + (1 if not requested else 0),
                 "failure_count": failure_count,
                 "error_summary": (
@@ -269,6 +284,11 @@ class MarketCliService:
     def cleanup(self, trade_date: date) -> MarketCleanupSummary:
         started_at = self._now()
         run_repository = MarketCaptureRunRepository(self.connection)
+        run_repository.fail_expired_workflow_runs(
+            "cleanup",
+            started_before=started_at - timedelta(minutes=30),
+            finished_at=started_at,
+        )
         run, created = run_repository.get_or_create(
             MarketCaptureRun(
                 run_id=f"cleanup-{trade_date.isoformat()}",
@@ -338,8 +358,31 @@ class MarketCliService:
         ).fetchall()
         repository = MarketCaptureRunRepository(self.connection)
         runs = [repository.get(str(row["run_id"])) for row in rows]
-        present = [run for run in runs if run is not None]
+        result_repository = MarketCaptureResultRepository(self.connection)
+        present = [
+            {
+                **run.model_dump(mode="json"),
+                "dataset_counts": self._dataset_counts(
+                    result_repository.list_for_run(run.run_id)
+                ),
+            }
+            for run in runs
+            if run is not None
+        ]
         return MarketRunsSummary(count=len(present), runs=present)
+
+    @staticmethod
+    def _dataset_counts(
+        results: list[MarketCaptureResult],
+    ) -> dict[str, dict[str, int]]:
+        counts: dict[str, dict[str, int]] = {}
+        for result in results:
+            dataset = counts.setdefault(
+                result.dataset.value,
+                {status.value: 0 for status in CaptureResultStatus},
+            )
+            dataset[result.status.value] += 1
+        return counts
 
     def _symbols(self, explicit: Sequence[str] | None) -> list[str]:
         members = build_universe(
@@ -375,35 +418,48 @@ class MarketCliService:
         dataset: CaptureDataset,
         expected_rows: int,
         capture: Callable[[], object],
-    ) -> MarketCaptureResult:
+    ) -> tuple[MarketCaptureResult, int, int, int]:
         try:
-            snapshot = capture()
-            return MarketCaptureResult(
-                run_id=run_id,
-                symbol=symbol,
-                dataset=dataset,
-                status=snapshot.status,
-                data_start=snapshot.data_start,
-                data_end=snapshot.data_end,
-                fetched_at=snapshot.fetched_at,
-                expected_rows=expected_rows,
-                actual_rows=snapshot.row_count,
-                source="akshare",
-                warning=snapshot.warning,
+            created = capture()
+            snapshot = created.snapshot
+            return (
+                MarketCaptureResult(
+                    run_id=run_id,
+                    symbol=symbol,
+                    dataset=dataset,
+                    status=snapshot.status,
+                    data_start=snapshot.data_start,
+                    data_end=snapshot.data_end,
+                    fetched_at=snapshot.fetched_at,
+                    expected_rows=expected_rows,
+                    actual_rows=snapshot.row_count,
+                    source="akshare",
+                    warning=snapshot.warning,
+                ),
+                created.provider_calls,
+                created.rows_received,
+                created.rows_written,
             )
         except Exception as exc:
+            if not isinstance(exc, MarketProviderError):
+                raise
             summary = safe_error_summary(exc)
-            return MarketCaptureResult(
-                run_id=run_id,
-                symbol=symbol,
-                dataset=dataset,
-                status=CaptureResultStatus.FAILED,
-                fetched_at=self._now(),
-                expected_rows=expected_rows,
-                actual_rows=0,
-                source="akshare",
-                warning=summary,
-                error_summary=summary,
+            return (
+                MarketCaptureResult(
+                    run_id=run_id,
+                    symbol=symbol,
+                    dataset=dataset,
+                    status=CaptureResultStatus.FAILED,
+                    fetched_at=self._now(),
+                    expected_rows=expected_rows,
+                    actual_rows=0,
+                    source="akshare",
+                    warning=summary,
+                    error_summary=summary,
+                ),
+                1,
+                0,
+                0,
             )
 
     def _backfill_summary(

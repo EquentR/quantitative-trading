@@ -133,6 +133,24 @@ def test_load_settings_rejects_non_positive_stale_threshold(monkeypatch) -> None
         load_settings()
 
 
+@pytest.mark.parametrize(
+    "values",
+    [
+        {
+            "market_strength_position_low": 0.8,
+            "market_strength_position_high": 0.2,
+        },
+        {
+            "market_strength_volume_low": 2.0,
+            "market_strength_volume_high": 1.0,
+        },
+    ],
+)
+def test_strength_threshold_ranges_must_not_overlap(values) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**values)
+
+
 def test_api_settings_have_safe_defaults(monkeypatch) -> None:
     clear_runtime_environment(monkeypatch)
 

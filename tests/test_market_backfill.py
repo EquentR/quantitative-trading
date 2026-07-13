@@ -124,10 +124,38 @@ def test_backfill_uses_250_and_60_trading_day_baselines_then_five_day_correction
     assert flow.row_count == 60
 
     service.backfill_daily("run-2", "600000", as_of)
-    service.backfill_money_flow("run-2", "600000", as_of)
+    second_daily = service.backfill_daily("run-3", "600000", as_of)
+    second_flow = service.backfill_money_flow("run-2", "600000", as_of)
     last_five = calendar.sessions_ending(as_of, 5)
     assert daily_provider.calls[-1][1:] == (last_five[0], as_of, "forward")
     assert flow_provider.calls[-1][1:] == (last_five[0], as_of)
+    assert second_daily.rows_received == 5
+    assert second_daily.rows_written == 0
+    assert second_flow.rows_received == 5
+    assert second_flow.rows_written == 0
+
+
+def test_backfill_requests_old_gap_and_correction_as_separate_ranges(connection) -> None:
+    service, calendar, daily_provider, _flow_provider = make_service(connection)
+    as_of = date(2026, 7, 13)
+    service.backfill_daily("run-1", "600000", as_of)
+    old_gap = calendar.sessions_ending(as_of, 250)[20]
+    connection.execute("DELETE FROM history_snapshot_members")
+    connection.execute("DELETE FROM history_snapshots")
+    connection.execute("DELETE FROM daily_bars WHERE trade_date = ?", (old_gap.isoformat(),))
+    connection.commit()
+    daily_provider.calls.clear()
+
+    result = service.backfill_daily("run-2", "600000", as_of)
+
+    last_five = calendar.sessions_ending(as_of, 5)
+    assert daily_provider.calls == [
+        ("600000", old_gap, old_gap, "forward"),
+        ("600000", last_five[0], as_of, "forward"),
+    ]
+    assert result.provider_calls == 2
+    assert result.rows_received == 6
+    assert result.rows_written == 1
 
 
 def test_minute_cleanup_retains_exactly_latest_twenty_xshg_trading_days(connection) -> None:

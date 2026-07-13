@@ -103,11 +103,6 @@ export interface AccountSnapshot {
   created_at: string
 }
 
-export interface CreatedSnapshotResponse {
-  snapshot_id: number
-  snapshot: AccountSnapshot
-}
-
 export interface ApiErrorPayload {
   error?: {
     code?: string
@@ -457,6 +452,7 @@ export interface MarketSnapshotTrace {
   snapshot_id: string | number
   plan_id: string | null
   recommendation_id: string | null
+  audit_id: string | null
   data_time: string | null
   fetched_at: string
   status: MarketQualityStatus

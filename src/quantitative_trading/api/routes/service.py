@@ -17,8 +17,7 @@ from quantitative_trading.api.dependencies import (
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.audit.service import AuditService
-from quantitative_trading.runtime.account_snapshot_job import create_and_save_account_snapshot
-from quantitative_trading.sanitization import safe_error_summary as _safe_error_summary
+from quantitative_trading.sanitization import safe_error_summary as _safe_error_summary  # noqa: F401
 from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
 
 
@@ -62,53 +61,13 @@ def stop_scheduler(container: ApiContainer = Depends(get_container)) -> dict[str
 
 @router.post("/run-once", dependencies=[Depends(require_token)])
 def run_once(container: ApiContainer = Depends(get_container)) -> dict[str, object]:
-    # 手动触发只写账户快照和调度状态，不修改现金账户或手动持仓台账。
-    started_at = datetime.now(UTC)
-    snapshot_id: int | None = None
-    status_value = "success"
-    error: str | None = None
-
-    try:
-        created = create_and_save_account_snapshot(container.settings)
-        snapshot_id = created.snapshot_id
-    except Exception as exc:
-        status_value = "failed"
-        error = _safe_error_summary(exc)
-
-    finished_at = datetime.now(UTC)
-    try:
-        with connection_scope(container.settings) as connection:
-            repository = SchedulerStateRepository(connection)
-            repository.get_or_create(
-                interval_seconds=container.settings.intraday_interval_seconds,
-                run_on_start=container.settings.service_run_on_start_when_scheduler_enabled,
-                now=started_at,
-            )
-            repository.record_result(
-                started_at=started_at,
-                finished_at=finished_at,
-                status=status_value,
-                reason="manual_api",
-                error=error,
-                snapshot_id=snapshot_id,
-                task_type="account_snapshot",
-                plan_id=None,
-                recommendation_ids=[],
-                now=finished_at,
-            )
-            AuditService(AuditLogRepository(connection)).record_event(
-                event_type="service.run_once",
-                recommendation_id=None,
-                payload={
-                    "status": status_value,
-                    "snapshot_id": snapshot_id,
-                    "error": error,
-                },
-                now=finished_at,
-            )
-    except (sqlite3.Error, ValidationError) as exc:
-        raise _service_state_failed() from exc
-    return _status_payload(container)
+    del container
+    raise ApiError(
+        status_code=410,
+        code="service_run_once_retired",
+        message="service run-once is retired; use the unified intraday workflow",
+        details={"replacement": "/api/v1/service/workflows/intraday/run"},
+    )
 
 
 def _status_payload(container: ApiContainer) -> dict[str, object]:

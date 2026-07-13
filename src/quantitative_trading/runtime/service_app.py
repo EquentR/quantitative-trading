@@ -19,9 +19,6 @@ from quantitative_trading.market.models import (
     CaptureRunAlreadyActiveError,
     CaptureRunStatus,
 )
-from quantitative_trading.runtime.account_snapshot_job import (
-    create_and_save_account_snapshot,
-)
 from quantitative_trading.runtime.scheduler import SchedulerManager
 from quantitative_trading.sanitization import safe_error_summary
 from quantitative_trading.storage.scheduler_state import SchedulerState
@@ -66,10 +63,15 @@ def run_api_service(settings: Settings) -> None:
                 status="failed",
                 error=error,
             )
+
+        if result.status == "failed":
+            error = result.error or (
+                f"{result.task_type} workflow returned failed status"
+            )
             try:
                 _dispatch_runtime_alert(
                     settings,
-                    reason=reason,
+                    reason=result.reason,
                     error=error,
                     now=started_at,
                     event_type="workflow.failed",
@@ -195,8 +197,13 @@ def _run_scheduler_task(
         )
 
     if reason == "close_readiness":
+        local_minute = local_now.time().replace(
+            tzinfo=None,
+            second=0,
+            microsecond=0,
+        )
         if not calendar.is_trading_day(trade_date) or not (
-            time(15, 15) <= local_now.time().replace(tzinfo=None) <= time(16, 30)
+            time(15, 15) <= local_minute <= time(16, 30)
         ):
             return SchedulerJobResult(
                 task_type="close",
@@ -208,16 +215,30 @@ def _run_scheduler_task(
             migrate(connection)
             workflow = _build_decision_workflow(connection, settings, task_now)
             result = workflow.run_close(trade_date)
+        deadline_not_ready = not result.ready and local_minute >= time(16, 30)
         return SchedulerJobResult(
             task_type="close",
             reason=(
-                "close_reused"
+                "close_deadline_not_ready"
+                if deadline_not_ready
+                else "close_reused"
                 if result.reused
                 else "close_published"
                 if result.ready
                 else "close_not_ready"
             ),
-            status="success" if result.ready else "degraded",
+            status=(
+                "failed"
+                if deadline_not_ready
+                else "success"
+                if result.ready
+                else "degraded"
+            ),
+            error=(
+                "close workflow data was not ready by the 16:30 deadline"
+                if deadline_not_ready
+                else None
+            ),
             snapshot_id=result.market_input_snapshot_id,
             plan_id=result.plan_id,
             recommendation_ids=[],
@@ -257,15 +278,6 @@ def _run_scheduler_task(
             delivery_ids=[delivery.delivery_id for delivery in deliveries],
         )
 
-    # Backward-compatible manual snapshot entry. It is not registered by SchedulerManager.
-    if reason in {"intraday", "startup", "manual_api"}:
-        created = create_and_save_account_snapshot(settings)
-        return SchedulerJobResult(
-            task_type="account_snapshot",
-            reason=reason,
-            snapshot_id=created.snapshot_id,
-            recommendation_ids=[],
-        )
     raise ValueError("unknown scheduler task")
 
 
@@ -377,4 +389,4 @@ def _task_type_for_reason(reason: str) -> str:
         return "cleanup"
     if reason == "email_delivery":
         return "email_delivery"
-    return "account_snapshot"
+    return "unknown"

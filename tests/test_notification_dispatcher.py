@@ -1,5 +1,8 @@
 import json
 import sqlite3
+import subprocess
+import sys
+import textwrap
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -22,6 +25,34 @@ from quantitative_trading.storage.sqlite import connect, migrate
 
 
 NOW = datetime(2026, 7, 13, 7, 0, tzinfo=UTC)
+
+
+def test_jsonl_writer_module_loads_when_fcntl_is_unavailable() -> None:
+    script = textwrap.dedent(
+        """
+        import builtins
+        import importlib
+
+        original_import = builtins.__import__
+
+        def without_fcntl(name, *args, **kwargs):
+            if name == "fcntl":
+                raise ModuleNotFoundError("No module named 'fcntl'")
+            return original_import(name, *args, **kwargs)
+
+        builtins.__import__ = without_fcntl
+        importlib.import_module("quantitative_trading.notification.jsonl")
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 class NoopSender:
@@ -146,6 +177,51 @@ def test_immediate_actions_create_notification_jsonl_and_email_outbox(tmp_path, 
         records = (settings.log_dir / "notifications.jsonl").read_text().splitlines()
         assert len(records) == 1
         assert json.loads(records[0])["summary"]["notification_id"] == result.notification.notification_id
+
+
+def test_retry_after_local_commit_repairs_missing_projections_without_duplicates(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_path=tmp_path / "projection-recovery.db",
+        log_dir=tmp_path / "logs",
+    )
+    rec = recommendation("rec-projection-recovery", RecommendationAction.BUY)
+
+    with connect(settings) as connection:
+        migrate(connection)
+        configure_smtp(connection)
+        dispatcher = build_dispatcher(connection, settings)
+
+        local = dispatcher.persist_local_recommendation(
+            rec,
+            plan_version=1,
+            now=NOW,
+        )
+        assert local.created is True
+        assert connection.execute("SELECT COUNT(*) FROM email_deliveries").fetchone()[0] == 0
+        assert not (settings.log_dir / "notifications.jsonl").exists()
+
+        repaired = dispatcher.dispatch_recommendation(
+            rec,
+            plan_version=1,
+            now=NOW,
+        )
+        duplicate = dispatcher.dispatch_recommendation(
+            rec,
+            plan_version=1,
+            now=NOW,
+        )
+
+        records = (settings.log_dir / "notifications.jsonl").read_text().splitlines()
+        assert repaired.created is False
+        assert repaired.email_delivery is not None
+        assert duplicate.created is False
+        assert duplicate.email_delivery == repaired.email_delivery
+        assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM email_deliveries").fetchone()[0] == 1
+        assert len(records) == 1
+        assert json.loads(records[0])["summary"]["notification_id"] == local.notification.notification_id
 
 
 @pytest.mark.parametrize(
@@ -350,6 +426,62 @@ def test_critical_system_alert_reaches_every_local_channel_without_smtp(
         assert "/tmp/private.db" not in local_outputs
         audits = AuditLogRepository(connection).list_recent(limit=20)
         assert sum(item.event_type == "workflow.database_failed" for item in audits) == 1
+
+
+def test_system_alert_retry_repairs_missing_jsonl_projection_without_duplicates(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        database_path=tmp_path / "alert-projection-recovery.db",
+        log_dir=tmp_path / "logs",
+    )
+    delegate = JsonlNotificationWriter(settings)
+
+    class FailingOnceWriter:
+        calls = 0
+
+        def write_system_alert(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("jsonl temporarily unavailable")
+            return delegate.write_system_alert(*args, **kwargs)
+
+    with connect(settings) as connection:
+        migrate(connection)
+        local_dispatcher = build_dispatcher(
+            connection,
+            settings,
+            writer=FailingOnceWriter(),
+        ).local_alert_dispatcher
+
+        first = local_dispatcher.dispatch(
+            alert_key="workflow-close-20260713",
+            event_type="workflow.close_failed",
+            message="close workflow failed",
+            details={"run_id": "run-close-1"},
+            now=NOW,
+        )
+        retry = local_dispatcher.dispatch(
+            alert_key="workflow-close-20260713",
+            event_type="workflow.close_failed",
+            message="close workflow failed",
+            details={"run_id": "run-close-1"},
+            now=NOW,
+        )
+        duplicate = local_dispatcher.dispatch(
+            alert_key="workflow-close-20260713",
+            event_type="workflow.close_failed",
+            message="close workflow failed",
+            details={"run_id": "run-close-1"},
+            now=NOW,
+        )
+
+        records = (settings.log_dir / "notifications.jsonl").read_text().splitlines()
+        assert retry == first
+        assert duplicate == first
+        assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 1
+        assert len(records) == 1
+        assert json.loads(records[0])["summary"]["notification_id"] == first.notification_id
 
 
 def test_critical_system_alert_email_is_immediate_and_deduplicated(tmp_path) -> None:

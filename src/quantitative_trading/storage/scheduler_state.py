@@ -66,6 +66,10 @@ class SchedulerStateRepository:
             raise RuntimeError("scheduler state was not initialized")
         return self._from_row(row)
 
+    def get(self) -> SchedulerState | None:
+        row = self._fetch()
+        return None if row is None else self._from_row(row)
+
     def set_enabled(
         self,
         enabled: bool,

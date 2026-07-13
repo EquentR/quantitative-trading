@@ -325,12 +325,20 @@ def migrate(connection: sqlite3.Connection) -> None:
     _ensure_notification_columns(connection)
     _ensure_recommendation_columns(connection)
     _ensure_market_capture_run_columns(connection)
+    _fail_duplicate_running_workflows(connection)
     _supersede_duplicate_active_plans(connection)
     connection.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedup_key
         ON notifications(dedup_key)
         WHERE dedup_key IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_market_capture_runs_running_workflow
+        ON market_capture_runs(workflow_type)
+        WHERE status = 'running'
         """
     )
     connection.execute(
@@ -348,6 +356,27 @@ def migrate(connection: sqlite3.Connection) -> None:
         """
     )
     connection.commit()
+
+
+def _fail_duplicate_running_workflows(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """SELECT run_id, workflow_type FROM market_capture_runs
+           WHERE status='running'
+           ORDER BY workflow_type, started_at DESC, id DESC"""
+    ).fetchall()
+    retained: set[str] = set()
+    for row in rows:
+        workflow_type = str(row["workflow_type"])
+        if workflow_type not in retained:
+            retained.add(workflow_type)
+            continue
+        connection.execute(
+            """UPDATE market_capture_runs SET status='failed',
+                 finished_at=started_at, failure_count=failure_count+1,
+                 error_summary='duplicate running workflow lease repaired during migration'
+               WHERE run_id=?""",
+            (row["run_id"],),
+        )
 
 
 def _ensure_trading_plan_status_constraint(connection: sqlite3.Connection) -> None:

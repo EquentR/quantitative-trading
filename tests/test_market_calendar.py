@@ -27,3 +27,12 @@ def test_xshg_calendar_exposes_shanghai_session_and_lunch_break() -> None:
     assert not calendar.is_trading_minute(
         datetime(2026, 7, 13, 12, 0, tzinfo=SHANGHAI)
     )
+    assert calendar.expected_minutes_through(
+        datetime(2026, 7, 13, 11, 30, tzinfo=SHANGHAI)
+    ) == 120
+    assert calendar.expected_minutes_through(
+        datetime(2026, 7, 13, 13, 0, tzinfo=SHANGHAI)
+    ) == 120
+    assert calendar.expected_minutes_through(
+        datetime(2026, 7, 13, 15, 0, tzinfo=SHANGHAI)
+    ) == 240

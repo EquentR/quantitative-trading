@@ -1,6 +1,7 @@
 import { computed, type Ref } from 'vue'
 import { useQuery } from '@tanstack/vue-query'
 import { useApiClient } from '@/api/client-provider'
+import { fetchAllPages } from '@/api/pagination'
 import type {
   DailyBarsResponse,
   IntradayStrengthResponse,
@@ -34,7 +35,14 @@ export function useMarketSymbolsQuery() {
   const client = useApiClient()
   return useQuery({
     queryKey: marketSymbolsQueryKey,
-    queryFn: () => client.get<PaginatedResponse<MarketSymbolSummary>>('/market/symbols'),
+    queryFn: async () => {
+      const items = await fetchAllPages<MarketSymbolSummary>(
+        client,
+        '/market/symbols',
+        { pageSize: 250 },
+      )
+      return { items, total: items.length }
+    },
     refetchInterval: marketRefreshMs,
     retry: false,
   })

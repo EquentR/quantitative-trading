@@ -102,12 +102,14 @@ qt cash transfer-out --amount 5000 --note 银证转出
 qt cash adjust --cash 48000 --note 手动校准券商可用资金
 ```
 
-查看资金账户和账户估值：
+查看资金账户，并通过统一盘中工作流刷新账户估值：
 
 ```bash
 qt cash show
-qt account snapshot
+qt workflow intraday
 ```
+
+`qt account snapshot` 已退役并以非零状态退出；账户快照只由统一盘中工作流生成，Web 和 API 保留只读查询。
 
 后台服务检查：
 
@@ -142,8 +144,9 @@ qt service run
 
 ```bash
 qt workflow close --date 2026-07-10
-qt plan latest
-qt recommendations list
+qt plan latest --json
+qt recommendations list --json
+qt service status --json
 ```
 
 旧 `qt recommendations scan` 已退役并以非零状态退出，旧 `POST /api/v1/recommendations/scan` 在认证后固定返回 HTTP `410 recommendation_scan_retired`。手动生成盘中建议使用 `qt workflow intraday` 或 `POST /api/v1/service/workflows/intraday/run`，不会形成第二条建议写入路径。
@@ -164,7 +167,9 @@ qt market snapshot
 
 盘中报价和分钟数据默认落后超过 6 个有效交易分钟即标记 stale，午休和非交易时段不累计。可在 `.env` 中设置 `QT_MARKET_STALE_TRADING_MINUTES=6`（允许 1 到 60）；实际生效值会保存到输入快照并在数据引用页展示。
 
-每个 `DecisionWorkflow` 运行形成 `run_id -> market_input_snapshot_id -> plan_id -> recommendation_id -> notification_id -> delivery_id` 追踪链。逐标的外部失败保存为 degraded/failed/stale 质量结果并继续其他标的；数据库、引用或模型契约失败终止当前整轮。CLI 和 API 不输出第三方原始响应。
+公开报价响应若没有经过契约验证的市场源时间，只保存抓取时间并标为 partial，且不得用抓取时间替代 `data_time`。收盘工作流只有在报价最新价与同日已固化前复权日 K 收盘价严格一致时，才以交易所会话收盘时间创建一条 partial 验证报价；否则不能发布收盘计划、放行 `buy/add` 或形成完整账户估值。分时规则版本和九个阈值可通过 `QT_MARKET_STRENGTH_*` 环境变量配置，实际值随强弱快照保存。
+
+每个 `DecisionWorkflow` 运行形成 `run_id -> market_input_snapshot_id -> plan_id -> recommendation_id -> notification_id -> delivery_id` 追踪链；数据库对每种工作流类型维持全局 running 租约，避免 HTTP、CLI 和调度器跨周期重复采集。逐标的外部失败保存为 degraded/failed/stale 质量结果并继续其他标的；数据库、引用或模型契约失败终止当前整轮。CLI 和 API 不输出第三方原始响应。
 
 工作流 CLI 范围包括日 K/资金流基线回填、收盘或盘中手动运行、指定交易日补跑、工作流与数据质量查询、分钟线清理、通知读取和邮件失败重试。维护和工作流命令支持人类可读摘要及 `--json`；两者包含一致的运行 ID、状态、质量和成本指标。强制运行、窗口外盘中运行、跳过日历或晚于截止补跑必须提供 `--reason`，CLI 会通过隐藏输入提示校验本地 API 访问密码，密码不会进入命令参数、输出或审计。具体已安装命令以 `qt --help` 及子命令 `--help` 为准，所有入口共享相同 repository、adapter 和 service。
 
@@ -231,11 +236,7 @@ qt service run
 
 人工执行反馈只写入复盘记录和关联通知状态，不修改手动持仓台账、手动资金账户、现金余额或净本金。真实成交后的权威数据仍需要用户手动维护。
 
-调试版后台服务单次快照：
-
-```bash
-qt service debug-run --once
-```
+`qt service debug-run` 已退役，不再启动独立的账户行情轮询。单次执行使用 `qt workflow intraday`，常驻运行使用 `qt service run`。
 
 ## Docker 示例
 

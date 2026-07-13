@@ -131,6 +131,8 @@ def test_trading_plan_preserves_versioned_market_decision_context() -> None:
         allowed_actions=["hold", "add", "reduce"],
         prohibited_actions=["buy"],
         position_constraint={"max_position_ratio": 0.30},
+        position_context={"source": "manual_ledger", "quantity": 1000},
+        account_context={"snapshot_id": 2, "source": "manual_cash_account"},
         risks=["跌破支撑后转弱"],
         invalid_if=["跌破 9.70"],
         data_quality="complete",
@@ -154,6 +156,8 @@ def test_trading_plan_preserves_versioned_market_decision_context() -> None:
     assert plan.market_input_snapshot_id == 34
     assert plan.data_time == GENERATED_AT
     assert plan.symbol_contexts["600000"].conditions[0].operator == "gte"
+    assert plan.symbol_contexts["600000"].position_context["quantity"] == 1000
+    assert plan.symbol_contexts["600000"].account_context["snapshot_id"] == 2
 
 
 @pytest.mark.parametrize(

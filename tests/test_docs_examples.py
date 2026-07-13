@@ -46,16 +46,16 @@ def test_docs_document_cash_and_account_service_scope() -> None:
 
     assert "手动资金账户" in project_spec
     assert "账户估值" in project_spec
-    assert "调试版后台服务" in project_spec
+    assert "统一后台服务" in project_spec
     assert "手动资金账户" in data_sources
     assert "AkShare 只提供行情报价" in data_sources
     assert "净本金" in trading_policy
     assert "可用买入资金" in trading_policy
     assert "资金上下文" in recommendation_contract
     assert "qt cash init" in readme
-    assert "qt account snapshot" in readme
+    assert "qt workflow intraday" in readme
     assert "```bash\nqt service run\n```" in readme
-    assert "qt service debug-run --once" in readme
+    assert "qt service debug-run` 已退役" in readme
     assert "QT_LOG_DIR=data/logs" in env_example
     assert "QT_MARKET_PROVIDER=akshare" in env_example
     assert "QT_TIMEZONE=Asia/Shanghai" in env_example
@@ -81,7 +81,9 @@ def test_api_docs_document_auth_and_error_contract() -> None:
     assert "auth_setup_required" in text
     assert "Authorization: Bearer" in text
     assert "GET /api/v1/account/snapshot?fresh=true" in text
-    assert "生成并保存新的账户快照" in text
+    assert "固定返回 HTTP `410`" in text
+    assert "POST /api/v1/account/snapshots" in text
+    assert "account_snapshot_create_retired" in text
     assert (
         "业务接口不可用，并返回 `auth_status=setup_required` 或统一错误码 "
         "`auth_setup_required`"
@@ -110,6 +112,8 @@ def test_readme_documents_manual_market_snapshot_capture_boundaries() -> None:
     assert "60 个交易日" in section
     assert "原始分钟线只保留最近 20 个交易日" in section
     assert "每个 `DecisionWorkflow` 运行形成" in section
+    assert "不得用抓取时间替代" in section
+    assert "同日已固化前复权日 K 收盘价严格一致" in section
 
 
 def test_api_docs_document_authenticated_market_snapshot_contract() -> None:
