@@ -23,8 +23,11 @@ class RecommendationRepository:
         rows = [
             (
                 recommendation.recommendation_id,
+                recommendation.dedup_key,
                 recommendation.symbol,
                 recommendation.action.value,
+                recommendation.condition_fingerprint,
+                recommendation.audit_id,
                 recommendation.data_time.astimezone(UTC).isoformat(),
                 created_at.astimezone(UTC).isoformat(),
                 recommendation.model_dump_json(),
@@ -35,8 +38,11 @@ class RecommendationRepository:
             """
             INSERT INTO recommendations (
               recommendation_id,
+              dedup_key,
               symbol,
               action,
+              condition_fingerprint,
+              audit_id,
               data_time,
               created_at,
               payload_json
@@ -46,20 +52,30 @@ class RecommendationRepository:
               ?,
               ?,
               ?,
+              ?,
+              ?,
+              ?,
               ?
             )
-            ON CONFLICT(recommendation_id) DO UPDATE SET
-              symbol = excluded.symbol,
-              action = excluded.action,
-              data_time = excluded.data_time,
-              created_at = excluded.created_at,
-              payload_json = excluded.payload_json
+            ON CONFLICT DO NOTHING
             """,
             rows,
         )
         if commit:
             self.connection.commit()
-        return recommendations
+        saved: list[Recommendation] = []
+        for recommendation in recommendations:
+            existing = (
+                self.get_by_dedup_key(recommendation.dedup_key)
+                if recommendation.dedup_key is not None
+                else self.get(recommendation.recommendation_id)
+            )
+            if existing is None:
+                raise sqlite3.IntegrityError(
+                    "recommendation was not saved and no matching identity exists"
+                )
+            saved.append(existing)
+        return saved
 
     def list(
         self,
@@ -135,6 +151,21 @@ class RecommendationRepository:
             WHERE recommendation_id = ?
             """,
             (recommendation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Recommendation.model_validate_json(row["payload_json"])
+
+    def get_by_dedup_key(self, dedup_key: str | None) -> Recommendation | None:
+        if dedup_key is None:
+            return None
+        row = self.connection.execute(
+            """
+            SELECT payload_json
+            FROM recommendations
+            WHERE dedup_key = ?
+            """,
+            (dedup_key,),
         ).fetchone()
         if row is None:
             return None

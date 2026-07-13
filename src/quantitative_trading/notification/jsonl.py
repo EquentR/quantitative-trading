@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from quantitative_trading.audit.models import AuditLog
 from quantitative_trading.config import Settings
@@ -10,9 +11,14 @@ from quantitative_trading.sanitization import sanitize_sensitive_data
 
 
 class JsonlNotificationWriter:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        configured_secret_texts: tuple[str, ...] = (),
+    ) -> None:
         self.settings = settings
-        self._configured_secrets = tuple(
+        settings_secrets = tuple(
             value
             for value in (
                 settings.api_access_password,
@@ -20,6 +26,7 @@ class JsonlNotificationWriter:
             )
             if value
         )
+        self._configured_secrets = settings_secrets + tuple(configured_secret_texts)
 
     def write(
         self,
@@ -27,13 +34,39 @@ class JsonlNotificationWriter:
         recommendation: Recommendation,
         audit_ref: AuditLog,
     ) -> None:
-        self.settings.log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = self.settings.log_dir / "notifications.jsonl"
         payload = {
             "summary": summary.model_dump(mode="json"),
             "recommendation": recommendation.model_dump(mode="json"),
             "audit": audit_ref.model_dump(mode="json"),
         }
+        self._append(payload)
+
+    def write_system_alert(
+        self,
+        summary: NotificationSummary,
+        audit_ref: AuditLog,
+        *,
+        event_type: str,
+        alert_key: str,
+        message: str,
+        details: dict[str, Any],
+    ) -> None:
+        self._append(
+            {
+                "summary": summary.model_dump(mode="json"),
+                "system_alert": {
+                    "event_type": event_type,
+                    "alert_key": alert_key,
+                    "message": message,
+                    "details": details,
+                },
+                "audit": audit_ref.model_dump(mode="json"),
+            }
+        )
+
+    def _append(self, payload: dict[str, Any]) -> None:
+        self.settings.log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.settings.log_dir / "notifications.jsonl"
         sanitized = sanitize_sensitive_data(
             payload,
             configured_secret_texts=self._configured_secrets,

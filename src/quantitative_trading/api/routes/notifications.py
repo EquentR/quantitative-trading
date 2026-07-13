@@ -30,6 +30,13 @@ class UnreadCountResponse(BaseModel):
     count: int
 
 
+class NotificationListResponse(BaseModel):
+    items: list[NotificationSummary]
+    total: int
+    page: int
+    page_size: int
+
+
 def _not_found() -> ApiError:
     return ApiError(
         status_code=404,
@@ -46,25 +53,36 @@ def _storage_failed() -> ApiError:
     )
 
 
-@router.get("", response_model=list[NotificationSummary])
+@router.get("", response_model=NotificationListResponse)
 def list_notifications(
     status: NotificationStatus | None = None,
     symbol: str | None = Query(default=None, pattern=r"^[0-9]{6}$"),
     action: str | None = None,
     recommendation_id: str | None = None,
-    limit: int = Query(default=50, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
     container: ApiContainer = Depends(get_container),
-) -> list[NotificationSummary]:
+) -> NotificationListResponse:
     try:
         with connection_scope(container.settings) as connection:
-            return NotificationRepository(connection).list(
-                status=status,
-                symbol=symbol,
-                action=action,
-                recommendation_id=recommendation_id,
-                limit=limit,
-                offset=offset,
+            repository = NotificationRepository(connection)
+            return NotificationListResponse(
+                items=repository.list(
+                    status=status,
+                    symbol=symbol,
+                    action=action,
+                    recommendation_id=recommendation_id,
+                    limit=page_size,
+                    offset=(page - 1) * page_size,
+                ),
+                total=repository.count(
+                    status=status,
+                    symbol=symbol,
+                    action=action,
+                    recommendation_id=recommendation_id,
+                ),
+                page=page,
+                page_size=page_size,
             )
     except (sqlite3.Error, ValidationError) as exc:
         raise _storage_failed() from exc

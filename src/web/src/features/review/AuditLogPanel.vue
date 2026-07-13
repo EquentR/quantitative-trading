@@ -3,10 +3,16 @@ import { computed } from 'vue'
 import Alert from '@/components/ui/Alert.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
 import { useAuditLogQuery } from '@/queries/audit'
+import type { AuditLog } from '@/api/types'
 
 const auditQuery = useAuditLogQuery()
 const auditLogs = computed(() => auditQuery.data.value ?? [])
 const auditError = computed(() => auditQuery.error.value != null)
+
+function auditSymbol(log: AuditLog): string | null {
+  const symbol = log.payload.symbol
+  return typeof symbol === 'string' && /^\d{6}$/.test(symbol) ? symbol : null
+}
 </script>
 
 <template>
@@ -23,6 +29,7 @@ const auditError = computed(() => auditQuery.error.value != null)
             <th class="w-1/4 py-1">事件类型</th>
             <th class="w-1/4 py-1">建议ID</th>
             <th class="w-1/4 py-1">时间</th>
+            <th class="w-20 py-1">行情</th>
           </tr>
         </thead>
         <tbody>
@@ -35,6 +42,15 @@ const auditError = computed(() => auditQuery.error.value != null)
             <td class="py-1.5 break-words">{{ log.event_type }}</td>
             <td class="py-1.5 break-words">{{ log.recommendation_id ?? '-' }}</td>
             <td class="py-1.5"><FormatValues kind="time" :value="log.created_at" /></td>
+            <td class="py-1.5">
+              <RouterLink
+                v-if="auditSymbol(log)"
+                class="text-primary underline"
+                :to="{ path: '/market', query: { symbol: auditSymbol(log) } }"
+                :aria-label="`返回 ${auditSymbol(log)} 行情（审计 ${log.audit_id}）`"
+              >查看</RouterLink>
+              <span v-else class="text-muted-foreground">-</span>
+            </td>
           </tr>
         </tbody>
       </table>

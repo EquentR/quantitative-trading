@@ -81,7 +81,12 @@ def test_email_delivery_api_lists_filters_details_and_manually_retries_dead(tmp_
     unauthorized = client.get("/api/v1/notifications/email-deliveries")
     listed = client.get(
         "/api/v1/notifications/email-deliveries",
-        params={"status": "dead", "notification_id": "notif-1", "limit": 1, "offset": 0},
+        params={
+            "status": "dead",
+            "notification_id": "notif-1",
+            "page": 1,
+            "page_size": 1,
+        },
         headers=headers,
     )
     detail = client.get(
@@ -92,7 +97,13 @@ def test_email_delivery_api_lists_filters_details_and_manually_retries_dead(tmp_
     )
 
     assert unauthorized.status_code == 401
-    assert [item["delivery_id"] for item in listed.json()] == ["delivery-1"]
+    assert [item["delivery_id"] for item in listed.json()["items"]] == ["delivery-1"]
+    assert listed.json() | {"items": []} == {
+        "items": [],
+        "total": 1,
+        "page": 1,
+        "page_size": 1,
+    }
     assert detail.json()["status"] == "dead"
     assert retried.status_code == 200
     assert retried.json()["status"] == "pending"

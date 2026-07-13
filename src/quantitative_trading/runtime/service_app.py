@@ -13,20 +13,12 @@ from quantitative_trading.decision.factory import (
     build_decision_workflow,
     build_notification_dispatcher,
 )
-from quantitative_trading.email.outbox import (
-    EmailDeliveryRepository,
-    EmailDeliveryService,
-)
-from quantitative_trading.email.repository import SmtpSettingsRepository
-from quantitative_trading.email.service import SmtplibEmailSender
-from quantitative_trading.audit.repository import AuditLogRepository
+from quantitative_trading.email.outbox import EmailDeliveryService
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
     CaptureRunAlreadyActiveError,
     CaptureRunStatus,
 )
-from quantitative_trading.recommendation.scanner import PlanNotScannableError
-from quantitative_trading.recommendation.scanner import scan_latest_plan_recommendations
 from quantitative_trading.runtime.account_snapshot_job import (
     create_and_save_account_snapshot,
 )
@@ -141,9 +133,11 @@ def run_api_service(settings: Settings) -> None:
         timezone=settings.timezone,
         job=run_trading_job,
     )
-    if state.enabled and state.run_on_start:
+    if state.enabled:
         recovery_reason = _startup_recovery_reason(datetime.now(UTC))
-        if recovery_reason is not None:
+        if recovery_reason == "close_readiness" or (
+            recovery_reason is not None and state.run_on_start
+        ):
             run_trading_job(recovery_reason, suppress_record_errors=True)
 
     app = create_app(settings, scheduler=scheduler, restore_scheduler=True)
@@ -255,7 +249,7 @@ def _run_scheduler_task(
     if reason == "email_delivery":
         with connect(settings) as connection:
             migrate(connection)
-            deliveries = _email_delivery_service(connection).process_due(now=task_now)
+            deliveries = _email_delivery_service(connection, settings).process_due(now=task_now)
         return SchedulerJobResult(
             task_type="email_delivery",
             reason="email_delivery_processed",
@@ -272,8 +266,6 @@ def _run_scheduler_task(
             snapshot_id=created.snapshot_id,
             recommendation_ids=[],
         )
-    if reason == "intraday_trigger":
-        return _run_intraday_trigger_job(settings)
     raise ValueError("unknown scheduler task")
 
 
@@ -285,13 +277,8 @@ def _build_decision_workflow(
     return build_decision_workflow(connection, settings, now=lambda: now)
 
 
-def _email_delivery_service(connection) -> EmailDeliveryService:
-    return EmailDeliveryService(
-        EmailDeliveryRepository(connection),
-        SmtpSettingsRepository(connection),
-        SmtplibEmailSender(),
-        audit_repository=AuditLogRepository(connection),
-    )
+def _email_delivery_service(connection, settings: Settings) -> EmailDeliveryService:
+    return build_notification_dispatcher(connection, settings).email_service
 
 
 def _dispatch_runtime_alert(
@@ -330,37 +317,6 @@ def _startup_recovery_reason(now: datetime) -> str | None:
     if calendar.is_trading_minute(local_now):
         return "intraday_decision"
     return None
-
-
-def _run_intraday_trigger_job(settings: Settings) -> SchedulerJobResult:
-    now = datetime.now(UTC)
-    try:
-        with connect(settings) as connection:
-            migrate(connection)
-            scan = scan_latest_plan_recommendations(connection, now=now)
-    except PlanNotScannableError as exc:
-        return SchedulerJobResult(
-            task_type="recommendation_intraday_trigger",
-            reason="no_recommendations_plan_not_scannable",
-            plan_id=exc.plan_id,
-            recommendation_ids=[],
-        )
-
-    if scan is None:
-        return SchedulerJobResult(
-            task_type="recommendation_intraday_trigger",
-            reason="no_recommendations_no_valid_plan",
-            recommendation_ids=[],
-        )
-
-    return SchedulerJobResult(
-        task_type="recommendation_intraday_trigger",
-        reason="recommendations_generated",
-        plan_id=scan.plan.plan_id,
-        recommendation_ids=[
-            recommendation.recommendation_id for recommendation in scan.recommendations
-        ],
-    )
 
 
 def _sync_scheduler_config_to_state(settings: Settings) -> SchedulerState:
@@ -421,6 +377,4 @@ def _task_type_for_reason(reason: str) -> str:
         return "cleanup"
     if reason == "email_delivery":
         return "email_delivery"
-    if reason == "intraday_trigger":
-        return "recommendation_intraday_trigger"
     return "account_snapshot"

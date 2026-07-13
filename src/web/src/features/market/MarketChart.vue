@@ -28,6 +28,7 @@ use([
 const props = defineProps<{
   label: string
   option: EChartsCoreOption
+  qualityMarker?: string | null
 }>()
 
 const element = ref<HTMLElement | null>(null)
@@ -58,5 +59,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div ref="element" class="market-chart" role="img" :aria-label="label" />
+  <div class="market-chart relative" role="img" :aria-label="label">
+    <div ref="element" class="size-full" />
+    <span
+      v-if="qualityMarker"
+      class="pointer-events-none absolute right-2 top-10 z-10 max-w-[calc(100%-1rem)] break-words rounded-sm border border-amber-400 bg-amber-50/95 px-2 py-1 text-xs font-medium text-amber-900 shadow-sm"
+      data-testid="chart-quality-marker"
+    >
+      {{ qualityMarker }}
+    </span>
+  </div>
 </template>

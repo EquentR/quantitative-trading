@@ -90,3 +90,24 @@ class AuditLogRepository:
             parameters,
         ).fetchall()
         return [AuditLog.model_validate_json(row["payload_json"]) for row in rows]
+
+    def count(
+        self,
+        *,
+        event_type: str | None = None,
+        recommendation_id: str | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        for column, value in (
+            ("event_type", event_type),
+            ("recommendation_id", recommendation_id),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                parameters.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.connection.execute(
+            f"SELECT COUNT(*) AS count FROM audit_logs {where}", parameters
+        ).fetchone()
+        return int(row["count"])

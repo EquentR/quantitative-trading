@@ -4,7 +4,7 @@ import sqlite3
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from quantitative_trading.api.dependencies import (
     ApiContainer,
@@ -27,6 +27,13 @@ router = APIRouter(
     tags=["email-deliveries"],
     dependencies=[Depends(require_token)],
 )
+
+
+class EmailDeliveryListResponse(BaseModel):
+    items: list[EmailDelivery]
+    total: int
+    page: int
+    page_size: int
 
 
 def _not_found() -> ApiError:
@@ -53,21 +60,30 @@ def _storage_failed() -> ApiError:
     )
 
 
-@router.get("", response_model=list[EmailDelivery])
+@router.get("", response_model=EmailDeliveryListResponse)
 def list_deliveries(
     status: EmailDeliveryStatus | None = None,
     notification_id: str | None = None,
-    limit: int = Query(default=50, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
     container: ApiContainer = Depends(get_container),
-) -> list[EmailDelivery]:
+) -> EmailDeliveryListResponse:
     try:
         with connection_scope(container.settings) as connection:
-            return EmailDeliveryRepository(connection).list(
-                status=status,
-                notification_id=notification_id,
-                limit=limit,
-                offset=offset,
+            repository = EmailDeliveryRepository(connection)
+            return EmailDeliveryListResponse(
+                items=repository.list(
+                    status=status,
+                    notification_id=notification_id,
+                    limit=page_size,
+                    offset=(page - 1) * page_size,
+                ),
+                total=repository.count(
+                    status=status,
+                    notification_id=notification_id,
+                ),
+                page=page,
+                page_size=page_size,
             )
     except (sqlite3.Error, ValidationError) as exc:
         raise _storage_failed() from exc

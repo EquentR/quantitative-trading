@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/vue-query'
 import { useApiClient } from '@/api/client-provider'
-import type { NotificationSummary } from '@/api/types'
+import { pageItems } from '@/api/pagination'
+import type { NotificationSummary, PaginatedResponse } from '@/api/types'
 
 export const notificationsQueryKey = ['notifications'] as const
 
@@ -8,7 +9,9 @@ export function useNotificationsQuery() {
   const client = useApiClient()
   return useQuery({
     queryKey: notificationsQueryKey,
-    queryFn: () => client.get<NotificationSummary[]>('/notifications'),
+    queryFn: async () => pageItems(
+      await client.get<PaginatedResponse<NotificationSummary> | NotificationSummary[]>('/notifications'),
+    ),
     retry: false,
   })
 }

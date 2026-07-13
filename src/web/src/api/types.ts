@@ -1,5 +1,5 @@
 export type AuthStatus = 'configured' | 'setup_required'
-export type SchedulerLastStatus = 'success' | 'failed' | 'running'
+export type SchedulerLastStatus = 'success' | 'degraded' | 'failed' | 'running' | 'skipped'
 export type AccountSnapshotStatus = 'ok' | 'partial' | 'market_data_unavailable' | 'cash_not_initialized'
 export type PositionValuationStatus = 'ok' | 'failed' | 'stale'
 export type CashTransactionType =
@@ -31,6 +31,8 @@ export interface ServiceStatus {
   last_task_type?: string | null
   last_plan_id?: string | null
   last_recommendation_ids?: string[]
+  overrun_count?: number
+  skipped_count?: number
 }
 
 export interface PositionInput {
@@ -204,9 +206,17 @@ export interface Recommendation {
   data_time: string
 }
 
-export interface RecommendationScanResponse {
-  count: number
-  recommendations: Recommendation[]
+export interface WorkflowRunResponse {
+  task: 'close' | 'intraday' | 'backfill' | 'cleanup'
+  status: 'success' | 'degraded' | 'failed'
+  run_id: string | null
+  snapshot_id: number | null
+  plan_id: string | null
+  recommendation_ids: string[]
+  warnings: string[]
+  reused: boolean
+  ready: boolean | null
+  cleaned_rows: number | null
 }
 
 export interface NotificationSummary {
@@ -451,6 +461,7 @@ export interface MarketSnapshotTrace {
   fetched_at: string
   status: MarketQualityStatus
   warnings: string[]
+  thresholds: Record<string, number>
   datasets: MarketTraceDataset[]
 }
 
@@ -480,6 +491,10 @@ export interface MarketCaptureRun {
   warning_count: number
   failure_count: number
   error_summary: string
+  dataset_counts: Partial<Record<
+    'quote' | 'daily_bar' | 'money_flow' | 'minute_bar' | 'intraday_strength',
+    { complete: number; degraded: number; failed: number; stale: number }
+  >>
 }
 
 export interface EmailNotificationSettings {

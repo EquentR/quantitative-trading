@@ -27,6 +27,7 @@ from quantitative_trading.market.providers import (
 )
 from quantitative_trading.notification.dispatcher import NotificationDispatcher
 from quantitative_trading.notification.jsonl import JsonlNotificationWriter
+from quantitative_trading.notification.local_alert import LocalAlertDispatcher
 from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.notification.service import NotificationService
 
@@ -92,6 +93,7 @@ def build_decision_workflow(
         money_flow_provider=money_flow_provider,
         intraday_provider=intraday_provider,
         now=clock,
+        stale_trading_minutes=settings.market_stale_trading_minutes,
         notification_dispatcher=build_notification_dispatcher(connection, settings),
     )
 
@@ -108,19 +110,33 @@ def build_notification_dispatcher(
         else ()
     )
     audit_repository = AuditLogRepository(connection)
+    notification_service = NotificationService(NotificationRepository(connection))
+    audit_service = AuditService(
+        audit_repository,
+        configured_secret_texts=configured_secrets,
+    )
+    jsonl_writer = JsonlNotificationWriter(
+        settings,
+        configured_secret_texts=configured_secrets,
+    )
+    local_alert_dispatcher = LocalAlertDispatcher(
+        notification_service=notification_service,
+        audit_service=audit_service,
+        jsonl_writer=jsonl_writer,
+        configured_secret_texts=configured_secrets,
+    )
     email_service = EmailDeliveryService(
         EmailDeliveryRepository(connection),
         smtp_repository,
         SmtplibEmailSender(),
         audit_repository=audit_repository,
+        dead_delivery_alert=local_alert_dispatcher.dispatch_dead_email,
     )
     return NotificationDispatcher(
-        notification_service=NotificationService(NotificationRepository(connection)),
-        audit_service=AuditService(
-            audit_repository,
-            configured_secret_texts=configured_secrets,
-        ),
-        jsonl_writer=JsonlNotificationWriter(settings),
+        notification_service=notification_service,
+        audit_service=audit_service,
+        jsonl_writer=jsonl_writer,
         email_service=email_service,
         smtp_settings_service=SmtpSettingsService(smtp_repository),
+        local_alert_dispatcher=local_alert_dispatcher,
     )

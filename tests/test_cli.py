@@ -46,12 +46,17 @@ from tests.planning_fixtures import persist_test_plan
 runner = CliRunner()
 
 
-def run_cli(tmp_path: Path, *args: str, env: dict[str, str] | None = None):
+def run_cli(
+    tmp_path: Path,
+    *args: str,
+    env: dict[str, str] | None = None,
+    input: str | None = None,
+):
     db_path = tmp_path / "ledger.db"
     cli_env = {"QT_DATABASE_PATH": str(db_path)}
     if env is not None:
         cli_env.update(env)
-    return runner.invoke(app, [*args], env=cli_env)
+    return runner.invoke(app, [*args], env=cli_env, input=input)
 
 
 def test_ledger_add_and_list(tmp_path) -> None:
@@ -915,90 +920,23 @@ def test_plan_latest_reads_existing_plan(tmp_path) -> None:
     assert "trading_day=2026-07-09" in latest_result.output
 
 
-def test_recommendation_scan_list_and_show_commands(tmp_path, monkeypatch) -> None:
-    run_cli(
-        tmp_path,
-        "ledger",
-        "add",
-        "--symbol",
-        "600000",
-        "--name",
-        "浦发银行",
-        "--quantity",
-        "1000",
-        "--available-quantity",
-        "800",
-        "--cost-price",
-        "9.5",
-        "--opened-at",
-        "2026-07-06",
-    )
-    persist_test_plan(Settings(database_path=tmp_path / "ledger.db"))
-
-    class FixedDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            fixed = datetime(2026, 7, 9, 6, 0, tzinfo=UTC)
-            if tz is None:
-                return fixed.replace(tzinfo=None)
-            return fixed.astimezone(tz)
-
-    monkeypatch.setattr(cli, "datetime", FixedDatetime)
-
-    scan_result = run_cli(tmp_path, "recommendations", "scan")
-    list_result = run_cli(tmp_path, "recommendations", "list")
-    show_result = run_cli(
-        tmp_path, "recommendations", "show", "rec-plan-20260709-600000"
-    )
-
-    assert scan_result.exit_code == 0
-    assert "generated=1" in scan_result.output
-    assert "rec-plan-20260709-600000 600000 hold" in scan_result.output
-    assert list_result.exit_code == 0
-    assert "rec-plan-20260709-600000 600000 hold" in list_result.output
-    assert show_result.exit_code == 0
-    assert "recommendation_id=rec-plan-20260709-600000" in show_result.output
-    assert "symbol=600000" in show_result.output
-    assert "action=hold" in show_result.output
-
-
-def test_recommendation_scan_rejects_expired_plan_without_traceback(
-    monkeypatch,
-    tmp_path,
-) -> None:
-    class FakeDatetime(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return datetime(2026, 7, 9, 8, 0, tzinfo=UTC)
-
-    run_cli(
-        tmp_path,
-        "ledger",
-        "add",
-        "--symbol",
-        "600000",
-        "--name",
-        "浦发银行",
-        "--quantity",
-        "1000",
-        "--available-quantity",
-        "800",
-        "--cost-price",
-        "9.5",
-        "--opened-at",
-        "2026-07-06",
-    )
-    persist_test_plan(Settings(database_path=tmp_path / "ledger.db"))
-    monkeypatch.setattr(cli, "datetime", FakeDatetime)
-
+def test_recommendation_scan_is_retired_without_writing(tmp_path) -> None:
     scan_result = run_cli(tmp_path, "recommendations", "scan")
     list_result = run_cli(tmp_path, "recommendations", "list")
 
     assert scan_result.exit_code != 0
-    assert "trading plan is not scannable" in scan_result.output
-    assert "Traceback" not in scan_result.output
+    assert "recommendations scan is retired" in scan_result.output
+    assert "workflow intraday" in scan_result.output
     assert list_result.exit_code == 0
     assert "暂无建议" in list_result.output
+
+
+def test_recommendation_scan_retirement_has_no_traceback(tmp_path) -> None:
+    scan_result = run_cli(tmp_path, "recommendations", "scan")
+
+    assert scan_result.exit_code != 0
+    assert "recommendations scan is retired" in scan_result.output
+    assert "Traceback" not in scan_result.output
 
 
 def test_service_run_once_uses_configured_akshare_provider(
@@ -1258,7 +1196,11 @@ def test_market_backfill_defaults_to_decision_enabled_universe_and_json(
         results = MarketCaptureResultRepository(connection).list_for_run(
             payload["run_id"]
         )
+        audits = AuditLogRepository(connection).list_recent(limit=20)
     assert len(results) == 4
+    manual_audit = next(item for item in audits if item.event_type == "workflow.manual_run")
+    assert manual_audit.payload["workflow_type"] == "backfill"
+    assert manual_audit.payload["run_id"] == payload["run_id"]
 
 
 def test_market_backfill_explicit_symbols_filter_enabled_universe_and_reuse_run(
@@ -1446,6 +1388,14 @@ def test_market_backfill_failure_is_sanitized_without_database_path(
     assert str(database_path) not in result.output
     assert "synthetic-token-secret" not in result.output
     assert "raw failure" not in result.output
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        audits = AuditLogRepository(connection).list_recent(limit=20)
+    failed = next(
+        item for item in audits if item.event_type == "workflow.manual_run_failed"
+    )
+    assert failed.payload["workflow_type"] == "backfill"
+    assert str(database_path) not in failed.model_dump_json()
 
 
 def test_market_backfill_sparse_usable_data_is_degraded_not_failed(
@@ -1636,6 +1586,8 @@ def test_notifications_cli_lists_counts_and_marks_read_with_audit(tmp_path) -> N
         "1",
     )
     unread = run_cli(tmp_path, "notifications", "unread")
+    listed_json = run_cli(tmp_path, "notifications", "list", "--json")
+    unread_json = run_cli(tmp_path, "notifications", "unread", "--json")
     marked = run_cli(tmp_path, "notifications", "read", "notif-1")
 
     assert listed.exit_code == 0
@@ -1643,6 +1595,8 @@ def test_notifications_cli_lists_counts_and_marks_read_with_audit(tmp_path) -> N
     assert "notif-2" not in listed.output
     assert unread.exit_code == 0
     assert unread.output.strip() == "unread=2"
+    assert len(json.loads(listed_json.output)) == 3
+    assert json.loads(unread_json.output) == {"unread": 2}
     assert marked.exit_code == 0
     assert "notification_id=notif-1 status=read" in marked.output
     with connect(settings) as connection:
@@ -1772,10 +1726,12 @@ def test_email_cli_deliveries_and_retry_share_outbox_service_and_write_audit(
         "--status",
         "dead",
     )
+    listed_json = run_cli(tmp_path, "email", "deliveries", "--json")
     retried = run_cli(tmp_path, "email", "retry", "delivery-1")
 
     assert listed.exit_code == 0
     assert "delivery-1 status=dead attempts=6" in listed.output
+    assert json.loads(listed_json.output)[0]["delivery_id"] == "delivery-1"
     assert retried.exit_code == 0
     assert "delivery_id=delivery-1 status=pending attempts=0" in retried.output
     with connect(settings) as connection:
@@ -1884,6 +1840,8 @@ def test_workflow_close_cli_requires_reason_for_calendar_override_and_audits(
         "--skip-calendar",
         "--reason",
         "人工确认交易日历例外",
+        env={"QT_API_ACCESS_PASSWORD": "local-password"},
+        input="local-password\n",
     )
 
     assert rejected.exit_code != 0
@@ -1897,3 +1855,30 @@ def test_workflow_close_cli_requires_reason_for_calendar_override_and_audits(
         audits = AuditLogRepository(connection).list_recent(limit=10)
     assert audits[0].event_type == "workflow.manual_run"
     assert audits[0].payload["manual_reason"] == "人工确认交易日历例外"
+
+
+def test_workflow_close_cli_rejects_invalid_override_password(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "_workflow_now",
+        lambda: datetime(2026, 7, 12, 7, 20, tzinfo=UTC),
+    )
+
+    result = run_cli(
+        tmp_path,
+        "workflow",
+        "close",
+        "--date",
+        "2026-07-12",
+        "--skip-calendar",
+        "--reason",
+        "人工确认交易日历例外",
+        env={"QT_API_ACCESS_PASSWORD": "local-password"},
+        input="wrong-password\n",
+    )
+
+    assert result.exit_code != 0
+    assert "manual workflow authentication failed" in result.output
+    assert "wrong-password" not in result.output

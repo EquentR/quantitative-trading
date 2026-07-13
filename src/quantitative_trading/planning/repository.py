@@ -6,13 +6,20 @@ from datetime import UTC, date
 from quantitative_trading.planning.models import TradingPlan, TradingPlanStatus
 
 
+class ActivePlanConflictError(RuntimeError):
+    def __init__(self, trading_day: date) -> None:
+        super().__init__(f"active trading plan already exists for {trading_day.isoformat()}")
+        self.trading_day = trading_day
+
+
 class TradingPlanRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
 
     def save(self, plan: TradingPlan, *, commit: bool = True) -> TradingPlan:
-        self.connection.execute(
-            """
+        try:
+            self.connection.execute(
+                """
             INSERT INTO trading_plans (
               plan_id,
               trading_day,
@@ -34,16 +41,20 @@ class TradingPlanRepository:
               valid_until = excluded.valid_until,
               status = excluded.status,
               payload_json = excluded.payload_json
-            """,
-            (
-                plan.plan_id,
-                plan.trading_day.isoformat(),
-                plan.generated_at.astimezone(UTC).isoformat(),
-                plan.valid_until.isoformat(),
-                plan.status.value,
-                plan.model_dump_json(),
-            ),
-        )
+                """,
+                (
+                    plan.plan_id,
+                    plan.trading_day.isoformat(),
+                    plan.generated_at.astimezone(UTC).isoformat(),
+                    plan.valid_until.isoformat(),
+                    plan.status.value,
+                    plan.model_dump_json(),
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            if plan.status is TradingPlanStatus.ACTIVE:
+                raise ActivePlanConflictError(plan.trading_day) from exc
+            raise
         if commit:
             self.connection.commit()
         return plan

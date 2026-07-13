@@ -259,14 +259,25 @@ class IntradayStrengthResponse(BaseModel):
     warnings: list[str]
 
 
+class DatasetStatusCounts(BaseModel):
+    complete: int = 0
+    degraded: int = 0
+    failed: int = 0
+    stale: int = 0
+
+
+class MarketRunSummary(MarketCaptureRun):
+    dataset_counts: dict[CaptureDataset, DatasetStatusCounts]
+
+
 class PaginatedMarketRuns(BaseModel):
-    items: list[MarketCaptureRun]
+    items: list[MarketRunSummary]
     total: int
     page: int
     page_size: int
 
 
-class MarketRunDetail(MarketCaptureRun):
+class MarketRunDetail(MarketRunSummary):
     results: list[MarketCaptureResult]
 
 
@@ -288,10 +299,12 @@ class MarketSnapshotTrace(BaseModel):
     snapshot_id: int
     plan_id: str | None
     recommendation_id: str | None
+    audit_id: str | None
     data_time: datetime | None
     fetched_at: datetime
     status: QualityStatus
     warnings: list[str]
+    thresholds: dict[str, float]
     datasets: list[MarketTraceDataset]
 
 
@@ -319,6 +332,18 @@ def _run_not_found(run_id: str) -> ApiError:
         message="market capture run not found",
         details={"run_id": run_id},
     )
+
+
+def _capture_dataset_counts(
+    results: list[MarketCaptureResult],
+) -> dict[CaptureDataset, DatasetStatusCounts]:
+    counts: dict[CaptureDataset, DatasetStatusCounts] = {}
+    for result in results:
+        current = counts.setdefault(result.dataset, DatasetStatusCounts())
+        counts[result.dataset] = current.model_copy(
+            update={result.status.value: getattr(current, result.status.value) + 1}
+        )
+    return counts
 
 
 def _plan_contains_symbol(plan: TradingPlan, symbol: str) -> bool:
@@ -1143,7 +1168,17 @@ def list_market_runs(
             """,
             (page_size, offset),
         ).fetchall()
-        items = [MarketCaptureRun.model_validate(dict(row)) for row in rows]
+        run_repository = MarketCaptureResultRepository(connection)
+        items = []
+        for row in rows:
+            run = MarketCaptureRun.model_validate(dict(row))
+            results = run_repository.list_for_run(run.run_id)
+            items.append(
+                MarketRunSummary(
+                    **run.model_dump(exclude_computed_fields=True),
+                    dataset_counts=_capture_dataset_counts(results),
+                )
+            )
     return PaginatedMarketRuns(
         items=items,
         total=int(total_row["count"]),
@@ -1164,6 +1199,7 @@ def get_market_run(
         results = MarketCaptureResultRepository(connection).list_for_run(run_id)
     return MarketRunDetail(
         **run.model_dump(exclude_computed_fields=True),
+        dataset_counts=_capture_dataset_counts(results),
         results=results,
     )
 
@@ -1392,9 +1428,11 @@ def get_market_snapshot_trace(
         recommendation_id=(
             None if recommendation is None else recommendation.recommendation_id
         ),
+        audit_id=None if recommendation is None else recommendation.audit_id,
         data_time=snapshot.data_time,
         fetched_at=snapshot.fetched_at,
         status=_trace_status(datasets),
         warnings=_deduplicate([*snapshot.warnings, *dataset_warnings]),
+        thresholds=snapshot.thresholds,
         datasets=datasets,
     )

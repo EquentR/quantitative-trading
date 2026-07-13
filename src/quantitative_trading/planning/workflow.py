@@ -64,6 +64,9 @@ def build_market_trading_plan(
             sources=item.sources,
             is_holding=item.is_holding,
             trend=dict(item.daily_features),
+            daily_feature_facts={
+                name: dict(fact) for name, fact in item.daily_feature_facts.items()
+            },
             volume_price={
                 "volume_ratio": item.daily_features.get("volume_ratio"),
                 "current_price": item.current_price,

@@ -6,6 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from quantitative_trading.api.app import create_app
+from quantitative_trading.audit.models import AuditLog
+from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.config import Settings
 from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import PositionRepository
@@ -297,6 +299,7 @@ def seed_market_data(settings: Settings) -> int:
                 money_flow_snapshot_refs={"600000": money_snapshot_id},
                 intraday_strength_snapshot_refs={"600000": strength_id},
                 capture_run_id=run.run_id,
+                thresholds={"stale_trading_minutes": 6},
                 data_time=DATA_TIME,
                 fetched_at=FETCHED_AT,
                 warnings=[],
@@ -351,9 +354,19 @@ def seed_market_data(settings: Settings) -> int:
             run_id=run.run_id,
             market_input_snapshot_id=market_snapshot_id,
             plan_id=plan.plan_id,
+            audit_id="audit-1",
         )
         RecommendationRepository(connection).save_many(
             [recommendation], created_at=FETCHED_AT
+        )
+        AuditLogRepository(connection).save(
+            AuditLog(
+                audit_id="audit-1",
+                event_type="recommendation.generated",
+                recommendation_id=recommendation.recommendation_id,
+                payload={"symbol": "600000", "action": "hold"},
+                created_at=FETCHED_AT,
+            )
         )
         NotificationRepository(connection).save(
             NotificationSummary(
@@ -656,6 +669,12 @@ def test_market_run_list_detail_results_and_missing_error(tmp_path) -> None:
     assert listed.status_code == 200
     assert listed.json()["total"] == 1
     assert listed.json()["items"][0]["run_id"] == "run-close-20260713"
+    assert listed.json()["items"][0]["dataset_counts"]["daily_bar"] == {
+        "complete": 1,
+        "degraded": 0,
+        "failed": 0,
+        "stale": 0,
+    }
     assert detail.status_code == 200
     assert detail.json()["run_id"] == "run-close-20260713"
     assert detail.json()["duration_ms"] == 240_000
@@ -664,6 +683,7 @@ def test_market_run_list_detail_results_and_missing_error(tmp_path) -> None:
     assert detail.json()["notification_count"] == 2
     assert detail.json()["email_outbox_count"] == 1
     assert detail.json()["retry_count"] == 1
+    assert detail.json()["dataset_counts"]["daily_bar"]["complete"] == 1
     assert detail.json()["results"][0]["dataset"] == "daily_bar"
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "market_run_not_found"
@@ -687,6 +707,8 @@ def test_market_snapshot_trace_resolves_all_dataset_and_decision_references(
     assert body["snapshot_id"] == snapshot_id
     assert body["plan_id"] == "plan-20260713"
     assert body["recommendation_id"] == "rec-600000-1"
+    assert body["audit_id"] == "audit-1"
+    assert body["thresholds"] == {"stale_trading_minutes": 6.0}
     assert [dataset["dataset"] for dataset in body["datasets"]] == [
         "quote",
         "history",

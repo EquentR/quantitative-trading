@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/vue-query'
 import { useApiClient } from '@/api/client-provider'
-import type { AuditLog } from '@/api/types'
+import { pageItems } from '@/api/pagination'
+import type { AuditLog, PaginatedResponse } from '@/api/types'
 
 export const auditLogQueryKey = ['audit'] as const
 export const auditEntryQueryKey = (auditId: string) => ['audit', auditId] as const
@@ -9,7 +10,9 @@ export function useAuditLogQuery() {
   const client = useApiClient()
   return useQuery({
     queryKey: auditLogQueryKey,
-    queryFn: () => client.get<AuditLog[]>('/audit'),
+    queryFn: async () => pageItems(
+      await client.get<PaginatedResponse<AuditLog> | AuditLog[]>('/audit'),
+    ),
     retry: false,
   })
 }

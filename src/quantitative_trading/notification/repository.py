@@ -127,6 +127,32 @@ class NotificationRepository:
         ).fetchone()
         return int(row["count"])
 
+    def count(
+        self,
+        *,
+        status: NotificationStatus | None = None,
+        symbol: str | None = None,
+        action: str | None = None,
+        recommendation_id: str | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        for column, value in (
+            ("status", status.value if status is not None else None),
+            ("symbol", symbol),
+            ("action", action),
+            ("recommendation_id", recommendation_id),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                parameters.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.connection.execute(
+            f"SELECT COUNT(*) AS count FROM notifications {where}",
+            parameters,
+        ).fetchone()
+        return int(row["count"])
+
     def list_by_recommendation_id(
         self,
         recommendation_id: str,

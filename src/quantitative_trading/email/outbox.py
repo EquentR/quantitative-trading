@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 from uuid import uuid4
 
+from quantitative_trading.audit.models import AuditLog
 from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.audit.service import AuditService
 from quantitative_trading.email.models import EmailDelivery, EmailDeliveryStatus
@@ -15,10 +18,21 @@ from quantitative_trading.sanitization import sanitize_sensitive_data
 
 
 DEFAULT_RETRY_DELAYS_MINUTES = (1, 5, 15, 30, 60)
+LOGGER = logging.getLogger(__name__)
 
 
 class EmailDeliveryNotRetryableError(RuntimeError):
     pass
+
+
+class DeadDeliveryAlert(Protocol):
+    def __call__(
+        self,
+        *,
+        delivery: EmailDelivery,
+        audit_ref: AuditLog,
+        now: datetime,
+    ) -> object: ...
 
 
 class EmailDeliveryRepository:
@@ -105,6 +119,26 @@ class EmailDeliveryRepository:
             parameters,
         ).fetchall()
         return [self._from_row(row) for row in rows]
+
+    def count(
+        self,
+        *,
+        status: EmailDeliveryStatus | None = None,
+        notification_id: str | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if status is not None:
+            clauses.append("status = ?")
+            parameters.append(status.value)
+        if notification_id is not None:
+            clauses.append("notification_id = ?")
+            parameters.append(notification_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.connection.execute(
+            f"SELECT COUNT(*) AS count FROM email_deliveries {where}", parameters
+        ).fetchone()
+        return int(row["count"])
 
     def claim_due(
         self,
@@ -291,6 +325,7 @@ class EmailDeliveryService:
         retry_delays_minutes: Sequence[int] = DEFAULT_RETRY_DELAYS_MINUTES,
         lease_seconds: int = 60,
         audit_repository: AuditLogRepository | None = None,
+        dead_delivery_alert: DeadDeliveryAlert | None = None,
     ) -> None:
         self.repository = repository
         self.smtp_repository = smtp_repository
@@ -299,6 +334,7 @@ class EmailDeliveryService:
         self.retry_delays_minutes = tuple(retry_delays_minutes)
         self.lease_seconds = lease_seconds
         self.audit_repository = audit_repository
+        self.dead_delivery_alert = dead_delivery_alert
 
     def enqueue(
         self,
@@ -392,7 +428,7 @@ class EmailDeliveryService:
                     updated.status is EmailDeliveryStatus.DEAD
                     and self.audit_repository is not None
                 ):
-                    AuditService(self.audit_repository).record_event(
+                    audit = AuditService(self.audit_repository).record_event(
                         event_type="email.delivery.dead",
                         recommendation_id=None,
                         payload={
@@ -401,6 +437,22 @@ class EmailDeliveryService:
                         },
                         now=attempted_at,
                     )
+                    if self.dead_delivery_alert is not None:
+                        try:
+                            self.dead_delivery_alert(
+                                delivery=updated,
+                                audit_ref=audit,
+                                now=attempted_at,
+                            )
+                        except Exception as alert_exc:
+                            LOGGER.error(
+                                "email_dead_local_alert_failed delivery_id=%s error=%s",
+                                updated.delivery_id,
+                                sanitized_email_error(
+                                    alert_exc,
+                                    secret_texts=secret_texts,
+                                ),
+                            )
             else:
                 processed.append(
                     self.repository.mark_sent(delivery.delivery_id, now=attempted_at)

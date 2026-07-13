@@ -65,6 +65,36 @@ def test_scheduler_state_persists_enabled_and_last_result(tmp_path) -> None:
     assert state.last_reason == "manual_api"
     assert state.last_error is None
     assert state.last_snapshot_id == 3
+    assert state.overrun_count == 0
+    assert state.skipped_count == 0
+
+
+def test_scheduler_state_accumulates_overrun_and_skipped_metrics(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "scheduler-metrics.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = SchedulerStateRepository(connection)
+        repository.record_result(
+            started_at=NOW,
+            finished_at=NOW,
+            status="skipped",
+            reason="scheduler_overrun:decision_intraday",
+            error=None,
+            snapshot_id=None,
+            now=NOW,
+        )
+        state = repository.record_result(
+            started_at=NOW,
+            finished_at=NOW,
+            status="skipped",
+            reason="scheduler_missed:decision_close_readiness",
+            error=None,
+            snapshot_id=None,
+            now=NOW,
+        )
+
+    assert state.overrun_count == 1
+    assert state.skipped_count == 2
 
 
 def test_scheduler_state_record_result_creates_default_state_when_missing(tmp_path) -> None:

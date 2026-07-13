@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from quantitative_trading.account.models import AccountSnapshot
+from quantitative_trading.account.models import AccountSnapshot, AccountSnapshotStatus
 from quantitative_trading.decision.models import DecisionSymbolInput
 from quantitative_trading.recommendation.models import Recommendation
 from quantitative_trading.recommendation.service import build_recommendation
@@ -29,6 +29,21 @@ def decide_symbol(
         risk_config,
         context=risk_context,
     )
+    if decision_input.is_holding and (
+        account_snapshot is None
+        or account_snapshot.status is not AccountSnapshotStatus.OK
+    ):
+        warning = (
+            "账户估值不可用，持仓仓位信息不完整，需人工复核"
+            if account_snapshot is None
+            else (
+                f"账户估值状态为 {account_snapshot.status.value}，"
+                "持仓仓位信息不完整，需人工复核"
+            )
+        )
+        risk_decision = risk_decision.model_copy(
+            update={"reasons": list(dict.fromkeys([*risk_decision.reasons, warning]))}
+        )
 
     position_constraint: dict[str, object] = {}
     if risk_decision.action in {StrategyAction.BUY, StrategyAction.ADD}:
@@ -111,7 +126,40 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
             stop_loss_price=decision_input.stop_loss_price,
         )
         if risk_signals:
-            return risk_signals[0]
+            signal = risk_signals[0]
+            if decision_input.limit_status in {"up", "down"}:
+                signal = signal.model_copy(
+                    update={
+                        "machine_reason": [
+                            *signal.machine_reason,
+                            "price_limit_execution_uncertain",
+                        ],
+                        "human_reason": [
+                            *signal.human_reason,
+                            "标的处于涨跌停状态，卖出或减仓建议可能无法成交",
+                        ],
+                    }
+                )
+            return signal
+
+        if (
+            decision_input.trading_status == "unknown"
+            or decision_input.limit_status == "unknown"
+        ):
+            return _conservative_signal(
+                decision_input,
+                action=StrategyAction.HOLD,
+                machine_reason="tradeability_unknown",
+                human_reason="无法确认交易状态或涨跌停状态，暂停新增买入或加仓",
+            )
+
+        if decision_input.limit_status in {"up", "down"}:
+            return _conservative_signal(
+                decision_input,
+                action=StrategyAction.HOLD,
+                machine_reason="price_limit_blocks_entry",
+                human_reason="标的处于涨跌停状态，禁止新增买入或加仓",
+            )
 
         if (
             decision_input.plan_active
@@ -119,6 +167,7 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
             and decision_input.plan_condition_met
             and decision_input.daily_structure_confirmed
             and decision_input.intraday_strength == "strong"
+            and decision_input.trading_status == "normal"
             and decision_input.limit_status == "none"
         ):
             return planned_entry_signal(
@@ -147,6 +196,17 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
             action=StrategyAction.WATCH,
             machine_reason="price_limit_blocks_entry",
             human_reason="标的处于涨跌停状态，禁止新增买入",
+        )
+
+    if (
+        decision_input.trading_status == "unknown"
+        or decision_input.limit_status == "unknown"
+    ):
+        return _conservative_signal(
+            decision_input,
+            action=StrategyAction.WATCH,
+            machine_reason="tradeability_unknown",
+            human_reason="无法确认交易状态或涨跌停状态，暂停新增买入",
         )
 
     return planned_entry_signal(

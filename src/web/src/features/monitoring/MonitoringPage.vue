@@ -81,6 +81,26 @@ const workflowLabels: Record<string, string> = {
   cleanup: '清理',
 }
 
+const datasetLabels: Record<string, string> = {
+  quote: 'quote',
+  daily_bar: 'daily_bar',
+  money_flow: 'money_flow',
+  minute_bar: 'minute_bar',
+  intraday_strength: 'intraday_strength',
+}
+
+function formatDatasetCounts(run: ReturnType<typeof marketRuns>[number]): string[] {
+  return Object.entries(run.dataset_counts ?? {}).map(([dataset, counts]) => {
+    const values = [
+      counts.complete ? `完成 ${counts.complete}` : '',
+      counts.degraded ? `降级 ${counts.degraded}` : '',
+      counts.failed ? `失败 ${counts.failed}` : '',
+      counts.stale ? `陈旧 ${counts.stale}` : '',
+    ].filter(Boolean)
+    return `${datasetLabels[dataset] ?? dataset} ${values.join(' / ')}`
+  })
+}
+
 async function onGenerate() {
   await runOnceMutation.mutateAsync()
   runMessage.value = '已请求生成账户快照'
@@ -98,6 +118,9 @@ async function onGenerate() {
         :auth-status="service()?.auth_status"
         :scheduler-running="service()?.scheduler_running"
       />
+      <p v-if="service()" class="text-xs text-muted-foreground break-words">
+        最近原因：{{ service()?.last_reason ?? '-' }} · 并发超限 {{ service()?.overrun_count ?? 0 }} 次 · 跳过 {{ service()?.skipped_count ?? 0 }} 次
+      </p>
       <div class="flex flex-wrap gap-2">
         <Button variant="primary" :loading="startMutation.isPending.value" @click="startMutation.mutate()">
           <Play class="size-4" />
@@ -122,40 +145,57 @@ async function onGenerate() {
       </div>
       <Alert v-if="marketRunsQuery.isError.value" variant="warning">运行记录加载失败</Alert>
       <div v-else class="overflow-x-auto border-y border-border">
-        <table class="min-w-[1120px] w-full text-sm">
+        <table class="min-w-[1720px] w-full text-sm">
           <thead class="text-left text-xs text-muted-foreground">
             <tr>
-              <th class="py-2 pr-3">开始时间</th>
+              <th class="py-2 pr-3">运行时间</th>
               <th class="py-2 pr-3">工作流</th>
+              <th class="py-2 pr-3">周期</th>
+              <th class="py-2 pr-3">标的</th>
               <th class="py-2 pr-3">状态</th>
               <th class="py-2 pr-3">总耗时</th>
               <th class="py-2 pr-3">Provider</th>
               <th class="py-2 pr-3">数据行</th>
               <th class="py-2 pr-3">产物</th>
               <th class="py-2 pr-3">重试</th>
+              <th class="py-2 pr-3">数据集</th>
               <th class="py-2">告警 / 错误</th>
             </tr>
           </thead>
           <tbody>
             <tr v-if="marketRuns().length === 0" class="border-t border-border">
-              <td colspan="9" class="py-3 text-muted-foreground">暂无工作流运行记录</td>
+              <td colspan="12" class="py-3 text-muted-foreground">暂无工作流运行记录</td>
             </tr>
             <tr
               v-for="run in marketRuns()"
               :key="run.run_id"
               class="border-t border-border align-top"
             >
-              <td class="py-2 pr-3 whitespace-nowrap"><FormatValues kind="time" :value="run.started_at" /></td>
+              <td class="py-2 pr-3 whitespace-nowrap">
+                <div>开始 <FormatValues kind="time" :value="run.started_at" /></div>
+                <div class="text-xs text-muted-foreground">结束 <FormatValues kind="time" :value="run.finished_at" /></div>
+              </td>
               <td class="py-2 pr-3">
                 <div>{{ workflowLabels[run.workflow_type] ?? run.workflow_type }}</div>
-                <div class="max-w-44 truncate text-xs text-muted-foreground" :title="run.run_id">{{ run.run_id }}</div>
+                <div class="text-xs text-muted-foreground">交易日 {{ run.trade_date }}</div>
+                <div class="max-w-56 truncate text-xs text-muted-foreground" :title="run.run_id">{{ run.run_id }}</div>
+                <div class="max-w-64 truncate text-xs text-muted-foreground" :title="run.idempotency_key">{{ run.idempotency_key }}</div>
               </td>
+              <td class="py-2 pr-3 whitespace-nowrap text-xs">
+                <div><FormatValues kind="time" :value="run.period_start" /></div>
+                <div class="text-muted-foreground"><FormatValues kind="time" :value="run.period_end" /></div>
+              </td>
+              <td class="py-2 pr-3 whitespace-nowrap">请求 {{ run.requested_symbols }} / 完成 {{ run.processed_symbols }}</td>
               <td class="py-2 pr-3">{{ run.status }}</td>
               <td class="py-2 pr-3 whitespace-nowrap">{{ formatDuration(run.duration_ms) }}</td>
               <td class="py-2 pr-3 whitespace-nowrap">{{ run.provider_calls }} 次 / {{ formatDuration(run.provider_duration_ms) }}</td>
               <td class="py-2 pr-3 whitespace-nowrap">收 {{ run.rows_received }} / 写 {{ run.rows_written }} / 清 {{ run.cleaned_rows }}</td>
               <td class="py-2 pr-3 whitespace-nowrap">计划 {{ run.plan_count }} / 建议 {{ run.recommendation_count }} / 通知 {{ run.notification_count }} / 邮件 {{ run.email_outbox_count }}</td>
               <td class="py-2 pr-3">{{ run.retry_count }}</td>
+              <td class="py-2 pr-3 text-xs whitespace-nowrap">
+                <div v-for="line in formatDatasetCounts(run)" :key="line">{{ line }}</div>
+                <span v-if="formatDatasetCounts(run).length === 0" class="text-muted-foreground">-</span>
+              </td>
               <td class="max-w-64 py-2 break-words">
                 <span v-if="run.error_summary">{{ run.error_summary }}</span>
                 <span v-else-if="run.warning_count || run.failure_count">warning {{ run.warning_count }} / failed {{ run.failure_count }}</span>

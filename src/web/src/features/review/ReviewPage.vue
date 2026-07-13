@@ -1,22 +1,35 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { useRoute } from 'vue-router'
 import Alert from '@/components/ui/Alert.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
 import RecommendationStatusBadge from '@/components/domain/RecommendationStatusBadge.vue'
 import { useRecommendationsQuery } from '@/queries/recommendations'
 import { useNotificationsQuery } from '@/queries/notifications'
-import { useLatestPlanQuery } from '@/queries/plans'
+import { useLatestPlanQuery, usePlanQuery } from '@/queries/plans'
 import AuditLogPanel from './AuditLogPanel.vue'
 import FeedbackPanel from './FeedbackPanel.vue'
 import type { Recommendation } from '@/api/types'
 
+const route = useRoute()
 const recommendationsQuery = useRecommendationsQuery()
 const notificationsQuery = useNotificationsQuery()
 const planQuery = useLatestPlanQuery()
+const requestedPlanId = computed(() => {
+  const value = Array.isArray(route.query.plan_id) ? route.query.plan_id[0] : route.query.plan_id
+  return typeof value === 'string' && value ? value : null
+})
+const requestedPlanQuery = usePlanQuery(requestedPlanId)
 
 const recommendations = computed(() => recommendationsQuery.data.value ?? [])
 const notifications = computed(() => notificationsQuery.data.value ?? [])
-const plan = computed(() => planQuery.data.value)
+const plan = computed(() => requestedPlanId.value
+  ? requestedPlanQuery.data.value
+  : planQuery.data.value)
+const planSymbols = computed(() => Array.from(new Set([
+  ...(plan.value?.holding_symbols ?? []),
+  ...(plan.value?.watch_symbols ?? []),
+])))
 const notificationsError = computed(() => notificationsQuery.error.value != null)
 
 function keyPriceText(r: Recommendation): string {
@@ -84,7 +97,11 @@ function invalidIfText(r: Recommendation): string {
               class="border-t border-border align-top break-words"
             >
               <td class="py-1.5">
-                <div>{{ r.symbol }}</div>
+                <RouterLink
+                  class="text-primary underline"
+                  :to="{ path: '/market', query: { symbol: r.symbol } }"
+                  :aria-label="`返回 ${r.symbol} 行情（建议 ${r.recommendation_id}）`"
+                >{{ r.symbol }}</RouterLink>
                 <div class="text-muted-foreground">{{ r.name }}</div>
               </td>
               <td class="py-1.5"><RecommendationStatusBadge kind="action" :value="r.action" /></td>
@@ -131,7 +148,13 @@ function invalidIfText(r: Recommendation): string {
               :key="n.notification_id"
               class="border-t border-border align-top break-words"
             >
-              <td class="py-1.5">{{ n.symbol }}</td>
+              <td class="py-1.5">
+                <RouterLink
+                  class="text-primary underline"
+                  :to="{ path: '/market', query: { symbol: n.symbol } }"
+                  :aria-label="`返回 ${n.symbol} 行情（通知 ${n.notification_id}）`"
+                >{{ n.symbol }}</RouterLink>
+              </td>
               <td class="py-1.5">{{ n.action }}</td>
               <td class="py-1.5"><RecommendationStatusBadge kind="status" :value="n.status" /></td>
               <td class="py-1.5 break-words whitespace-normal">{{ n.reason.join(' / ') }}</td>
@@ -145,16 +168,34 @@ function invalidIfText(r: Recommendation): string {
       </p>
     </section>
 
-    <section class="space-y-2">
+    <section
+      class="space-y-2"
+      :class="requestedPlanId && plan?.plan_id === requestedPlanId ? 'border-l-2 border-primary pl-3' : ''"
+      :data-plan-id="plan?.plan_id"
+    >
       <h2 class="text-sm font-medium">输入快照引用</h2>
       <div class="space-y-1 text-sm">
         <template v-if="plan">
+          <p v-if="requestedPlanId === plan.plan_id" class="font-medium text-primary" role="status">
+            已定位计划 {{ plan.plan_id }}
+          </p>
           <p>计划ID：{{ plan.plan_id }}</p>
           <p>Universe 快照ID：{{ plan.universe_snapshot_id }}</p>
           <p>账户快照ID：{{ plan.account_snapshot_id ?? '-' }}</p>
           <p>台账最近更新：<FormatValues kind="time" :value="plan.ledger_max_updated_at" /></p>
+          <div v-if="planSymbols.length" class="flex flex-wrap gap-2">
+            <RouterLink
+              v-for="symbol in planSymbols"
+              :key="symbol"
+              class="text-primary underline"
+              :to="{ path: '/market', query: { symbol } }"
+              :aria-label="`返回 ${symbol} 行情（计划 ${plan.plan_id}）`"
+            >{{ symbol }} 行情</RouterLink>
+          </div>
         </template>
-        <p v-else-if="planQuery.error.value" class="text-muted-foreground">计划数据不可用</p>
+        <p v-else-if="requestedPlanId && requestedPlanQuery.error.value" class="text-muted-foreground">指定计划数据不可用</p>
+        <p v-else-if="!requestedPlanId && planQuery.error.value" class="text-muted-foreground">计划数据不可用</p>
+        <p v-else-if="requestedPlanId" class="text-muted-foreground">正在定位指定计划</p>
         <p v-else class="text-muted-foreground">暂无计划快照引用</p>
       </div>
     </section>

@@ -15,6 +15,8 @@ from quantitative_trading.api.dependencies import (
     verify_authorization_header,
 )
 from quantitative_trading.api.errors import ApiError
+from quantitative_trading.audit.repository import AuditLogRepository
+from quantitative_trading.audit.service import AuditService
 from quantitative_trading.runtime.account_snapshot_job import create_and_save_account_snapshot
 from quantitative_trading.sanitization import safe_error_summary as _safe_error_summary
 from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
@@ -94,6 +96,16 @@ def run_once(container: ApiContainer = Depends(get_container)) -> dict[str, obje
                 recommendation_ids=[],
                 now=finished_at,
             )
+            AuditService(AuditLogRepository(connection)).record_event(
+                event_type="service.run_once",
+                recommendation_id=None,
+                payload={
+                    "status": status_value,
+                    "snapshot_id": snapshot_id,
+                    "error": error,
+                },
+                now=finished_at,
+            )
     except (sqlite3.Error, ValidationError) as exc:
         raise _service_state_failed() from exc
     return _status_payload(container)
@@ -129,6 +141,8 @@ def _status_payload(container: ApiContainer) -> dict[str, object]:
         "last_task_type": scheduler_state.last_task_type,
         "last_plan_id": scheduler_state.last_plan_id,
         "last_recommendation_ids": scheduler_state.last_recommendation_ids,
+        "overrun_count": scheduler_state.overrun_count,
+        "skipped_count": scheduler_state.skipped_count,
     }
 
 
@@ -150,6 +164,16 @@ def _set_scheduler_enabled(container: ApiContainer, *, enabled: bool) -> None:
                 enabled,
                 interval_seconds=container.settings.intraday_interval_seconds,
                 run_on_start=container.settings.service_run_on_start_when_scheduler_enabled,
+                now=now,
+            )
+            AuditService(AuditLogRepository(connection)).record_event(
+                event_type=(
+                    "service.scheduler.started"
+                    if enabled
+                    else "service.scheduler.stopped"
+                ),
+                recommendation_id=None,
+                payload={"enabled": enabled},
                 now=now,
             )
     except (sqlite3.Error, ValidationError) as exc:

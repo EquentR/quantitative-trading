@@ -1,10 +1,68 @@
 import sqlite3
 import stat
+import json
 
 import pytest
 
 from quantitative_trading.config import Settings
 from quantitative_trading.storage.sqlite import connect, migrate
+
+
+def test_migration_repairs_legacy_duplicate_active_plans_before_unique_index(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "legacy-active-plans.db")
+    with connect(settings) as connection:
+        connection.execute(
+            """
+            CREATE TABLE trading_plans (
+              plan_id TEXT PRIMARY KEY NOT NULL,
+              trading_day TEXT NOT NULL,
+              generated_at TEXT NOT NULL,
+              valid_until TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (
+                status IN ('draft', 'active', 'superseded', 'expired', 'stale')
+              ),
+              payload_json TEXT NOT NULL
+            )
+            """
+        )
+        for plan_id, generated_at in (
+            ("plan-v1", "2026-07-12T07:00:00+00:00"),
+            ("plan-v2", "2026-07-12T08:00:00+00:00"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO trading_plans (
+                  plan_id, trading_day, generated_at, valid_until, status, payload_json
+                ) VALUES (?, '2026-07-13', ?, '2026-07-13T15:00:00+08:00', 'active', ?)
+                """,
+                (plan_id, generated_at, json.dumps({"status": "active"})),
+            )
+        connection.commit()
+
+        migrate(connection)
+
+        rows = connection.execute(
+            """
+            SELECT plan_id, status, payload_json
+            FROM trading_plans
+            ORDER BY plan_id
+            """
+        ).fetchall()
+        index = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'index' AND name = 'idx_trading_plans_one_active_day'
+            """
+        ).fetchone()
+
+    assert [(row["plan_id"], row["status"]) for row in rows] == [
+        ("plan-v1", "superseded"),
+        ("plan-v2", "active"),
+    ]
+    assert json.loads(rows[0]["payload_json"])["status"] == "superseded"
+    assert index is not None
 
 
 def test_connect_restricts_database_and_parent_permissions(tmp_path) -> None:
@@ -374,6 +432,8 @@ def insert_trading_plan(
                 "last_task_type",
                 "last_plan_id",
                 "last_recommendation_ids",
+                "overrun_count",
+                "skipped_count",
                 "updated_at",
             ],
         ),

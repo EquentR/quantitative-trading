@@ -13,6 +13,7 @@ from quantitative_trading.email.repository import SmtpSettingsRepository
 from quantitative_trading.email.service import SmtpSettingsService
 from quantitative_trading.notification.dispatcher import NotificationDispatcher
 from quantitative_trading.notification.jsonl import JsonlNotificationWriter
+from quantitative_trading.notification.local_alert import LocalAlertDispatcher
 from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.notification.service import NotificationService
 from quantitative_trading.recommendation.models import Recommendation, RecommendationAction
@@ -82,13 +83,25 @@ def configure_smtp(connection) -> None:  # noqa: ANN001
 
 def build_dispatcher(connection, settings, *, writer=None, outbox=None):  # noqa: ANN001
     audit_repository = AuditLogRepository(connection)
+    notification_service = NotificationService(NotificationRepository(connection))
+    audit_service = AuditService(
+        audit_repository,
+        configured_secret_texts=("synthetic-dispatch-password",),
+    )
+    jsonl_writer = writer or JsonlNotificationWriter(
+        settings,
+        configured_secret_texts=("synthetic-dispatch-password",),
+    )
+    local_alert_dispatcher = LocalAlertDispatcher(
+        notification_service=notification_service,
+        audit_service=audit_service,
+        jsonl_writer=jsonl_writer,
+        configured_secret_texts=("synthetic-dispatch-password",),
+    )
     return NotificationDispatcher(
-        notification_service=NotificationService(NotificationRepository(connection)),
-        audit_service=AuditService(
-            audit_repository,
-            configured_secret_texts=("synthetic-dispatch-password",),
-        ),
-        jsonl_writer=writer or JsonlNotificationWriter(settings),
+        notification_service=notification_service,
+        audit_service=audit_service,
+        jsonl_writer=jsonl_writer,
         email_service=outbox
         or EmailDeliveryService(
             EmailDeliveryRepository(connection),
@@ -97,6 +110,7 @@ def build_dispatcher(connection, settings, *, writer=None, outbox=None):  # noqa
             audit_repository=audit_repository,
         ),
         smtp_settings_service=SmtpSettingsService(SmtpSettingsRepository(connection)),
+        local_alert_dispatcher=local_alert_dispatcher,
     )
 
 
@@ -287,8 +301,59 @@ def test_daily_summary_aggregates_hold_watch_avoid_once_per_plan_version(tmp_pat
         assert connection.execute("SELECT COUNT(*) FROM email_deliveries").fetchone()[0] == 2
 
 
-def test_critical_system_alert_is_immediate_deduplicated_and_sanitized(tmp_path) -> None:
+def test_critical_system_alert_reaches_every_local_channel_without_smtp(
+    tmp_path,
+    caplog,
+) -> None:
     settings = Settings(database_path=tmp_path / "alert.db", log_dir=tmp_path / "logs")
+    with connect(settings) as connection:
+        migrate(connection)
+        dispatcher = build_dispatcher(connection, settings)
+
+        with caplog.at_level("ERROR"):
+            first = dispatcher.dispatch_system_alert(
+                alert_key="database-integrity-20260713",
+                event_type="workflow.database_failed",
+                message=(
+                    "database failed password=synthetic-dispatch-password "
+                    "token=synthetic-token /tmp/private.db"
+                ),
+                details={"password": "synthetic-dispatch-password"},
+                now=NOW,
+            )
+            duplicate = dispatcher.dispatch_system_alert(
+                alert_key="database-integrity-20260713",
+                event_type="workflow.database_failed",
+                message="same alert retry",
+                now=NOW,
+            )
+
+        assert first is None
+        assert duplicate is None
+        notifications = NotificationRepository(connection).list_recent(limit=20)
+        assert len(notifications) == 1
+        alert = notifications[0]
+        assert alert.action == "system_alert"
+        assert alert.symbol == "000000"
+        assert alert.reason == ["database failed [redacted] [redacted] [path]"]
+        assert alert.status.value == "unread"
+        records = (settings.log_dir / "notifications.jsonl").read_text().splitlines()
+        assert len(records) == 1
+        record = json.loads(records[0])
+        assert record["summary"]["notification_id"] == alert.notification_id
+        assert record["system_alert"]["event_type"] == "workflow.database_failed"
+        assert connection.execute("SELECT COUNT(*) FROM email_deliveries").fetchone()[0] == 0
+        local_outputs = "\n".join(records + [caplog.text]).lower()
+        assert "workflow.database_failed" in caplog.text
+        assert "synthetic-dispatch-password" not in local_outputs
+        assert "synthetic-token" not in local_outputs
+        assert "/tmp/private.db" not in local_outputs
+        audits = AuditLogRepository(connection).list_recent(limit=20)
+        assert sum(item.event_type == "workflow.database_failed" for item in audits) == 1
+
+
+def test_critical_system_alert_email_is_immediate_and_deduplicated(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "alert-email.db", log_dir=tmp_path / "logs")
     with connect(settings) as connection:
         migrate(connection)
         configure_smtp(connection)
@@ -297,10 +362,8 @@ def test_critical_system_alert_is_immediate_deduplicated_and_sanitized(tmp_path)
         first = dispatcher.dispatch_system_alert(
             alert_key="database-integrity-20260713",
             event_type="workflow.database_failed",
-            message=(
-                "database failed password=synthetic-dispatch-password "
-                "token=synthetic-token /tmp/private.db"
-            ),
+            message="database failed synthetic-dispatch-password",
+            details={"safe_detail": "synthetic-dispatch-password"},
             now=NOW,
         )
         duplicate = dispatcher.dispatch_system_alert(
@@ -311,12 +374,13 @@ def test_critical_system_alert_is_immediate_deduplicated_and_sanitized(tmp_path)
         )
 
         assert duplicate == first
-        assert first.notification_id is None
+        assert first.notification_id is not None
         persisted = first.model_dump_json().lower()
         assert "synthetic-dispatch-password" not in persisted
-        assert "synthetic-token" not in persisted
-        assert "/tmp/private.db" not in persisted
         assert connection.execute("SELECT COUNT(*) FROM email_deliveries").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 1
+        jsonl_text = (settings.log_dir / "notifications.jsonl").read_text()
+        assert "synthetic-dispatch-password" not in jsonl_text
         audits = AuditLogRepository(connection).list_recent(limit=20)
         assert any(item.event_type == "workflow.database_failed" for item in audits)
 

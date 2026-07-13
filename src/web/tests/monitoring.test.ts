@@ -83,6 +83,21 @@ test('展示每轮工作流成本和产物计数', async () => {
   expect(row).toHaveTextContent('收 62 / 写 64 / 清 0')
   expect(row).toHaveTextContent('计划 0 / 建议 2 / 通知 2 / 邮件 1')
   expect(row).toHaveTextContent('warning 1 / failed 0')
+  expect(row).toHaveTextContent('交易日 2026-07-13')
+  expect(row).toHaveTextContent('intraday:2026-07-13:1021')
+  expect(row).toHaveTextContent('请求 2 / 完成 2')
+  expect(row).toHaveTextContent('quote 完成 2')
+  expect(row).toHaveTextContent('minute_bar 完成 1 / 降级 1')
+  expect(row).toHaveTextContent('intraday_strength 完成 1 / 陈旧 1')
+  expect(row).toHaveTextContent('结束')
+})
+
+test('展示调度跳过、超限累计和最近原因', async () => {
+  renderMonitoring()
+
+  await waitFor(() => expect(screen.getByText(/最近原因：manual_api/)).toBeInTheDocument())
+  expect(screen.getByText(/并发超限 2 次/)).toBeInTheDocument()
+  expect(screen.getByText(/跳过 3 次/)).toBeInTheDocument()
 })
 
 test('展示最近错误和数据缺口', async () => {

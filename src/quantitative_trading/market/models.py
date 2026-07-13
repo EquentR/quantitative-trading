@@ -444,6 +444,7 @@ class MarketInputSnapshot(BaseModel):
     dataset_quality: dict[str, dict[CaptureDataset, DatasetQuality]] = Field(
         default_factory=dict
     )
+    thresholds: dict[str, float] = Field(default_factory=dict)
     capture_run_id: str | None = Field(default=None, min_length=1)
     data_time: datetime | None = None
     fetched_at: datetime

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
-import { X } from 'lucide-vue-next'
+import { ChartCandlestick, X } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
 import Alert from '@/components/ui/Alert.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
@@ -125,6 +125,15 @@ onUnmounted(() => {
           <X class="size-4" />
         </Button>
       </header>
+
+      <RouterLink
+        class="inline-flex items-center gap-1.5 text-sm text-primary underline"
+        :to="{ path: '/market', query: { symbol: rec.symbol } }"
+        :aria-label="`返回 ${rec.symbol} 行情`"
+      >
+        <ChartCandlestick class="size-4" />
+        返回行情
+      </RouterLink>
 
       <Alert v-if="contractError" variant="danger" data-testid="recommendation-contract-error">
         本条建议缺少必要字段{{ missingInvalidIf ? '：失效条件' : '' }}{{ missingDataTime ? '、数据时间' : '' }}，不可作为完整建议展示。

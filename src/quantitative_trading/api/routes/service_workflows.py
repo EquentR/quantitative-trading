@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, time
+import logging
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Path as ApiPath
@@ -30,6 +31,7 @@ router = APIRouter(
     tags=["service"],
     dependencies=[Depends(require_token)],
 )
+LOGGER = logging.getLogger(__name__)
 
 WorkflowType = Literal["close", "intraday", "backfill", "cleanup"]
 Symbol = Annotated[str, Field(pattern=r"^[0-9]{6}$")]
@@ -217,6 +219,47 @@ def _audit_request(
         },
         now=now,
     )
+
+
+def _audit_failed_request(
+    container: ApiContainer,
+    *,
+    workflow_type: WorkflowType,
+    request: WorkflowRunRequest,
+    exc: ApiError,
+    now: datetime,
+) -> None:
+    event_type = (
+        "service.workflow.run_failed"
+        if exc.status_code >= 500
+        else "service.workflow.run_rejected"
+    )
+    try:
+        with connection_scope(container.settings) as connection:
+            AuditService(AuditLogRepository(connection)).record_event(
+                event_type=event_type,
+                recommendation_id=None,
+                payload={
+                    "workflow_type": workflow_type,
+                    "error_code": exc.code,
+                    "force": request.force,
+                    "skip_calendar": request.skip_calendar,
+                    "manual_reason": request.manual_reason,
+                    "trade_date": (
+                        None
+                        if request.trade_date is None
+                        else request.trade_date.isoformat()
+                    ),
+                    "as_of": None if request.as_of is None else request.as_of.isoformat(),
+                    "symbols": request.symbols,
+                },
+                now=now,
+            )
+    except Exception as audit_exc:
+        LOGGER.warning(
+            "workflow request outcome audit failed: %s",
+            safe_error_summary(audit_exc),
+        )
 
 
 def _run_close(
@@ -452,15 +495,25 @@ def run_workflow(
     container: ApiContainer = Depends(get_container),
 ) -> WorkflowRunResponse:
     payload = request or WorkflowRunRequest()
-    _validate_fields(workflow_type, payload)
     try:
         now = _aware_now()
     except Exception as exc:
         raise _run_failed(exc) from exc
-    if workflow_type == "close":
-        return _run_close(container, payload, now)
-    if workflow_type == "intraday":
-        return _run_intraday(container, payload, now)
-    if workflow_type == "backfill":
-        return _run_backfill(container, payload, now)
-    return _run_cleanup(container, payload, now)
+    try:
+        _validate_fields(workflow_type, payload)
+        if workflow_type == "close":
+            return _run_close(container, payload, now)
+        if workflow_type == "intraday":
+            return _run_intraday(container, payload, now)
+        if workflow_type == "backfill":
+            return _run_backfill(container, payload, now)
+        return _run_cleanup(container, payload, now)
+    except ApiError as exc:
+        _audit_failed_request(
+            container,
+            workflow_type=workflow_type,
+            request=payload,
+            exc=exc,
+            now=now,
+        )
+        raise

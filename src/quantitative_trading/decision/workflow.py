@@ -6,6 +6,8 @@ from datetime import date, datetime, time, timedelta
 from time import perf_counter
 from typing import Any, Callable, Protocol, Sequence
 
+from quantitative_trading.audit.models import AuditLog
+from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.decision.models import DecisionSymbolInput
 from quantitative_trading.decision.service import decide_symbol
 from quantitative_trading.feedback.repository import FeedbackRepository
@@ -58,7 +60,8 @@ from quantitative_trading.planning.repository import TradingPlanRepository
 from quantitative_trading.planning.service import evaluate_plan_conditions
 from quantitative_trading.planning.workflow import build_market_trading_plan
 from quantitative_trading.recommendation.repository import RecommendationRepository
-from quantitative_trading.recommendation.models import RecommendationAction
+from quantitative_trading.recommendation.identity import with_recommendation_identity
+from quantitative_trading.recommendation.models import Recommendation, RecommendationAction
 from quantitative_trading.risk.models import RiskConfig, RiskContext
 from quantitative_trading.runtime.account_snapshot_job import (
     create_and_save_account_snapshot_with_connection,
@@ -112,10 +115,6 @@ class RecommendationDispatcher(Protocol):
         now: datetime,
     ) -> Any: ...
 
-
-class WorkflowAlreadyRunningError(CaptureRunAlreadyActiveError):
-    pass
-
     def dispatch_daily_summary(
         self,
         *,
@@ -124,6 +123,10 @@ class WorkflowAlreadyRunningError(CaptureRunAlreadyActiveError):
         recommendations: list,
         now: datetime,
     ) -> Any: ...
+
+
+class WorkflowAlreadyRunningError(CaptureRunAlreadyActiveError):
+    pass
 
 
 class DecisionWorkflow:
@@ -137,6 +140,7 @@ class DecisionWorkflow:
         money_flow_provider: MoneyFlowProvider,
         intraday_provider: IntradayProvider,
         now: Callable[[], datetime],
+        stale_trading_minutes: int = 6,
         notification_dispatcher: RecommendationDispatcher | None = None,
     ) -> None:
         self.connection = connection
@@ -146,6 +150,9 @@ class DecisionWorkflow:
         self.money_flow_provider = money_flow_provider
         self.intraday_provider = intraday_provider
         self.now = now
+        if stale_trading_minutes < 1:
+            raise ValueError("stale trading minute threshold must be positive")
+        self.stale_trading_minutes = stale_trading_minutes
         self.notification_dispatcher = notification_dispatcher
 
     def run_backfill(
@@ -546,7 +553,16 @@ class DecisionWorkflow:
             intraday_strength_snapshot_refs={},
             dataset_quality=dataset_quality,
             capture_run_id=run_id,
-            data_time=min(data_times) if data_times else None,
+            thresholds={
+                "stale_trading_minutes": float(self.stale_trading_minutes),
+            },
+            data_time=(
+                self.calendar.session(trade_date).close_at
+                if symbols and hard_ready
+                else min(data_times)
+                if data_times
+                else None
+            ),
             fetched_at=started_at,
             warnings=warnings,
         )
@@ -604,8 +620,7 @@ class DecisionWorkflow:
             quotes,
             daily_repository,
             flow_repository,
-            history_refs,
-            flow_refs,
+            dataset_quality,
         )
         plan_symbols = [
             item.model_copy(
@@ -910,6 +925,14 @@ class DecisionWorkflow:
                     previous_daily_bar=previous_daily,
                     fetched_at=started_at,
                 )
+                strength = strength.model_copy(
+                    update={
+                        "thresholds": {
+                            **strength.thresholds,
+                            "stale_minutes": float(self.stale_trading_minutes),
+                        }
+                    }
+                )
                 minute_stale = bool(
                     minute_bars
                     and _trading_minute_lag(
@@ -917,10 +940,13 @@ class DecisionWorkflow:
                         max(bar.minute for bar in minute_bars),
                         started_at,
                     )
-                    > 6
+                    > self.stale_trading_minutes
                 )
                 if minute_stale:
-                    stale_warning = "分时数据落后超过 6 个有效交易分钟"
+                    stale_warning = (
+                        "分时数据落后超过 "
+                        f"{self.stale_trading_minutes} 个有效交易分钟"
+                    )
                     warnings.append(f"{symbol} {stale_warning}")
                     strength = strength.model_copy(
                         update={
@@ -928,10 +954,6 @@ class DecisionWorkflow:
                             "degradation_reasons": _stable_unique(
                                 [*strength.degradation_reasons, stale_warning]
                             ),
-                            "thresholds": {
-                                **strength.thresholds,
-                                "stale_minutes": 6.0,
-                            },
                         }
                     )
                 strength_id = strength_repository.save(strength)
@@ -965,6 +987,18 @@ class DecisionWorkflow:
                         fetched_at=started_at,
                         expected_rows=1,
                         source="intraday_provider",
+                        error_summary=warning,
+                    )
+                )
+                result_repository.upsert(
+                    MarketCaptureResult(
+                        run_id=run_id,
+                        symbol=symbol,
+                        dataset=CaptureDataset.INTRADAY_STRENGTH,
+                        status=CaptureResultStatus.FAILED,
+                        fetched_at=started_at,
+                        expected_rows=1,
+                        source="intraday_strength_v1",
                         error_summary=warning,
                     )
                 )
@@ -1042,6 +1076,9 @@ class DecisionWorkflow:
             intraday_strength_snapshot_refs=strength_refs,
             dataset_quality=dataset_quality,
             capture_run_id=run_id,
+            thresholds={
+                "stale_trading_minutes": float(self.stale_trading_minutes),
+            },
             data_time=min(data_times) if data_times else None,
             fetched_at=started_at,
             warnings=warnings,
@@ -1150,6 +1187,12 @@ class DecisionWorkflow:
                 market_input,
                 plan_id=None if plan is None else plan.plan_id,
                 account_snapshot_id=account_created.snapshot_id,
+                account_status=(
+                    "complete"
+                    if account_snapshot.status.value == "ok"
+                    else account_snapshot.status.value
+                ),
+                account_warnings=account_snapshot.warnings,
                 ledger_updated_at=None if position is None else position.updated_at,
             )
             invalid_if = (
@@ -1207,7 +1250,7 @@ class DecisionWorkflow:
                 },
                 data_references=data_references,
                 invalid_if=invalid_if,
-                warnings=warnings,
+                warnings=_stable_unique([*warnings, *account_snapshot.warnings]),
                 data_time=quote.data_time or started_at,
                 valid_until=(
                     plan.valid_until
@@ -1242,6 +1285,33 @@ class DecisionWorkflow:
                 recommendation_id=f"rec-{run_id}-{symbol}",
                 created_at=started_at,
             )
+            recommendation = recommendation.model_copy(
+                update={
+                    "condition_context": {
+                        "plan_conditions": (
+                            []
+                            if plan_context is None
+                            else [
+                                condition.model_dump(mode="json")
+                                for condition in plan_context.conditions
+                            ]
+                        ),
+                        "evaluation": (
+                            []
+                            if condition_evaluation is None
+                            else [
+                                asdict(item) for item in condition_evaluation.items
+                            ]
+                        ),
+                    }
+                }
+            )
+            recommendation = with_recommendation_identity(
+                recommendation,
+                trade_date=trade_date,
+                period_start=run.period_start or started_at,
+                plan_version=None if plan is None else plan.version,
+            )
             recommendations.append(recommendation)
             if recommendation.action in {
                 RecommendationAction.BUY,
@@ -1263,10 +1333,9 @@ class DecisionWorkflow:
             }:
                 reserved_trade_count += 1
 
-        RecommendationRepository(self.connection).save_many(
+        recommendations = self._persist_recommendations_with_audits(
             recommendations,
             created_at=started_at,
-            commit=True,
         )
         notification_count = 0
         email_outbox_count = 0
@@ -1374,9 +1443,12 @@ class DecisionWorkflow:
                     quote.data_time,
                     fetched_at,
                 )
-                > 6
+                > self.stale_trading_minutes
             ):
-                stale_warning = "quote data lags by more than 6 trading minutes"
+                stale_warning = (
+                    "quote data lags by more than "
+                    f"{self.stale_trading_minutes} trading minutes"
+                )
                 quote = quote.model_copy(
                     update={
                         "status": QuoteStatus.STALE,
@@ -1432,8 +1504,7 @@ class DecisionWorkflow:
         quotes: dict[str, QuoteSnapshot],
         daily_repository: DailyBarRepository,
         flow_repository: MoneyFlowRepository,
-        history_refs: dict[str, int],
-        flow_refs: dict[str, int],
+        dataset_quality: dict[str, dict[CaptureDataset, DatasetQuality]],
     ) -> list[MarketPlanSymbolInput]:
         results: list[MarketPlanSymbolInput] = []
         for member in members:
@@ -1448,6 +1519,10 @@ class DecisionWorkflow:
                 name: getattr(features, name).value
                 for name in features.__dataclass_fields__
             }
+            feature_facts = {
+                name: asdict(getattr(features, name))
+                for name in features.__dataclass_fields__
+            }
             current_flows = flow_repository.current(member.symbol, limit=60)
             money_flow = (
                 {"status": "failed"}
@@ -1460,10 +1535,26 @@ class DecisionWorkflow:
                     ),
                 }
             )
+            symbol_quality = dataset_quality.get(member.symbol, {})
+            relevant_quality = [
+                symbol_quality.get(CaptureDataset.DAILY_BAR),
+                symbol_quality.get(CaptureDataset.MONEY_FLOW),
+            ]
             quality = (
                 "complete"
-                if member.symbol in history_refs and member.symbol in flow_refs
+                if all(
+                    item is not None
+                    and item.status is CaptureResultStatus.COMPLETE
+                    for item in relevant_quality
+                )
                 else "degraded"
+            )
+            quality_warnings = _stable_unique(
+                [
+                    item.warning
+                    for item in relevant_quality
+                    if item is not None and item.warning
+                ]
             )
             results.append(
                 MarketPlanSymbolInput(
@@ -1475,13 +1566,63 @@ class DecisionWorkflow:
                     ),
                     current_price=quote.current_price,
                     daily_features=feature_values,
+                    daily_feature_facts=feature_facts,
                     market_structure=asdict(structure),
                     money_flow=money_flow,
                     data_quality=quality,
-                    warnings=[],
+                    warnings=quality_warnings,
                 )
             )
         return results
+
+    def _persist_recommendations_with_audits(
+        self,
+        recommendations: list[Recommendation],
+        *,
+        created_at: datetime,
+    ) -> list[Recommendation]:
+        savepoint = "persist_recommendations_with_audits"
+        self.connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            audited = []
+            audit_repository = AuditLogRepository(self.connection)
+            for recommendation in recommendations:
+                audit_id = f"audit-{recommendation.recommendation_id}"
+                audited_recommendation = recommendation.model_copy(
+                    update={"audit_id": audit_id}
+                )
+                audit_repository.save(
+                    AuditLog(
+                        audit_id=audit_id,
+                        event_type="recommendation.generated",
+                        recommendation_id=recommendation.recommendation_id,
+                        payload={
+                            "symbol": recommendation.symbol,
+                            "action": recommendation.action.value,
+                            "run_id": recommendation.run_id,
+                            "plan_id": recommendation.plan_id,
+                            "plan_version": recommendation.plan_version,
+                            "condition_fingerprint": (
+                                recommendation.condition_fingerprint
+                            ),
+                        },
+                        created_at=created_at,
+                    ),
+                    commit=False,
+                )
+                audited.append(audited_recommendation)
+            saved = RecommendationRepository(self.connection).save_many(
+                audited,
+                created_at=created_at,
+                commit=False,
+            )
+            self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except BaseException:
+            self.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        self.connection.commit()
+        return saved
 
     def _decision_references(
         self,
@@ -1490,6 +1631,8 @@ class DecisionWorkflow:
         *,
         plan_id: str | None,
         account_snapshot_id: int,
+        account_status: str,
+        account_warnings: list[str],
         ledger_updated_at: datetime | None,
     ) -> dict[str, dict[str, Any]]:
         def reference(
@@ -1509,7 +1652,11 @@ class DecisionWorkflow:
                 else ledger_updated_at.isoformat(),
                 "status": "missing" if ledger_updated_at is None else "complete",
             },
-            "account": {"snapshot_id": account_snapshot_id, "status": "complete"},
+            "account": {
+                "snapshot_id": account_snapshot_id,
+                "status": account_status,
+                "warnings": account_warnings,
+            },
             "quote": reference(snapshot.quote_snapshot_refs, CaptureDataset.QUOTE),
             "history": reference(
                 snapshot.history_snapshot_refs, CaptureDataset.DAILY_BAR

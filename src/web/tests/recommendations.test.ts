@@ -17,11 +17,23 @@ beforeEach(() => {
   localStorage.clear()
 })
 
-function renderPage() {
+async function renderPage(path = '/recommendations') {
   const pinia = createPinia()
   setActivePinia(pinia)
   useSessionStore().setToken('test-token')
-  return render(RecommendationListPage, { global: { plugins: [pinia, VueQueryPlugin] } })
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      { path: '/recommendations', component: RecommendationListPage },
+      { path: '/market', component: { template: '<div>行情目标</div>' } },
+    ],
+  })
+  await router.push(path)
+  await router.isReady()
+  return {
+    ...render(RecommendationListPage, { global: { plugins: [pinia, VueQueryPlugin, router] } }),
+    router,
+  }
 }
 
 async function renderShellAt(path: string) {
@@ -46,7 +58,7 @@ test('路由页面渲染建议列表表头与模拟建议行', async () => {
 })
 
 test('动作/置信度/处理状态徽章渲染期望中文标签', async () => {
-  renderPage()
+  await renderPage()
 
   await waitFor(() => expect(screen.getByText('持有')).toBeInTheDocument())
   expect(screen.getByText('中')).toBeInTheDocument()
@@ -59,7 +71,7 @@ test('动作/置信度/处理状态徽章渲染期望中文标签', async () => 
 
 test('点击行按钮打开详情抽屉并展示必要区块与数据时间', async () => {
   const user = userEvent.setup()
-  renderPage()
+  await renderPage()
   await screen.findByText('600000')
 
   await user.click(screen.getByRole('button', { name: /查看详情/ }))
@@ -76,32 +88,54 @@ test('点击行按钮打开详情抽屉并展示必要区块与数据时间', as
   expect(drawer.getAttribute('data-data-time')).toBeTruthy()
 })
 
-test('扫描按钮触发 POST /api/v1/recommendations/scan 并刷新列表', async () => {
+test('recommendation_id query 自动定位详情并可返回对应行情', async () => {
   const user = userEvent.setup()
-  let scanCalled = false
+  const { router } = await renderPage('/recommendations?recommendation_id=rec-001')
+
+  const drawer = await screen.findByRole('dialog', { name: '建议详情' })
+  await user.click(within(drawer).getByRole('link', { name: '返回 600000 行情' }))
+  expect(router.currentRoute.value.path).toBe('/market')
+  expect(router.currentRoute.value.query.symbol).toBe('600000')
+})
+
+test('扫描按钮触发认证盘中工作流并按 recommendation_ids 刷新列表', async () => {
+  const user = userEvent.setup()
+  let workflowCalled = false
+  let deprecatedScanCalled = false
   server.use(
+    http.post('/api/v1/service/workflows/intraday/run', ({ request }) => {
+      expect(request.headers.get('authorization')).toBe('Bearer test-token')
+      workflowCalled = true
+      return HttpResponse.json({
+        task: 'intraday', status: 'success', run_id: 'intraday-test', snapshot_id: 1,
+        plan_id: null, recommendation_ids: ['rec-001'], warnings: [], reused: false,
+        ready: null, cleaned_rows: null,
+      })
+    }),
     http.post('/api/v1/recommendations/scan', () => {
-      scanCalled = true
-      return HttpResponse.json({ count: mockRecommendations.length, recommendations: mockRecommendations })
+      deprecatedScanCalled = true
+      return HttpResponse.json({ error: { code: 'gone', message: 'gone' } }, { status: 410 })
     }),
   )
-  renderPage()
+  await renderPage()
   await screen.findByText('600000')
 
   await user.click(screen.getByRole('button', { name: '扫描建议' }))
 
-  await waitFor(() => expect(scanCalled).toBe(true))
+  await waitFor(() => expect(workflowCalled).toBe(true))
+  expect(deprecatedScanCalled).toBe(false)
+  expect(screen.getByRole('status')).toHaveTextContent('盘中工作流已生成 1 条建议')
   await waitFor(() => expect(screen.getByText('600000')).toBeInTheDocument())
 })
 
 test('扫描失败时显示告警且页面仍可用', async () => {
   const user = userEvent.setup()
   server.use(
-    http.post('/api/v1/recommendations/scan', () =>
+    http.post('/api/v1/service/workflows/intraday/run', () =>
       HttpResponse.json({ error: { message: 'scan failed' } }, { status: 500 }),
     ),
   )
-  renderPage()
+  await renderPage()
   await screen.findByText('600000')
 
   await user.click(screen.getByRole('button', { name: '扫描建议' }))
@@ -116,7 +150,7 @@ test('扫描失败时显示告警且页面仍可用', async () => {
 
 test('处理状态筛选可按未读/已读过滤列表', async () => {
   const user = userEvent.setup()
-  renderPage()
+  await renderPage()
   await screen.findByText('600000')
 
   // Wait for notifications to load so the filter becomes available.
@@ -134,7 +168,7 @@ test('通知数据不可用时不展示处理状态筛选但页面仍可用', as
       HttpResponse.json({ error: { message: 'not mounted' } }, { status: 404 }),
     ),
   )
-  renderPage()
+  await renderPage()
   await screen.findByText('600000')
 
   expect(screen.queryByLabelText('处理状态筛选')).not.toBeInTheDocument()
@@ -153,7 +187,7 @@ test('缺失失效条件的建议详情用告警替代完整展示', async () =>
     http.get('/api/v1/recommendations', () => HttpResponse.json([brokenRec])),
     http.get('/api/v1/notifications', () => HttpResponse.json([])),
   )
-  renderPage()
+  await renderPage()
   await screen.findByRole('button', { name: /查看详情/ })
 
   await user.click(screen.getByRole('button', { name: /查看详情/ }))
@@ -167,7 +201,7 @@ test('缺失失效条件的建议详情用告警替代完整展示', async () =>
 
 test('详情抽屉可按 role dialog 与名称建议详情定位', async () => {
   const user = userEvent.setup()
-  renderPage()
+  await renderPage()
   await screen.findByText('600000')
 
   await user.click(screen.getByRole('button', { name: /查看详情/ }))
@@ -179,7 +213,7 @@ test('详情抽屉可按 role dialog 与名称建议详情定位', async () => {
 
 test('按 Escape 关闭详情抽屉', async () => {
   const user = userEvent.setup()
-  renderPage()
+  await renderPage()
   await screen.findByText('600000')
 
   await user.click(screen.getByRole('button', { name: /查看详情/ }))
@@ -192,7 +226,7 @@ test('按 Escape 关闭详情抽屉', async () => {
 
 test('打开详情抽屉后焦点移至关闭按钮', async () => {
   const user = userEvent.setup()
-  renderPage()
+  await renderPage()
   await screen.findByText('600000')
 
   await user.click(screen.getByRole('button', { name: /查看详情/ }))
@@ -217,7 +251,7 @@ test('sell 建议缺少 invalid_if 不触发契约错误并展示不适用', asy
     http.get('/api/v1/recommendations', () => HttpResponse.json([sellRec])),
     http.get('/api/v1/notifications', () => HttpResponse.json([])),
   )
-  renderPage()
+  await renderPage()
   await screen.findByRole('button', { name: /查看详情/ })
 
   await user.click(screen.getByRole('button', { name: /查看详情/ }))
@@ -253,7 +287,7 @@ test('空理由列表展示暂无理由占位', async () => {
     http.get('/api/v1/recommendations', () => HttpResponse.json([emptyReasonRec])),
     http.get('/api/v1/notifications', () => HttpResponse.json([])),
   )
-  renderPage()
+  await renderPage()
   await screen.findByRole('button', { name: /查看详情/ })
 
   await user.click(screen.getByRole('button', { name: /查看详情/ }))
@@ -263,7 +297,7 @@ test('空理由列表展示暂无理由占位', async () => {
 })
 
 test('页面不包含真实下单或成交按钮文案', async () => {
-  renderPage()
+  await renderPage()
   await screen.findByText('600000')
 
   const buttons = screen.queryAllByRole('button')

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -148,8 +149,11 @@ CREATE TABLE IF NOT EXISTS trading_plans (
 RECOMMENDATIONS_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS recommendations (
   recommendation_id TEXT PRIMARY KEY NOT NULL,
+  dedup_key TEXT,
   symbol TEXT NOT NULL,
   action TEXT NOT NULL CHECK (action IN ('buy', 'sell', 'add', 'reduce', 'hold', 'watch', 'avoid')),
+  condition_fingerprint TEXT,
+  audit_id TEXT,
   data_time TEXT NOT NULL,
   created_at TEXT NOT NULL,
   payload_json TEXT NOT NULL,
@@ -266,6 +270,8 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
   last_task_type TEXT,
   last_plan_id TEXT,
   last_recommendation_ids TEXT,
+  overrun_count INTEGER NOT NULL DEFAULT 0 CHECK (overrun_count >= 0),
+  skipped_count INTEGER NOT NULL DEFAULT 0 CHECK (skipped_count >= 0),
   updated_at TEXT NOT NULL
 );
 """
@@ -317,12 +323,28 @@ def migrate(connection: sqlite3.Connection) -> None:
     _ensure_trading_plan_status_constraint(connection)
     _ensure_scheduler_state_columns(connection)
     _ensure_notification_columns(connection)
+    _ensure_recommendation_columns(connection)
     _ensure_market_capture_run_columns(connection)
+    _supersede_duplicate_active_plans(connection)
     connection.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedup_key
         ON notifications(dedup_key)
         WHERE dedup_key IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_recommendations_dedup_key
+        ON recommendations(dedup_key)
+        WHERE dedup_key IS NOT NULL
+        """
+    )
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_trading_plans_one_active_day
+        ON trading_plans(trading_day)
+        WHERE status = 'active'
         """
     )
     connection.commit()
@@ -358,6 +380,8 @@ def _ensure_scheduler_state_columns(connection: sqlite3.Connection) -> None:
         "last_task_type": "TEXT",
         "last_plan_id": "TEXT",
         "last_recommendation_ids": "TEXT",
+        "overrun_count": "INTEGER NOT NULL DEFAULT 0 CHECK (overrun_count >= 0)",
+        "skipped_count": "INTEGER NOT NULL DEFAULT 0 CHECK (skipped_count >= 0)",
     }
     for name, column_type in columns.items():
         if name not in existing:
@@ -373,6 +397,48 @@ def _ensure_notification_columns(connection: sqlite3.Connection) -> None:
     }
     if "dedup_key" not in existing:
         connection.execute("ALTER TABLE notifications ADD COLUMN dedup_key TEXT")
+
+
+def _ensure_recommendation_columns(connection: sqlite3.Connection) -> None:
+    existing = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(recommendations)").fetchall()
+    }
+    for name in ("dedup_key", "condition_fingerprint", "audit_id"):
+        if name not in existing:
+            connection.execute(f"ALTER TABLE recommendations ADD COLUMN {name} TEXT")
+
+
+def _supersede_duplicate_active_plans(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT rowid, trading_day, payload_json
+        FROM trading_plans
+        WHERE status = 'active'
+        ORDER BY trading_day, generated_at DESC, rowid DESC
+        """
+    ).fetchall()
+    retained_days: set[str] = set()
+    for row in rows:
+        trading_day = str(row["trading_day"])
+        if trading_day not in retained_days:
+            retained_days.add(trading_day)
+            continue
+        payload = json.loads(row["payload_json"])
+        if not isinstance(payload, dict):
+            raise ValueError("trading plan payload must be a JSON object")
+        payload["status"] = "superseded"
+        connection.execute(
+            """
+            UPDATE trading_plans
+            SET status = 'superseded', payload_json = ?
+            WHERE rowid = ?
+            """,
+            (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                row["rowid"],
+            ),
+        )
 
 
 def _ensure_market_capture_run_columns(connection: sqlite3.Connection) -> None:

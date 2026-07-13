@@ -1,3 +1,4 @@
+import { computed, type Ref } from 'vue'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useApiClient } from '@/api/client-provider'
 import type { CreatedPlanResponse, TradingPlan } from '@/api/types'
@@ -20,11 +21,12 @@ export function useLatestPlanQuery() {
   })
 }
 
-export function usePlanQuery(planId: string) {
+export function usePlanQuery(planId: Ref<string | null>) {
   const client = useApiClient()
   return useQuery({
-    queryKey: planQueryKey(planId),
-    queryFn: () => client.get<TradingPlan>(`/plans/${planId}`),
+    queryKey: computed(() => planQueryKey(planId.value ?? 'none')),
+    queryFn: () => client.get<TradingPlan>(`/plans/${planId.value}`),
+    enabled: computed(() => planId.value !== null),
   })
 }
 

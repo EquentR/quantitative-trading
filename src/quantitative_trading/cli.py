@@ -16,6 +16,11 @@ import typer
 from pydantic import ValidationError
 
 from quantitative_trading.account.service import AccountService
+from quantitative_trading.api.auth import (
+    AuthService,
+    AuthSetupRequiredError,
+    InvalidCredentialsError,
+)
 from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.audit.service import AuditService
 from quantitative_trading.cash.repository import (
@@ -69,14 +74,11 @@ from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.notification.service import NotificationService
 from quantitative_trading.planning.repository import TradingPlanRepository
 from quantitative_trading.recommendation.repository import RecommendationRepository
-from quantitative_trading.recommendation.scanner import (
-    PlanNotScannableError,
-    scan_latest_plan_recommendations,
-)
 from quantitative_trading.runtime.service_app import run_api_service
 from quantitative_trading.runtime.service_runner import DebugServiceRunner
 from quantitative_trading.sanitization import safe_error_summary
 from quantitative_trading.storage.sqlite import connect, migrate
+from quantitative_trading.storage.api_auth import ApiAuthRepository
 from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
 from quantitative_trading.watchlist.repository import (
     WATCH_PINNED_CSV_COLUMNS,
@@ -728,7 +730,11 @@ def _echo_market_backfill(summary) -> None:
         f"run_id={summary.run_id} workflow=backfill "
         f"date={summary.trade_date.isoformat()} status={summary.status.value} "
         f"reused={str(summary.reused).lower()} requested={summary.requested_symbols} "
-        f"processed={summary.processed_symbols} failures={summary.failure_count}"
+        f"processed={summary.processed_symbols} "
+        f"provider_calls={summary.provider_calls} "
+        f"provider_duration_ms={summary.provider_duration_ms:.2f} "
+        f"rows_received={summary.rows_received} rows_written={summary.rows_written} "
+        f"warnings={summary.warning_count} failures={summary.failure_count}"
     )
     for result in summary.results:
         typer.echo(
@@ -757,7 +763,20 @@ def market_backfill(
                 trading_day,
                 symbols=symbols,
             )
-    except Exception:
+            _audit_market_maintenance(
+                connection,
+                workflow_type="backfill",
+                run_id=summary.run_id,
+                trade_date=trading_day,
+                status=summary.status.value,
+                symbols=symbols,
+            )
+    except Exception as exc:
+        _audit_cli_failure(
+            workflow_type="backfill",
+            error=safe_error_summary(exc),
+            trade_date=trading_day,
+        )
         raise typer.BadParameter("market backfill failed") from None
     if json_output:
         typer.echo(summary.model_dump_json())
@@ -776,7 +795,20 @@ def market_cleanup(
     try:
         with _database_scope() as (_settings, connection):
             result = _market_maintenance_workflow(connection).run_cleanup(trading_day)
-    except Exception:
+            _audit_market_maintenance(
+                connection,
+                workflow_type="cleanup",
+                run_id=result.run_id,
+                trade_date=trading_day,
+                status=result.status.value,
+                symbols=None,
+            )
+    except Exception as exc:
+        _audit_cli_failure(
+            workflow_type="cleanup",
+            error=safe_error_summary(exc),
+            trade_date=trading_day,
+        )
         raise typer.BadParameter("market cleanup failed") from None
     if json_output:
         typer.echo(
@@ -822,7 +854,15 @@ def market_runs(
             f"run_id={run.run_id} workflow={run.workflow_type} "
             f"date={run.trade_date.isoformat()} status={run.status.value} "
             f"requested={run.requested_symbols} processed={run.processed_symbols} "
-            f"warnings={run.warning_count} failures={run.failure_count}"
+            f"duration_ms={run.duration_ms if run.duration_ms is not None else '-'} "
+            f"provider_calls={run.provider_calls} "
+            f"provider_duration_ms={run.provider_duration_ms:.2f} "
+            f"rows_received={run.rows_received} rows_written={run.rows_written} "
+            f"cleaned_rows={run.cleaned_rows} plans={run.plan_count} "
+            f"recommendations={run.recommendation_count} "
+            f"notifications={run.notification_count} emails={run.email_outbox_count} "
+            f"retries={run.retry_count} warnings={run.warning_count} "
+            f"failures={run.failure_count} error={run.error_summary or '-'}"
         )
 
 
@@ -836,6 +876,22 @@ def _require_manual_reason(reason: str | None) -> str:
             "reason is required for forced or calendar-override runs"
         )
     return reason.strip()
+
+
+def _authenticate_manual_override(
+    settings: Settings,
+    connection: sqlite3.Connection,
+) -> None:
+    password = typer.prompt("API password", hide_input=True)
+    try:
+        AuthService(
+            ApiAuthRepository(connection),
+            token_ttl_seconds=settings.api_token_ttl_seconds,
+            startup_password=settings.api_access_password,
+            configured_token_secret=settings.api_token_secret,
+        ).login(password)
+    except (AuthSetupRequiredError, InvalidCredentialsError) as exc:
+        raise typer.BadParameter("manual workflow authentication failed") from exc
 
 
 def _audit_manual_workflow(
@@ -862,6 +918,57 @@ def _audit_manual_workflow(
     )
 
 
+def _audit_market_maintenance(
+    connection: sqlite3.Connection,
+    *,
+    workflow_type: str,
+    run_id: str,
+    trade_date: date,
+    status: str,
+    symbols: list[str] | None,
+) -> None:
+    AuditService(AuditLogRepository(connection)).record_event(
+        event_type="workflow.manual_run",
+        recommendation_id=None,
+        payload={
+            "workflow_type": workflow_type,
+            "run_id": run_id,
+            "trade_date": trade_date.isoformat(),
+            "status": status,
+            "symbols": symbols,
+        },
+    )
+
+
+def _audit_cli_failure(
+    *,
+    workflow_type: str,
+    error: str,
+    trade_date: date | None = None,
+    force: bool = False,
+    skip_calendar: bool = False,
+    manual_reason: str | None = None,
+) -> None:
+    try:
+        with _database_scope() as (_settings, connection):
+            AuditService(AuditLogRepository(connection)).record_event(
+                event_type="workflow.manual_run_failed",
+                recommendation_id=None,
+                payload={
+                    "workflow_type": workflow_type,
+                    "trade_date": (
+                        None if trade_date is None else trade_date.isoformat()
+                    ),
+                    "force": force,
+                    "skip_calendar": skip_calendar,
+                    "manual_reason": manual_reason,
+                    "error": error,
+                },
+            )
+    except Exception:
+        return
+
+
 @workflow_app.command("intraday")
 def run_intraday_workflow(
     force: Annotated[bool, typer.Option("--force")] = False,
@@ -875,6 +982,7 @@ def run_intraday_workflow(
         local_now.date()
     ) and calendar.is_trading_minute(local_now)
     manual_reason = reason.strip() if reason and reason.strip() else None
+    requires_auth = force or not in_session
     if not in_session:
         if not force:
             raise typer.BadParameter("intraday workflow is outside an XSHG session")
@@ -884,6 +992,8 @@ def run_intraday_workflow(
 
     try:
         with _database_scope() as (settings, connection):
+            if requires_auth:
+                _authenticate_manual_override(settings, connection)
             result = build_decision_workflow(
                 connection,
                 settings,
@@ -899,6 +1009,13 @@ def run_intraday_workflow(
                 manual_reason=manual_reason,
             )
     except Exception as exc:
+        _audit_cli_failure(
+            workflow_type="intraday",
+            error=safe_error_summary(exc),
+            trade_date=local_now.date(),
+            force=force,
+            manual_reason=manual_reason,
+        )
         raise typer.BadParameter(
             f"intraday workflow failed: {safe_error_summary(exc)}"
         ) from None
@@ -941,7 +1058,8 @@ def run_close_workflow(
         15, 15
     ) <= local_now.time().replace(tzinfo=None) <= time(16, 30)
     manual_reason = reason.strip() if reason and reason.strip() else None
-    if force or skip_calendar or not in_close_window:
+    requires_auth = force or skip_calendar or not in_close_window
+    if requires_auth:
         manual_reason = _require_manual_reason(manual_reason)
     if (
         trade_date == local_now.date()
@@ -954,6 +1072,8 @@ def run_close_workflow(
 
     try:
         with _database_scope() as (settings, connection):
+            if requires_auth:
+                _authenticate_manual_override(settings, connection)
             result = build_decision_workflow(
                 connection,
                 settings,
@@ -969,6 +1089,14 @@ def run_close_workflow(
                 manual_reason=manual_reason,
             )
     except Exception as exc:
+        _audit_cli_failure(
+            workflow_type="close",
+            error=safe_error_summary(exc),
+            trade_date=trade_date,
+            force=force,
+            skip_calendar=skip_calendar,
+            manual_reason=manual_reason,
+        )
         raise typer.BadParameter(
             f"close workflow failed: {safe_error_summary(exc)}"
         ) from None
@@ -1019,17 +1147,9 @@ def latest_plan() -> None:
 
 @recommendations_app.command("scan")
 def scan_recommendations() -> None:
-    try:
-        with _database_scope() as (_settings, connection):
-            scan = scan_latest_plan_recommendations(connection, now=datetime.now(UTC))
-    except PlanNotScannableError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    if scan is None:
-        typer.echo("暂无计划，无法生成建议")
-        return
-    typer.echo(f"generated={len(scan.recommendations)} plan_id={scan.plan.plan_id}")
-    for recommendation in scan.recommendations:
-        _echo_recommendation_line(recommendation)
+    raise typer.BadParameter(
+        "qt recommendations scan is retired; use qt workflow intraday"
+    )
 
 
 @recommendations_app.command("list")
@@ -1073,6 +1193,7 @@ def list_notifications(
     ] = None,
     limit: Annotated[int, typer.Option("--limit", min=1, max=100)] = 50,
     offset: Annotated[int, typer.Option("--offset", min=0)] = 0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     with _database_scope() as (_settings, connection):
         notifications = NotificationService(
@@ -1085,6 +1206,14 @@ def list_notifications(
             limit=limit,
             offset=offset,
         )
+    if json_output:
+        typer.echo(
+            json.dumps(
+                [item.model_dump(mode="json") for item in notifications],
+                ensure_ascii=False,
+            )
+        )
+        return
     if not notifications:
         typer.echo("暂无通知")
         return
@@ -1100,14 +1229,19 @@ def list_notifications(
 
 
 @notifications_app.command("unread")
-def unread_notifications() -> None:
+def unread_notifications(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
     with _database_scope() as (_settings, connection):
         count = NotificationService(NotificationRepository(connection)).unread_count()
-    typer.echo(f"unread={count}")
+    typer.echo(json.dumps({"unread": count}) if json_output else f"unread={count}")
 
 
 @notifications_app.command("read")
-def read_notification(notification_id: Annotated[str, typer.Argument()]) -> None:
+def read_notification(
+    notification_id: Annotated[str, typer.Argument()],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
     try:
         with _database_scope() as (_settings, connection):
             service = NotificationService(NotificationRepository(connection))
@@ -1121,15 +1255,23 @@ def read_notification(notification_id: Annotated[str, typer.Argument()]) -> None
             connection.commit()
     except KeyError:
         raise typer.BadParameter(f"notification not found: {notification_id}") from None
-    typer.echo(
-        f"notification_id={updated.notification_id} status={updated.status.value}"
-    )
+    if json_output:
+        typer.echo(updated.model_dump_json())
+    else:
+        typer.echo(
+            f"notification_id={updated.notification_id} status={updated.status.value}"
+        )
 
 
 @email_app.command("status")
-def email_status() -> None:
+def email_status(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
     with _database_scope() as (_settings, connection):
         settings = SmtpSettingsService(SmtpSettingsRepository(connection)).get_public()
+    if json_output:
+        typer.echo(settings.model_dump_json())
+        return
     typer.echo(
         f"configured={str(settings.configured).lower()} "
         f"enabled={str(settings.enabled).lower()} "
@@ -1143,13 +1285,19 @@ def email_status() -> None:
 
 
 @email_app.command("test")
-def test_email() -> None:
+def test_email(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
     with _database_scope() as (_settings, connection):
         repository = SmtpSettingsRepository(connection)
         service = SmtpSettingsService(repository)
         configured = repository.get()
         if configured is None:
-            typer.echo("smtp_test=not_configured")
+            typer.echo(
+                json.dumps({"smtp_test": "not_configured"})
+                if json_output
+                else "smtp_test=not_configured"
+            )
             return
         secret_texts = (configured.password,) if configured.password else ()
         audit_service = AuditService(
@@ -1159,7 +1307,11 @@ def test_email() -> None:
         try:
             tested = service.send_test(SmtplibEmailSender())
         except SmtpSettingsNotConfiguredError:
-            typer.echo("smtp_test=not_configured")
+            typer.echo(
+                json.dumps({"smtp_test": "not_configured"})
+                if json_output
+                else "smtp_test=not_configured"
+            )
             return
         except Exception as exc:
             error = sanitized_email_error(exc, secret_texts=secret_texts)
@@ -1174,7 +1326,11 @@ def test_email() -> None:
             recommendation_id=None,
             payload={"recipient": tested.recipient},
         )
-    typer.echo(f"smtp_test=sent recipient={tested.recipient}")
+    typer.echo(
+        json.dumps({"smtp_test": "sent", "recipient": tested.recipient})
+        if json_output
+        else f"smtp_test=sent recipient={tested.recipient}"
+    )
 
 
 def _email_delivery_service(connection: sqlite3.Connection) -> EmailDeliveryService:
@@ -1195,6 +1351,7 @@ def list_email_deliveries(
     ] = None,
     limit: Annotated[int, typer.Option("--limit", min=1, max=100)] = 50,
     offset: Annotated[int, typer.Option("--offset", min=0)] = 0,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     with _database_scope() as (_settings, connection):
         deliveries = _email_delivery_service(connection).list_deliveries(
@@ -1203,6 +1360,14 @@ def list_email_deliveries(
             limit=limit,
             offset=offset,
         )
+    if json_output:
+        typer.echo(
+            json.dumps(
+                [item.model_dump(mode="json") for item in deliveries],
+                ensure_ascii=False,
+            )
+        )
+        return
     if not deliveries:
         typer.echo("暂无邮件投递")
         return
@@ -1218,7 +1383,10 @@ def list_email_deliveries(
 
 
 @email_app.command("retry")
-def retry_email_delivery(delivery_id: Annotated[str, typer.Argument()]) -> None:
+def retry_email_delivery(
+    delivery_id: Annotated[str, typer.Argument()],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
     try:
         with _database_scope() as (_settings, connection):
             delivery = _email_delivery_service(connection).manual_retry(delivery_id)
@@ -1228,10 +1396,13 @@ def retry_email_delivery(delivery_id: Annotated[str, typer.Argument()]) -> None:
         raise typer.BadParameter(
             f"email delivery is not retryable: {delivery_id}"
         ) from None
-    typer.echo(
-        f"delivery_id={delivery.delivery_id} "
-        f"status={delivery.status.value} attempts={delivery.attempt_count}"
-    )
+    if json_output:
+        typer.echo(delivery.model_dump_json())
+    else:
+        typer.echo(
+            f"delivery_id={delivery.delivery_id} "
+            f"status={delivery.status.value} attempts={delivery.attempt_count}"
+        )
 
 
 @service_app.command("check")

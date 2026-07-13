@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { RefreshCw, SlidersHorizontal, X } from 'lucide-vue-next'
 import type { EChartsCoreOption } from 'echarts/core'
 import Alert from '@/components/ui/Alert.vue'
@@ -22,6 +23,9 @@ import MarketScanner from './MarketScanner.vue'
 
 type MarketTab = 'overview' | 'daily' | 'money' | 'intraday' | 'trace'
 
+const route = useRoute()
+const router = useRouter()
+
 const tabs: { value: MarketTab; label: string }[] = [
   { value: 'overview', label: '概览' },
   { value: 'daily', label: 'K 线' },
@@ -38,10 +42,18 @@ const moneyWindow = ref(60)
 
 const symbolsQuery = useMarketSymbolsQuery()
 const symbols = computed(() => symbolsQuery.data.value?.items ?? [])
+const requestedSymbol = computed(() => {
+  const value = Array.isArray(route.query.symbol) ? route.query.symbol[0] : route.query.symbol
+  return typeof value === 'string' && /^\d{6}$/.test(value) ? value : null
+})
 
-watch(symbols, (items) => {
+watch([symbols, requestedSymbol], ([items, requested]) => {
   if (items.length === 0) {
     selectedSymbol.value = null
+    return
+  }
+  if (requested && items.some((item) => item.symbol === requested)) {
+    selectedSymbol.value = requested
     return
   }
   if (!items.some((item) => item.symbol === selectedSymbol.value)) {
@@ -71,6 +83,7 @@ const combinedRisks = computed(() => Array.from(new Set([
 function selectSymbol(symbol: string) {
   selectedSymbol.value = symbol
   drawerOpen.value = false
+  void router.replace({ query: { ...route.query, symbol } })
 }
 
 function qualityText(status: MarketQualityStatus): string {
@@ -100,6 +113,11 @@ function componentDirection(component: MarketStrengthComponent): string {
   if (component.direction === 1) return '偏强'
   if (component.direction === -1) return '偏弱'
   return '中性'
+}
+
+function staleChartMarker(status: MarketQualityStatus | undefined, dataTime: string | null | undefined): string | null {
+  if (status !== 'stale') return null
+  return `陈旧数据 · ${dataTime ?? '数据时间不可用'}`
 }
 
 const dailyBars = computed(() => (dailyQuery.data.value?.bars ?? []).slice(-dailyWindow.value))
@@ -333,7 +351,7 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
                 </div>
                 <p v-else class="text-sm text-muted-foreground">非持仓标的</p>
                 <div v-if="overview.plan" class="space-y-1 text-sm">
-                  <p>计划：<a class="text-primary underline" :href="`/review?plan_id=${overview.plan.plan_id}`">{{ overview.plan.plan_id }}</a></p>
+                  <p>计划：<RouterLink class="text-primary underline" :to="{ path: '/review', query: { plan_id: overview.plan.plan_id } }">{{ overview.plan.plan_id }}</RouterLink></p>
                   <p>状态：{{ overview.plan.status }}</p>
                   <p class="break-words">允许动作：{{ overview.plan.allowed_actions.join(' / ') || '不可用' }}</p>
                   <p>有效期：<FormatValues kind="time" :value="overview.plan.valid_until" /></p>
@@ -348,9 +366,9 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
                     <RecommendationStatusBadge kind="action" :value="overview.recommendation.action" />
                     <RecommendationStatusBadge kind="confidence" :value="overview.recommendation.confidence" />
                   </div>
-                  <a class="block break-all text-sm text-primary underline" :href="`/recommendations?recommendation_id=${overview.recommendation.recommendation_id}`">
+                  <RouterLink class="block break-all text-sm text-primary underline" :to="{ path: '/recommendations', query: { recommendation_id: overview.recommendation.recommendation_id } }">
                     {{ overview.recommendation.recommendation_id }}
-                  </a>
+                  </RouterLink>
                   <ul class="list-disc space-y-1 pl-4 text-sm">
                     <li v-for="reason in overview.recommendation.reason" :key="reason" class="break-words">{{ reason }}</li>
                   </ul>
@@ -420,7 +438,11 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
               {{ qualityText(dailyQuery.data.value!.status) }}
               <span v-for="warning in dailyQuery.data.value!.warnings" :key="warning" class="ml-1 break-words">{{ warning }}</span>
             </Alert>
-            <MarketChart label="前复权日 K 线、均线与成交量图" :option="dailyOption" />
+            <MarketChart
+              label="前复权日 K 线、均线与成交量图"
+              :option="dailyOption"
+              :quality-marker="staleChartMarker(dailyQuery.data.value?.status, dailyQuery.data.value?.data_time)"
+            />
           </template>
         </div>
 
@@ -441,7 +463,11 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
               <span>{{ qualityText(moneyQuery.data.value!.status) }}</span>
               <span v-for="warning in moneyQuery.data.value!.warnings" :key="warning" class="ml-1 break-words">{{ warning }}</span>
             </Alert>
-            <MarketChart label="资金流净额与占比图" :option="moneyOption" />
+            <MarketChart
+              label="资金流净额与占比图"
+              :option="moneyOption"
+              :quality-marker="staleChartMarker(moneyQuery.data.value?.status, moneyQuery.data.value?.data_time)"
+            />
             <div class="table-scroll">
               <table class="w-full table-fixed text-xs md:min-w-[80rem]" aria-label="资金流完整明细">
                 <thead class="text-left text-muted-foreground"><tr>
@@ -469,7 +495,11 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
             <Alert v-if="minuteQuery.data.value!.status !== 'complete' && minuteQuery.data.value!.status !== 'ok'" variant="warning">
               {{ qualityText(minuteQuery.data.value!.status) }}
             </Alert>
-            <MarketChart label="分时价格、VWAP 与成交量图" :option="intradayOption" />
+            <MarketChart
+              label="分时价格、VWAP 与成交量图"
+              :option="intradayOption"
+              :quality-marker="staleChartMarker(minuteQuery.data.value?.status, minuteQuery.data.value?.data_time)"
+            />
             <div class="flex flex-wrap gap-x-5 gap-y-1 text-xs text-muted-foreground">
               <span>前收 {{ formatNumber(minuteQuery.data.value!.previous_close, 3) }}</span>
               <span><span>VWAP</span> 使用后端分钟数据</span>
@@ -478,7 +508,7 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
             <ul v-if="minuteMarkers.length" class="space-y-1 text-sm">
               <li v-for="marker in minuteMarkers" :key="marker.recommendation_id" class="break-words">
                 <span>建议发生点 {{ marker.time }} {{ marker.action }}</span>
-                <a class="ml-1 text-primary underline" :href="`/recommendations?recommendation_id=${marker.recommendation_id}`">{{ marker.recommendation_id }}</a>
+                <RouterLink class="ml-1 text-primary underline" :to="{ path: '/recommendations', query: { recommendation_id: marker.recommendation_id } }">{{ marker.recommendation_id }}</RouterLink>
               </li>
             </ul>
             <section v-if="strengthQuery.data.value" class="space-y-2 border-t border-border pt-3">
@@ -514,6 +544,7 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
               <dt class="text-muted-foreground">plan_id</dt><dd class="break-all">{{ traceQuery.data.value.plan_id ?? '不可用' }}</dd>
               <dt class="text-muted-foreground">recommendation_id</dt><dd class="break-all">{{ traceQuery.data.value.recommendation_id ?? '不可用' }}</dd>
               <dt class="text-muted-foreground">数据时间</dt><dd><FormatValues kind="time" :value="traceQuery.data.value.data_time" /></dd>
+              <dt class="text-muted-foreground">Stale 阈值</dt><dd>{{ traceQuery.data.value.thresholds.stale_trading_minutes ?? '不可用' }} 个有效交易分钟</dd>
             </dl>
             <div class="table-scroll">
               <table class="w-full table-fixed text-xs md:min-w-[48rem]" aria-label="数据集引用">

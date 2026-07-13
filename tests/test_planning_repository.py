@@ -5,7 +5,10 @@ import pytest
 
 from quantitative_trading.config import Settings
 from quantitative_trading.planning.models import TradingPlan, TradingPlanStatus
-from quantitative_trading.planning.repository import TradingPlanRepository
+from quantitative_trading.planning.repository import (
+    ActivePlanConflictError,
+    TradingPlanRepository,
+)
 from quantitative_trading.storage.sqlite import connect, migrate
 
 
@@ -28,7 +31,7 @@ def trading_plan(
     plan_id: str = "plan-20260709",
     *,
     generated_at: datetime = GENERATED_AT,
-    status: TradingPlanStatus = TradingPlanStatus.ACTIVE,
+    status: TradingPlanStatus = TradingPlanStatus.DRAFT,
 ) -> TradingPlan:
     return TradingPlan(
         plan_id=plan_id,
@@ -200,3 +203,21 @@ def test_next_version_increments_highest_version_for_trading_day(
     )
 
     assert repository.next_version(date(2026, 7, 9)) == 4
+
+
+def test_storage_rejects_a_second_active_plan_for_same_trade_date(
+    repository: TradingPlanRepository,
+) -> None:
+    first = trading_plan("plan-active-1", status=TradingPlanStatus.ACTIVE)
+    conflicting = trading_plan(
+        "plan-active-2",
+        generated_at=LATER,
+        status=TradingPlanStatus.ACTIVE,
+    )
+
+    repository.save(first)
+
+    with pytest.raises(ActivePlanConflictError):
+        repository.save(conflicting)
+
+    assert repository.active_for_day(date(2026, 7, 9)) == first

@@ -16,7 +16,7 @@
 - `synced`：外部自选置顶同步结果，默认不进入计划。
 - `manual_synced`：外部同步命中本地手动记录，保留本地 `plan_enabled` 和备注。
 
-非持仓自选股票只有 `plan_enabled=true` 时才会进入收盘计划和建议扫描；持仓台账中的股票始终按持仓来源进入计划。
+非持仓自选股票只有 `plan_enabled=true` 时才会进入收盘计划和盘中决策；持仓台账中的股票始终按持仓来源进入计划。
 
 ## 本地开发安装
 
@@ -133,18 +133,20 @@ qt service run
 - 盘中 `09:30-11:30`、`13:00-15:00` 每 3 分钟运行一次统一工作流。
 - 收盘 `15:15` 首次检查当日数据，未就绪每 5 分钟重试，最晚 `16:30`。
 - 原始分钟线在交易日 `16:35` 独立清理。
+- 日 K/资金流 backfill 不自动调度，由认证 HTTP 或 CLI 按需运行。
 - 邮件 outbox worker 每 15 秒轮询，不受交易时段限制。
 
-每种工作流最多一个实例，错过的盘中触发只合并为当前有效周期。超过 `16:30` 的收盘补跑必须通过认证入口显式执行并留下审计记录。
+四种工作流类型 `intraday/close/backfill/cleanup` 全部由同一个 `DecisionWorkflow` 执行，每种类型最多一个实例，错过的盘中触发只合并为当前有效周期。服务在交易日 `15:15-16:30` 内重启且当日计划未发布时会立即恢复收盘就绪检查，此规则不受可选的 `QT_SERVICE_RUN_ON_START_WHEN_SCHEDULER_ENABLED` 普通启动开关限制。超过 `16:30` 的收盘补跑必须通过认证入口显式执行并留下审计记录。
 
 运行统一收盘工作流、查看计划和建议：
 
 ```bash
 qt workflow close --date 2026-07-10
 qt plan latest
-qt recommendations scan
 qt recommendations list
 ```
+
+旧 `qt recommendations scan` 已退役并以非零状态退出，旧 `POST /api/v1/recommendations/scan` 在认证后固定返回 HTTP `410 recommendation_scan_retired`。手动生成盘中建议使用 `qt workflow intraday` 或 `POST /api/v1/service/workflows/intraday/run`，不会形成第二条建议写入路径。
 
 建议 API 和 CLI 只生成可解释的本地建议。`buy/add` 需要活动收盘计划、至少两个独立有效因子和硬性风控；计划外非持仓机会只能 `watch/avoid`。持仓新风险可以覆盖计划，但数据不足时必须降级并保留风险、失效条件和人工复核要求。
 
@@ -160,18 +162,23 @@ qt market snapshot
 
 系统为启用标的维护最近 250 个 `XSHG` 交易日的前复权日 K、60 个交易日的主力/超大单/大单/中单/小单净额和净占比，以及当前交易日 1 分钟行情。日 K 和资金流使用追加版本及不可变快照；原始分钟线只保留最近 20 个交易日，但分时强弱、规则版本、建议输入和审计引用长期保留。
 
+盘中报价和分钟数据默认落后超过 6 个有效交易分钟即标记 stale，午休和非交易时段不累计。可在 `.env` 中设置 `QT_MARKET_STALE_TRADING_MINUTES=6`（允许 1 到 60）；实际生效值会保存到输入快照并在数据引用页展示。
+
 每个 `DecisionWorkflow` 运行形成 `run_id -> market_input_snapshot_id -> plan_id -> recommendation_id -> notification_id -> delivery_id` 追踪链。逐标的外部失败保存为 degraded/failed/stale 质量结果并继续其他标的；数据库、引用或模型契约失败终止当前整轮。CLI 和 API 不输出第三方原始响应。
 
-工作流 CLI 范围包括日 K/资金流基线回填、收盘或盘中手动运行、指定交易日补跑、工作流与数据质量查询、分钟线清理、通知读取和邮件失败重试。具体已安装命令以 `qt --help` 及子命令 `--help` 为准，所有入口共享相同 repository、adapter 和 service。
+工作流 CLI 范围包括日 K/资金流基线回填、收盘或盘中手动运行、指定交易日补跑、工作流与数据质量查询、分钟线清理、通知读取和邮件失败重试。维护和工作流命令支持人类可读摘要及 `--json`；两者包含一致的运行 ID、状态、质量和成本指标。强制运行、窗口外盘中运行、跳过日历或晚于截止补跑必须提供 `--reason`，CLI 会通过隐藏输入提示校验本地 API 访问密码，密码不会进入命令参数、输出或审计。具体已安装命令以 `qt --help` 及子命令 `--help` 为准，所有入口共享相同 repository、adapter 和 service。
 
 ```bash
 qt market backfill --date 2026-07-13
 qt market cleanup --date 2026-07-13
 qt market runs --limit 20
+qt market runs --limit 20 --json
 qt workflow intraday
 qt workflow close --date 2026-07-13
 qt workflow close --date 2026-07-13 --force --reason "人工确认补跑"
 ```
+
+监控页和 `/api/v1/market/runs` 展示工作流类型、交易日、周期、幂等键、起止与耗时、请求/处理标的数、provider 调用与耗时、行数、计划/建议/通知/outbox 数量，以及各数据集 `complete/degraded/failed/stale` 的 `dataset_counts`。服务状态另显示最近任务原因及累计 `overrun_count/skipped_count`。计划、建议、通知、反馈、审计和邮件投递等列表 API 统一返回 `{items,total,page,page_size}`。
 
 ## 数据源密钥安全
 
@@ -190,7 +197,7 @@ qt email retry <delivery_id>
 
 SMTP 密码经用户确认后明文保存在本地 SQLite，这是项目唯一的秘密存储例外。读取 API、CLI、Web 回填、日志、审计、错误和 outbox 永远不得包含原值；密码输入留空保留已有值，替换和清除必须是明确操作。数据库导出和备份会包含 SMTP 明文密码，因此 `data/`、备份和本地运行数据必须保持 git 忽略并限制为本机用户可读。
 
-`buy/add/sell/reduce` 在本地通知成功后立即进入 outbox，`hold/watch/avoid` 只进入收盘每日摘要。投递失败按 1、5、15、30、60 分钟退避，达到最多 6 次尝试后成为 `dead`。邮件失败不会回滚建议，也不会重跑决策工作流；SMTP 禁用或未配置时，本地控制台、Web/API 和 JSONL 通知仍正常运行。
+`buy/add/sell/reduce` 在本地通知成功后立即进入 outbox，`hold/watch/avoid` 只进入收盘每日摘要。关键工作流故障先写数据库/Web 通知、控制台和 JSONL，再在 SMTP 可用时进入邮件 outbox。投递失败按 1、5、15、30、60 分钟退避，达到最多 6 次尝试后成为 `dead`，同时生成去重的数据库/Web、控制台和 JSONL 本地告警。邮件失败不会回滚建议，也不会重跑决策工作流；SMTP 禁用、未配置或自身故障不能压制本地告警。
 
 ## 本地前端控制台开发
 

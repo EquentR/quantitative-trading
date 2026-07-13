@@ -146,7 +146,7 @@ def test_runtime_runs_cleanup_and_email_worker_independently(
     monkeypatch.setattr(
         service_app,
         "_email_delivery_service",
-        lambda connection: FakeEmailWorker(),
+        lambda connection, settings: FakeEmailWorker(),
     )
     settings = Settings(database_path=tmp_path / "runtime.db")
 

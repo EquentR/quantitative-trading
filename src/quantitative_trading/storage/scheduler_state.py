@@ -23,6 +23,8 @@ class SchedulerState:
     last_task_type: str | None
     last_plan_id: str | None
     last_recommendation_ids: list[str]
+    overrun_count: int
+    skipped_count: int
     updated_at: datetime
 
 
@@ -139,6 +141,8 @@ class SchedulerStateRepository:
                   last_task_type = ?,
                   last_plan_id = ?,
                   last_recommendation_ids = ?,
+                  overrun_count = overrun_count + ?,
+                  skipped_count = skipped_count + ?,
                   updated_at = ?
                 WHERE id = 1
                 """,
@@ -152,6 +156,8 @@ class SchedulerStateRepository:
                     task_type,
                     plan_id,
                     json.dumps(recommendation_ids or [], ensure_ascii=False),
+                    int(reason.startswith("scheduler_overrun:")),
+                    int(status == "skipped"),
                     now.isoformat(),
                 ),
             )
@@ -179,6 +185,8 @@ class SchedulerStateRepository:
               last_task_type,
               last_plan_id,
               last_recommendation_ids,
+              overrun_count,
+              skipped_count,
               updated_at
             FROM scheduler_state
             WHERE id = 1
@@ -201,6 +209,8 @@ class SchedulerStateRepository:
             last_recommendation_ids=self._parse_recommendation_ids(
                 row["last_recommendation_ids"]
             ),
+            overrun_count=int(row["overrun_count"]),
+            skipped_count=int(row["skipped_count"]),
             updated_at=self._parse_datetime(row["updated_at"]),
         )
 

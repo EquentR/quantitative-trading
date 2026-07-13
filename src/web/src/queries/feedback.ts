@@ -1,8 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useApiClient } from '@/api/client-provider'
+import { pageItems } from '@/api/pagination'
 import { latestPlanQueryKey } from '@/queries/plans'
 import { serviceStatusQueryKey } from '@/queries/service'
-import type { ExecutionFeedback, ExecutionFeedbackInput, ServiceStatus, TradingPlan } from '@/api/types'
+import type {
+  ExecutionFeedback,
+  ExecutionFeedbackInput,
+  PaginatedResponse,
+  ServiceStatus,
+  TradingPlan,
+} from '@/api/types'
 
 export const feedbackQueryKey = (recommendationId: string | undefined, limit = 20) =>
   ['feedback', recommendationId ?? null, limit] as const
@@ -25,8 +32,10 @@ export function useFeedbackQuery(recommendationId?: string, limit = 20) {
       if (recommendationId) {
         params.set('recommendation_id', recommendationId)
       }
-      params.set('limit', String(limit))
-      return client.get<ExecutionFeedback[]>(`/feedback?${params.toString()}`)
+      params.set('page_size', String(limit))
+      return client
+        .get<PaginatedResponse<ExecutionFeedback> | ExecutionFeedback[]>(`/feedback?${params.toString()}`)
+        .then(pageItems)
     },
   })
 }

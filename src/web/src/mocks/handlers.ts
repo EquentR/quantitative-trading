@@ -45,6 +45,8 @@ export const mockServiceStatus: ServiceStatus = {
   last_task_type: 'plan_generation',
   last_plan_id: 'plan-001',
   last_recommendation_ids: ['rec-001'],
+  overrun_count: 2,
+  skipped_count: 3,
 }
 
 export const mockPositions: Position[] = [
@@ -428,6 +430,7 @@ export const mockMarketTrace: MarketSnapshotTrace = {
   fetched_at: '2026-07-13T10:22:00+08:00',
   status: 'partial',
   warnings: ['资金流数据延迟一个采集周期'],
+  thresholds: { stale_trading_minutes: 6 },
   datasets: [
     { dataset: 'quote', reference_id: 'quote-101', status: 'complete', source: 'akshare', data_start: null, data_end: null, data_time: '2026-07-13T10:21:00+08:00', fetched_at: '2026-07-13T10:22:00+08:00', warnings: [] },
     { dataset: 'history', reference_id: 'daily-101', status: 'complete', source: 'akshare', data_start: '2025-07-08', data_end: '2026-07-13', data_time: '2026-07-13T15:00:00+08:00', fetched_at: '2026-07-13T15:06:00+08:00', warnings: [] },
@@ -442,7 +445,7 @@ export const mockMarketRuns: MarketCaptureRun[] = [
     workflow_type: 'intraday',
     trade_date: '2026-07-13',
     period_start: '2026-07-13T10:21:00+08:00',
-    period_end: null,
+    period_end: '2026-07-13T10:24:00+08:00',
     idempotency_key: 'intraday:2026-07-13:1021',
     status: 'degraded',
     started_at: '2026-07-13T10:21:00+08:00',
@@ -463,6 +466,11 @@ export const mockMarketRuns: MarketCaptureRun[] = [
     warning_count: 1,
     failure_count: 0,
     error_summary: '',
+    dataset_counts: {
+      quote: { complete: 2, degraded: 0, failed: 0, stale: 0 },
+      minute_bar: { complete: 1, degraded: 1, failed: 0, stale: 0 },
+      intraday_strength: { complete: 1, degraded: 0, failed: 0, stale: 1 },
+    },
   },
 ]
 
@@ -581,15 +589,41 @@ export const handlers = [
   }),
   http.get('/api/v1/plans/latest', () => HttpResponse.json(mockTradingPlan)),
   http.get('/api/v1/plans/:plan_id', () => HttpResponse.json(mockTradingPlan)),
-  http.post('/api/v1/recommendations/scan', () =>
-    HttpResponse.json({ count: mockRecommendations.length, recommendations: mockRecommendations }),
+  http.post('/api/v1/service/workflows/intraday/run', () =>
+    HttpResponse.json({
+      task: 'intraday',
+      status: 'success',
+      run_id: 'intraday-mock-run',
+      snapshot_id: 1,
+      plan_id: null,
+      recommendation_ids: mockRecommendations.map((item) => item.recommendation_id),
+      warnings: [],
+      reused: false,
+      ready: null,
+      cleaned_rows: null,
+    }),
   ),
-  http.get('/api/v1/recommendations', () => HttpResponse.json(mockRecommendations)),
+  http.get('/api/v1/recommendations', () => HttpResponse.json({
+    items: mockRecommendations,
+    total: mockRecommendations.length,
+    page: 1,
+    page_size: 20,
+  })),
   http.get('/api/v1/recommendations/:recommendation_id', () =>
     HttpResponse.json(mockRecommendations[0]),
   ),
-  http.get('/api/v1/notifications', () => HttpResponse.json(mockNotifications)),
-  http.get('/api/v1/audit', () => HttpResponse.json([mockAuditLog])),
+  http.get('/api/v1/notifications', () => HttpResponse.json({
+    items: mockNotifications,
+    total: mockNotifications.length,
+    page: 1,
+    page_size: 50,
+  })),
+  http.get('/api/v1/audit', () => HttpResponse.json({
+    items: [mockAuditLog],
+    total: 1,
+    page: 1,
+    page_size: 50,
+  })),
   http.get('/api/v1/audit/:audit_id', () => HttpResponse.json(mockAuditLog)),
   http.get('/api/v1/feedback', ({ request }) => {
     const url = new URL(request.url)
@@ -600,7 +634,12 @@ export const handlers = [
         { status: 400 },
       )
     }
-    return HttpResponse.json(mockExecutionFeedback)
+    return HttpResponse.json({
+      items: mockExecutionFeedback,
+      total: mockExecutionFeedback.length,
+      page: 1,
+      page_size: 20,
+    })
   }),
   http.post('/api/v1/feedback', async ({ request }) => {
     const body = await request.json()
@@ -658,7 +697,12 @@ export const handlers = [
   http.post('/api/v1/notifications/email/settings/test-connection', () => HttpResponse.json({ status: 'connected' })),
   http.post('/api/v1/settings/notifications/email/test', () => HttpResponse.json({ status: 'sent' })),
   http.get('/api/v1/notifications/email-deliveries', () =>
-    HttpResponse.json(mockEmailDeliveries),
+    HttpResponse.json({
+      items: mockEmailDeliveries,
+      total: mockEmailDeliveries.length,
+      page: 1,
+      page_size: 50,
+    }),
   ),
   http.post('/api/v1/notifications/email-deliveries/:delivery_id/retry', ({ params }) =>
     HttpResponse.json({ ...mockEmailDeliveries[0], delivery_id: String(params.delivery_id), status: 'pending' }),

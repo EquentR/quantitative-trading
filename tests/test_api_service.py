@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from quantitative_trading.api.app import create_app
+from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.config import Settings
 from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
 from quantitative_trading.storage.sqlite import connect, migrate
@@ -42,6 +43,8 @@ def test_service_status_reports_scheduler_state(tmp_path) -> None:
     assert payload["interval_seconds"] == 180
     assert payload["timezone"] == "Asia/Shanghai"
     assert payload["run_on_start"] is True
+    assert payload["overrun_count"] == 0
+    assert payload["skipped_count"] == 0
     assert payload["last_status"] is None
     assert payload["last_task_type"] is None
     assert payload["last_plan_id"] is None
@@ -129,6 +132,12 @@ def test_scheduler_start_and_stop_persist_state(tmp_path) -> None:
     assert started_status.json()["scheduler_enabled"] is True
     assert stop_response.status_code == 200
     assert stop_response.json()["scheduler_enabled"] is False
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
+    with connect(settings) as connection:
+        event_types = {
+            item.event_type for item in AuditLogRepository(connection).list_recent(limit=20)
+        }
+    assert event_types >= {"service.scheduler.started", "service.scheduler.stopped"}
 
 
 def test_create_app_restores_enabled_scheduler(tmp_path) -> None:
@@ -355,7 +364,7 @@ def test_run_api_service_maps_external_workflow_concurrency_to_overrun(
     assert alerts[0]["event_type"] == "workflow.overrun"
 
 
-def test_run_api_service_reconciles_current_run_on_start_false_before_startup(
+def test_run_api_service_recovers_close_window_when_run_on_start_is_false(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -400,6 +409,7 @@ def test_run_api_service_reconciles_current_run_on_start_false_before_startup(
         )
 
     snapshot_calls = []
+    recovery_calls = []
     uvicorn_calls = []
 
     def fake_create_and_save_account_snapshot(received_settings):
@@ -409,7 +419,22 @@ def test_run_api_service_reconciles_current_run_on_start_false_before_startup(
         uvicorn_calls.append({"app": app, "host": host, "port": port})
 
     monkeypatch.setattr(service_app, "SchedulerManager", FakeSchedulerManager)
-    monkeypatch.setattr(service_app, "_startup_recovery_reason", lambda now: "startup")
+    monkeypatch.setattr(
+        service_app, "_startup_recovery_reason", lambda now: "close_readiness"
+    )
+    monkeypatch.setattr(
+        service_app,
+        "_run_scheduler_task",
+        lambda settings, reason: (
+            recovery_calls.append(reason)
+            or service_app.SchedulerJobResult(
+                task_type="close",
+                reason="close_reused",
+                status="success",
+                run_id="close-20260713",
+            )
+        ),
+    )
     monkeypatch.setattr(
         service_app,
         "create_and_save_account_snapshot",
@@ -427,12 +452,13 @@ def test_run_api_service_reconciles_current_run_on_start_false_before_startup(
         )
 
     assert snapshot_calls == []
+    assert recovery_calls == ["close_readiness"]
     assert uvicorn_calls
     assert state.enabled is True
     assert state.interval_seconds == 11
     assert state.run_on_start is False
-    assert state.last_reason == "manual_api"
-    assert state.last_snapshot_id == 12
+    assert state.last_reason == "close_reused"
+    assert state.last_status == "success"
 
 
 def test_run_api_service_reconciles_current_run_on_start_true_before_startup(
@@ -826,6 +852,12 @@ def test_run_once_records_latest_result(tmp_path) -> None:
     assert status_response.json()["last_reason"] == "manual_api"
     assert status_response.json()["last_snapshot_id"] == 1
     assert status_response.json()["last_task_type"] == "account_snapshot"
+    settings = Settings(database_path=tmp_path / "api.db", enable_market_fetch=False)
+    with connect(settings) as connection:
+        audits = AuditLogRepository(connection).list_recent(limit=20)
+    run_audit = next(item for item in audits if item.event_type == "service.run_once")
+    assert run_audit.payload["status"] == "success"
+    assert run_audit.payload["snapshot_id"] == 1
 
 
 def test_service_control_endpoints_require_auth_after_setup(tmp_path) -> None:

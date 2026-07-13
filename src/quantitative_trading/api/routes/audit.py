@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from quantitative_trading.api.dependencies import (
     ApiContainer,
@@ -23,6 +23,13 @@ router = APIRouter(
 )
 
 
+class AuditListResponse(BaseModel):
+    items: list[AuditLog]
+    total: int
+    page: int
+    page_size: int
+
+
 def _not_found() -> ApiError:
     return ApiError(status_code=404, code="audit_not_found", message="audit log not found")
 
@@ -35,21 +42,30 @@ def _storage_failed() -> ApiError:
     )
 
 
-@router.get("", response_model=list[AuditLog])
+@router.get("", response_model=AuditListResponse)
 def list_audit_logs(
     event_type: str | None = None,
     recommendation_id: str | None = None,
-    limit: int = Query(default=50, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
     container: ApiContainer = Depends(get_container),
-) -> list[AuditLog]:
+) -> AuditListResponse:
     try:
         with connection_scope(container.settings) as connection:
-            return AuditLogRepository(connection).list(
-                event_type=event_type,
-                recommendation_id=recommendation_id,
-                limit=limit,
-                offset=offset,
+            repository = AuditLogRepository(connection)
+            return AuditListResponse(
+                items=repository.list(
+                    event_type=event_type,
+                    recommendation_id=recommendation_id,
+                    limit=page_size,
+                    offset=(page - 1) * page_size,
+                ),
+                total=repository.count(
+                    event_type=event_type,
+                    recommendation_id=recommendation_id,
+                ),
+                page=page,
+                page_size=page_size,
             )
     except (sqlite3.Error, ValidationError) as exc:
         raise _storage_failed() from exc

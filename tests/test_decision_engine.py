@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from quantitative_trading.account.models import (
     AccountSnapshot,
     AccountSnapshotStatus,
@@ -230,3 +232,84 @@ def test_existing_holding_uses_add_action_when_entry_plan_confirms() -> None:
 
     assert recommendation.action is RecommendationAction.ADD
     assert recommendation.position_constraint["suggested_quantity"] > 0
+
+
+@pytest.mark.parametrize(
+    "status_override",
+    [
+        {"trading_status": "unknown"},
+        {"limit_status": "unknown"},
+    ],
+)
+def test_unknown_tradeability_fields_block_non_holding_buy(
+    status_override: dict[str, str],
+) -> None:
+    recommendation = decide_symbol(
+        decision_input(data_quality="degraded", **status_override),
+        account_snapshot=account_snapshot(),
+        risk_config=RiskConfig(),
+        risk_context=RiskContext(proposed_value=8_000, liquidity_amount=2_000_000),
+        recommendation_id="rec-unknown-entry",
+        created_at=NOW,
+    )
+
+    assert recommendation.action is RecommendationAction.WATCH
+    assert "tradeability_unknown" in recommendation.risk["machine_reason"]
+    assert any("交易状态" in reason for reason in recommendation.reason)
+
+
+@pytest.mark.parametrize(
+    "status_override",
+    [
+        {"trading_status": "unknown"},
+        {"limit_status": "unknown"},
+    ],
+)
+def test_unknown_tradeability_fields_block_holding_add(
+    status_override: dict[str, str],
+) -> None:
+    recommendation = decide_symbol(
+        decision_input(
+            is_holding=True,
+            data_quality="degraded",
+            position_context={
+                "source": "manual_ledger",
+                "quantity": 1000,
+                "available_quantity": 1000,
+                "market_value": 10000,
+            },
+            **status_override,
+        ),
+        account_snapshot=account_snapshot(),
+        risk_config=RiskConfig(),
+        risk_context=RiskContext(proposed_value=5_000, liquidity_amount=2_000_000),
+        recommendation_id="rec-unknown-add",
+        created_at=NOW,
+    )
+
+    assert recommendation.action is RecommendationAction.HOLD
+    assert "tradeability_unknown" in recommendation.risk["machine_reason"]
+
+
+def test_holding_risk_action_at_price_limit_warns_execution_may_fail() -> None:
+    recommendation = decide_symbol(
+        decision_input(
+            is_holding=True,
+            current_price=9.2,
+            limit_status="down",
+            position_context={
+                "source": "manual_ledger",
+                "quantity": 1000,
+                "available_quantity": 1000,
+                "market_value": 9200,
+            },
+        ),
+        account_snapshot=account_snapshot(),
+        risk_config=RiskConfig(),
+        risk_context=RiskContext(),
+        recommendation_id="rec-limit-risk",
+        created_at=NOW,
+    )
+
+    assert recommendation.action is RecommendationAction.SELL
+    assert any("可能无法成交" in reason for reason in recommendation.reason)

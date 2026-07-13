@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from quantitative_trading.api.dependencies import (
     ApiContainer,
@@ -14,6 +14,8 @@ from quantitative_trading.api.dependencies import (
     require_token,
 )
 from quantitative_trading.api.errors import ApiError
+from quantitative_trading.audit.repository import AuditLogRepository
+from quantitative_trading.audit.service import AuditService
 from quantitative_trading.feedback.models import ExecutionFeedback, ExecutionFeedbackInput
 from quantitative_trading.feedback.repository import FeedbackRepository
 from quantitative_trading.feedback.service import FeedbackService
@@ -26,6 +28,13 @@ router = APIRouter(
     tags=["feedback"],
     dependencies=[Depends(require_token)],
 )
+
+
+class FeedbackListResponse(BaseModel):
+    items: list[ExecutionFeedback]
+    total: int
+    page: int
+    page_size: int
 
 
 def _current_time() -> datetime:
@@ -58,6 +67,16 @@ def record_feedback(
                     connection,
                     recommendation_id=feedback.recommendation_id,
                 )
+                AuditService(AuditLogRepository(connection)).record_event(
+                    event_type="feedback.recorded",
+                    recommendation_id=feedback.recommendation_id,
+                    payload={
+                        "feedback_id": feedback.feedback_id,
+                        "executed": feedback.executed,
+                    },
+                    now=feedback.created_at,
+                    commit=False,
+                )
                 connection.commit()
                 return feedback
             except (sqlite3.Error, ValidationError):
@@ -67,17 +86,25 @@ def record_feedback(
         raise _feedback_storage_failed() from exc
 
 
-@router.get("", response_model=list[ExecutionFeedback])
+@router.get("", response_model=FeedbackListResponse)
 def list_feedback(
     recommendation_id: Annotated[str | None, Query(min_length=1)] = None,
-    limit: Annotated[int, Query(gt=0, le=200)] = 50,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(gt=0, le=200)] = 50,
     container: ApiContainer = Depends(get_container),
-) -> list[ExecutionFeedback]:
+) -> FeedbackListResponse:
     try:
         with connection_scope(container.settings) as connection:
-            return FeedbackService(FeedbackRepository(connection)).list(
-                recommendation_id=recommendation_id,
-                limit=limit,
+            repository = FeedbackRepository(connection)
+            return FeedbackListResponse(
+                items=repository.list(
+                    recommendation_id=recommendation_id,
+                    limit=page_size,
+                    offset=(page - 1) * page_size,
+                ),
+                total=repository.count(recommendation_id=recommendation_id),
+                page=page,
+                page_size=page_size,
             )
     except (sqlite3.Error, ValidationError) as exc:
         raise _feedback_storage_failed() from exc

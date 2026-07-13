@@ -50,6 +50,7 @@ class PlanSymbolContext(BaseModel):
     sources: list[str] = Field(min_length=1)
     is_holding: bool
     trend: dict[str, Any] = Field(default_factory=dict)
+    daily_feature_facts: dict[str, dict[str, Any]] = Field(default_factory=dict)
     volume_price: dict[str, Any] = Field(default_factory=dict)
     money_flow: dict[str, Any] = Field(default_factory=dict)
     conditions: list[PlanCondition] = Field(default_factory=list)
@@ -83,6 +84,7 @@ class MarketPlanSymbolInput(BaseModel):
     is_holding: bool
     current_price: float = Field(gt=0, allow_inf_nan=False)
     daily_features: dict[str, Any]
+    daily_feature_facts: dict[str, dict[str, Any]] = Field(default_factory=dict)
     market_structure: dict[str, Any]
     money_flow: dict[str, Any]
     data_quality: PlanDataQuality

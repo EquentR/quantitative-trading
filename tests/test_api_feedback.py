@@ -4,6 +4,7 @@ import sqlite3
 from fastapi.testclient import TestClient
 
 from quantitative_trading.api.app import create_app
+from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.config import Settings
 from quantitative_trading.notification.models import NotificationStatus, NotificationSummary
 from quantitative_trading.notification.repository import NotificationRepository
@@ -109,11 +110,21 @@ def test_post_feedback_records_manual_execution_without_mutating_ledgers(tmp_pat
     assert cash_after == original_cash
     assert transactions_after == original_transactions
     assert list_response.status_code == 200
-    assert [item["recommendation_id"] for item in list_response.json()] == ["rec-1"]
+    assert [item["recommendation_id"] for item in list_response.json()["items"]] == [
+        "rec-1"
+    ]
+    assert list_response.json()["total"] == 1
     with connect(settings) as connection:
         notification = NotificationRepository(connection).get("notif-1")
+        audits = AuditLogRepository(connection).list_recent(limit=20)
     assert notification is not None
     assert notification.status is NotificationStatus.FEEDBACK_RECORDED
+    feedback_audit = next(item for item in audits if item.event_type == "feedback.recorded")
+    assert feedback_audit.recommendation_id == "rec-1"
+    assert feedback_audit.payload == {
+        "feedback_id": body["feedback_id"],
+        "executed": True,
+    }
 
 
 def test_post_feedback_rolls_back_when_notification_update_fails(
@@ -140,7 +151,12 @@ def test_post_feedback_rolls_back_when_notification_update_fails(
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
     assert list_response.status_code == 200
-    assert list_response.json() == []
+    assert list_response.json() == {
+        "items": [],
+        "total": 0,
+        "page": 1,
+        "page_size": 50,
+    }
     with connect(settings) as connection:
         notification = NotificationRepository(connection).get("notif-1")
     assert notification is not None

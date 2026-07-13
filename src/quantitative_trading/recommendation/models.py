@@ -84,6 +84,15 @@ class Recommendation(BaseModel):
     run_id: int | str | None = None
     market_input_snapshot_id: int | None = Field(default=None, gt=0)
     plan_id: str | None = None
+    plan_version: int | str | None = None
+    decision_cycle: str | None = Field(default=None, min_length=1)
+    condition_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    dedup_key: str | None = Field(default=None, min_length=1, max_length=500)
+    audit_id: str | None = Field(default=None, min_length=1)
+    condition_context: dict[str, Any] = Field(default_factory=dict)
     data_references: dict[str, dict[str, Any]] = Field(
         default_factory=_missing_data_references
     )
@@ -120,6 +129,15 @@ class Recommendation(BaseModel):
             raise ValueError("run_id integer must be positive")
         if isinstance(value, str) and not value.strip():
             raise ValueError("run_id cannot be blank")
+        return value
+
+    @field_validator("plan_version")
+    @classmethod
+    def plan_version_must_be_valid(cls, value: int | str | None) -> int | str | None:
+        if isinstance(value, int) and value <= 0:
+            raise ValueError("plan_version integer must be positive")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("plan_version cannot be blank")
         return value
 
     @model_validator(mode="after")

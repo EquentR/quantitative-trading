@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     log_dir: Path = Field(default=Path("data/logs"))
     market_provider: str = Field(default="akshare")
     intraday_interval_seconds: int = Field(default=180, ge=1)
+    market_stale_trading_minutes: int = Field(default=6, ge=1, le=60)
     timezone: str = Field(default="Asia/Shanghai")
     enable_market_fetch: bool = Field(default=True)
     api_host: str = Field(default="0.0.0.0")

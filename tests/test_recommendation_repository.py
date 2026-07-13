@@ -1,6 +1,7 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from quantitative_trading.config import Settings
+from quantitative_trading.recommendation.identity import with_recommendation_identity
 from quantitative_trading.recommendation.models import Recommendation, RecommendationAction
 from quantitative_trading.recommendation.repository import RecommendationRepository
 from quantitative_trading.storage.sqlite import connect, migrate
@@ -85,3 +86,86 @@ def test_save_many_can_participate_in_caller_transaction(tmp_path) -> None:
         connection.rollback()
 
         assert repository.get("rec-rollback") is None
+
+
+def test_same_cycle_reuses_identical_recommendation_but_keeps_material_change(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "recommendation-identity.db")
+    period_start = datetime(2026, 7, 13, 2, 30, tzinfo=UTC)
+    original = recommendation(
+        "temporary-id",
+        "600000",
+        RecommendationAction.WATCH,
+        data_time=NOW,
+    ).model_copy(
+        update={
+            "condition_context": {
+                "plan_conditions": ["price_above_support"],
+                "evaluation": ["matched"],
+            }
+        }
+    )
+    identical = original.model_copy(update={"recommendation_id": "another-temporary-id"})
+    changed = original.model_copy(
+        update={
+            "recommendation_id": "changed-temporary-id",
+            "risk": {
+                **original.risk,
+                "invalid_if": ["跌破更新后的计划支撑位"],
+            },
+        }
+    )
+
+    original = with_recommendation_identity(
+        original,
+        trade_date=date(2026, 7, 13),
+        period_start=period_start,
+        plan_version=2,
+    )
+    identical = with_recommendation_identity(
+        identical,
+        trade_date=date(2026, 7, 13),
+        period_start=period_start,
+        plan_version=2,
+    )
+    changed = with_recommendation_identity(
+        changed,
+        trade_date=date(2026, 7, 13),
+        period_start=period_start,
+        plan_version=2,
+    )
+
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = RecommendationRepository(connection)
+        saved = repository.save_many(
+            [original, identical, changed],
+            created_at=NOW,
+        )
+
+        assert repository.count(symbol="600000") == 2
+        assert original.recommendation_id == identical.recommendation_id
+        assert changed.recommendation_id != original.recommendation_id
+        assert changed.condition_fingerprint != original.condition_fingerprint
+        assert [item.recommendation_id for item in saved] == [
+            original.recommendation_id,
+            original.recommendation_id,
+            changed.recommendation_id,
+        ]
+
+
+def test_recommendation_identity_aligns_to_three_minute_cycle() -> None:
+    identified = with_recommendation_identity(
+        recommendation(
+            "temporary-id",
+            "600000",
+            RecommendationAction.WATCH,
+            data_time=NOW,
+        ),
+        trade_date=date(2026, 7, 13),
+        period_start=datetime(2026, 7, 13, 2, 32, 59, tzinfo=UTC),
+        plan_version=1,
+    )
+
+    assert identified.decision_cycle == "2026-07-13T02:30:00+00:00"

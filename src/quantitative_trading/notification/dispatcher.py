@@ -13,6 +13,7 @@ from quantitative_trading.email.models import EmailDelivery
 from quantitative_trading.email.outbox import EmailDeliveryService
 from quantitative_trading.email.service import SmtpSettingsService
 from quantitative_trading.notification.jsonl import JsonlNotificationWriter
+from quantitative_trading.notification.local_alert import LocalAlertDispatcher
 from quantitative_trading.notification.models import NotificationSummary
 from quantitative_trading.notification.service import NotificationService
 from quantitative_trading.recommendation.models import Recommendation, RecommendationAction
@@ -51,12 +52,18 @@ class NotificationDispatcher:
         jsonl_writer: JsonlNotificationWriter,
         email_service: EmailDeliveryService,
         smtp_settings_service: SmtpSettingsService,
+        local_alert_dispatcher: LocalAlertDispatcher | None = None,
     ) -> None:
         self.notification_service = notification_service
         self.audit_service = audit_service
         self.jsonl_writer = jsonl_writer
         self.email_service = email_service
         self.smtp_settings_service = smtp_settings_service
+        self.local_alert_dispatcher = local_alert_dispatcher or LocalAlertDispatcher(
+            notification_service=notification_service,
+            audit_service=audit_service,
+            jsonl_writer=jsonl_writer,
+        )
 
     def dispatch_recommendation(
         self,
@@ -222,23 +229,24 @@ class NotificationDispatcher:
         now: datetime | None = None,
     ) -> EmailDelivery | None:
         dispatched_at = now or datetime.now(UTC)
+        notification = self.local_alert_dispatcher.dispatch(
+            alert_key=alert_key,
+            event_type=event_type,
+            message=message,
+            details=details,
+            now=dispatched_at,
+        )
         dedup_key = f"email:system-alert:{alert_key}"
         existing = self.email_service.get_by_dedup_key(dedup_key)
         if existing is not None:
             return existing
-        audit = self.audit_service.record_event(
-            event_type=event_type,
-            recommendation_id=None,
-            payload={"alert_key": alert_key, "message": message, "details": details or {}},
-            now=dispatched_at,
-        )
         recipient = self.smtp_settings_service.delivery_recipient()
         if recipient is None:
             return None
         try:
             return self.email_service.enqueue(
                 dedup_key=dedup_key,
-                notification_id=None,
+                notification_id=notification.notification_id,
                 recipient=recipient,
                 subject=f"Critical system alert: {event_type}",
                 body=message,
@@ -246,7 +254,7 @@ class NotificationDispatcher:
                     "alert_key": alert_key,
                     "event_type": event_type,
                     "details": details or {},
-                    "audit_id": audit.audit_id,
+                    "audit_id": notification.audit_id,
                 },
                 now=dispatched_at,
             )

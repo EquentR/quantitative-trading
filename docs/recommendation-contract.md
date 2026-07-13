@@ -156,25 +156,28 @@
 
 ## 5. HTTP API 契约
 
-建议 API 使用与 CLI 相同的核心逻辑：
+建议 API 只读取统一 `DecisionWorkflow` 已经保存的建议：
 
 ```text
-POST /api/v1/recommendations/scan
-GET /api/v1/recommendations
+GET /api/v1/recommendations?page=1&page_size=20
 GET /api/v1/recommendations/{recommendation_id}
 GET /api/v1/recommendations/{recommendation_id}/trace
 ```
 
-`POST /scan` 返回：
+列表统一返回分页封装：
 
 ```json
 {
-  "count": 0,
-  "recommendations": []
+  "items": [],
+  "total": 0,
+  "page": 1,
+  "page_size": 20
 }
 ```
 
-`recommendations` 数组中的每一项必须满足本文定义的建议模型。对于非持仓买入侧，最新计划不存在时返回或降级为稳定的计划门禁结果；计划不可消费时必须保留 `plan_id`、`status` 和 `valid_until`。持仓风险例外不能被计划错误整体阻断。列表接口返回稳定排序和分页结果，详情接口按 `recommendation_id` 返回单条建议，trace 接口解析实际输入和审计引用。
+`items` 中每一项必须满足本文定义的建议模型。对于非持仓买入侧，最新计划不存在时返回或降级为稳定的计划门禁结果；计划不可消费时必须保留 `plan_id`、`status` 和 `valid_until`。持仓风险例外不能被计划错误整体阻断。列表接口使用稳定排序，详情接口按 `recommendation_id` 返回单条建议，trace 接口解析实际输入和审计引用。
+
+旧 `POST /api/v1/recommendations/scan` 已退役，认证请求固定返回 HTTP `410`、错误码 `recommendation_scan_retired` 和盘中工作流替代地址，不采集数据也不写建议。旧 `qt recommendations scan` 同样以非零状态退出；手动生成盘中建议只能使用认证的 `POST /api/v1/service/workflows/intraday/run` 或 `qt workflow intraday`，两者与后台调度共享 `DecisionWorkflow`。
 
 ## 6. 通知与反馈状态
 
@@ -188,9 +191,9 @@ GET /api/v1/recommendations/{recommendation_id}/trace
 
 人工执行反馈字段为 `recommendation_id`、`executed`、`execution_price`、`execution_quantity`、`note` 和 `created_at`。反馈写入后可以把同一建议关联通知标记为 `feedback_recorded`，但不得修改手动持仓台账、手动资金账户、现金余额、净本金或账户快照。反馈只用于复盘和策略改进，不代表系统确认真实成交。
 
-通知和审计读取路由是稳定 API：通知支持列表、未读数和标记已读，审计支持列表和按 ID 查询。通知去重键包含交易日、标的、动作、计划版本和条件指纹；相同条件不重复创建，实质变化允许新通知。
+通知和审计读取路由是稳定 API：通知支持列表、未读数和标记已读，审计支持列表和按 ID 查询；所有列表统一返回 `{items,total,page,page_size}`。通知去重键包含交易日、标的、动作、计划版本和条件指纹；相同条件不重复创建，实质变化允许新通知。
 
-`buy/add/sell/reduce` 在本地通知成功后立即写入邮件 outbox；`hold/watch/avoid` 只在收盘计划发布后进入同一活动计划版本的一封每日摘要。邮件失败独立重试，不得回滚建议、通知或重跑 `DecisionWorkflow`。通知、邮件和审计中的错误只能保存经过清理的安全摘要。
+`buy/add/sell/reduce` 在本地通知成功后立即写入邮件 outbox；`hold/watch/avoid` 只在收盘计划发布后进入同一活动计划版本的一封每日摘要。关键工作流故障先创建数据库通知并投射到 Web/API、控制台和 JSONL，SMTP 可用时再进入邮件 outbox；SMTP 不可用不得压制本地告警。邮件达到最大尝试次数成为 `dead` 时生成去重的本地系统告警，同样可在 Web 查看并写控制台和 JSONL。邮件失败独立重试，不得回滚建议、通知或重跑 `DecisionWorkflow`。通知、邮件和审计中的错误只能保存经过清理的安全摘要。
 
 ## 7. 日志要求
 

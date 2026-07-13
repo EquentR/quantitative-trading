@@ -84,8 +84,8 @@ def test_notifications_api_supports_auth_pagination_filters_and_unread_count(tmp
             "status": "unread",
             "symbol": "600000",
             "recommendation_id": "rec-1",
-            "limit": 1,
-            "offset": 1,
+            "page": 2,
+            "page_size": 1,
         },
         headers=headers,
     )
@@ -93,7 +93,13 @@ def test_notifications_api_supports_auth_pagination_filters_and_unread_count(tmp
 
     assert unauthorized.status_code == 401
     assert response.status_code == 200
-    assert [item["notification_id"] for item in response.json()] == ["notif-1"]
+    assert [item["notification_id"] for item in response.json()["items"]] == ["notif-1"]
+    assert response.json() | {"items": []} == {
+        "items": [],
+        "total": 2,
+        "page": 2,
+        "page_size": 1,
+    }
     assert unread.status_code == 200
     assert unread.json() == {"count": 2}
 
@@ -165,14 +171,20 @@ def test_audit_api_supports_stable_pagination_and_filters(tmp_path) -> None:
         params={
             "event_type": "notification.created",
             "recommendation_id": "rec-1",
-            "limit": 1,
-            "offset": 1,
+            "page": 2,
+            "page_size": 1,
         },
         headers=headers,
     )
     detail = client.get("/api/v1/audit/audit-2", headers=headers)
 
     assert response.status_code == 200
-    assert [item["audit_id"] for item in response.json()] == ["audit-1"]
+    assert [item["audit_id"] for item in response.json()["items"]] == ["audit-1"]
+    assert response.json() | {"items": []} == {
+        "items": [],
+        "total": 2,
+        "page": 2,
+        "page_size": 1,
+    }
     assert detail.status_code == 200
     assert detail.json()["audit_id"] == "audit-2"

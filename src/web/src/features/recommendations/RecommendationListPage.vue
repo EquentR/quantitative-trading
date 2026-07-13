@@ -1,18 +1,29 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ScanLine } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
 import Alert from '@/components/ui/Alert.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
 import RecommendationStatusBadge from '@/components/domain/RecommendationStatusBadge.vue'
 import RecommendationDetailDrawer from './RecommendationDetailDrawer.vue'
-import { useRecommendationsQuery, useScanRecommendationsMutation } from '@/queries/recommendations'
+import { useRecommendationQuery, useRecommendationsQuery } from '@/queries/recommendations'
 import { useNotificationsQuery } from '@/queries/notifications'
+import { useRunIntradayWorkflowMutation } from '@/queries/service'
 import type { Recommendation, NotificationProcessingStatus } from '@/api/types'
 
+const route = useRoute()
+const router = useRouter()
 const recommendationsQuery = useRecommendationsQuery()
 const notificationsQuery = useNotificationsQuery()
-const scanMutation = useScanRecommendationsMutation()
+const scanMutation = useRunIntradayWorkflowMutation()
+const requestedRecommendationId = computed(() => {
+  const value = Array.isArray(route.query.recommendation_id)
+    ? route.query.recommendation_id[0]
+    : route.query.recommendation_id
+  return typeof value === 'string' && value ? value : null
+})
+const requestedRecommendationQuery = useRecommendationQuery(requestedRecommendationId)
 
 const recommendations = computed(() => recommendationsQuery.data.value ?? [])
 const notifications = computed(() => notificationsQuery.data.value ?? [])
@@ -39,23 +50,40 @@ const filteredRecommendations = computed(() => {
 })
 
 const scanError = ref(false)
+const scanMessage = ref('')
 
 const selectedId = ref<string | null>(null)
 const selectedRecommendation = computed(
-  () => recommendations.value.find((r) => r.recommendation_id === selectedId.value) ?? null,
+  () => recommendations.value.find((r) => r.recommendation_id === selectedId.value)
+    ?? (requestedRecommendationQuery.data.value?.recommendation_id === selectedId.value
+      ? requestedRecommendationQuery.data.value
+      : null),
 )
+
+watch(requestedRecommendationId, (recommendationId) => {
+  selectedId.value = recommendationId
+}, { immediate: true })
 
 function openDetail(id: string) {
   selectedId.value = id
+  void router.replace({ query: { ...route.query, recommendation_id: id } })
 }
 function closeDetail() {
   selectedId.value = null
+  if (route.query.recommendation_id === undefined) return
+  const query = { ...route.query }
+  delete query.recommendation_id
+  void router.replace({ query })
 }
 
 async function onScan() {
   scanError.value = false
+  scanMessage.value = ''
   try {
-    await scanMutation.mutateAsync()
+    const result = await scanMutation.mutateAsync()
+    scanMessage.value = result.recommendation_ids.length
+      ? `盘中工作流已生成 ${result.recommendation_ids.length} 条建议`
+      : '盘中工作流完成，本轮没有新建议'
   } catch {
     scanError.value = true
   }
@@ -91,6 +119,7 @@ function keyPriceText(r: Recommendation): string {
     <Alert v-if="scanError" variant="danger" data-testid="scan-error-alert">
       扫描建议失败，请稍后重试或检查后端服务状态。
     </Alert>
+    <p v-if="scanMessage" class="text-sm text-emerald-700" role="status">{{ scanMessage }}</p>
 
     <div v-if="showFilter" class="flex items-center gap-2 text-sm">
       <label for="rec-status-filter" class="whitespace-nowrap">处理状态筛选</label>

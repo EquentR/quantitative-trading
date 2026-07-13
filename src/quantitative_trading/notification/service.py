@@ -75,6 +75,43 @@ class NotificationService:
                 raise
             return existing
 
+    def create_system_alert(
+        self,
+        *,
+        alert_key: str,
+        message: str,
+        audit_ref: AuditLog,
+        dedup_key: str,
+        now: datetime | None = None,
+    ) -> NotificationSummary:
+        existing = self.repository.get_by_dedup_key(dedup_key)
+        if existing is not None:
+            return existing
+        created_at = now or datetime.now(UTC)
+        summary = NotificationSummary(
+            notification_id=self._id_factory(),
+            dedup_key=dedup_key,
+            recommendation_id=f"system-alert:{alert_key}",
+            symbol="000000",
+            action="system_alert",
+            confidence="critical",
+            key_price=None,
+            reason=[message],
+            risk=["Review the service state and audit details before retrying."],
+            data_time=created_at,
+            audit_id=audit_ref.audit_id,
+            status=NotificationStatus.UNREAD,
+            created_at=created_at,
+        )
+        try:
+            return self.repository.save(summary)
+        except sqlite3.IntegrityError:
+            self.repository.connection.rollback()
+            existing = self.repository.get_by_dedup_key(dedup_key)
+            if existing is None:
+                raise
+            return existing
+
     def mark_read(
         self,
         notification_id: str,

@@ -1,6 +1,8 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 from quantitative_trading.audit.repository import AuditLogRepository
+from quantitative_trading.audit.service import AuditService
 from quantitative_trading.config import Settings
 from quantitative_trading.email.models import (
     EmailDeliveryStatus,
@@ -11,7 +13,10 @@ from quantitative_trading.email.outbox import EmailDeliveryRepository, EmailDeli
 from quantitative_trading.email.repository import SmtpSettingsRepository
 from quantitative_trading.email.service import SmtpSettingsService
 from quantitative_trading.notification.models import NotificationSummary
+from quantitative_trading.notification.local_alert import LocalAlertDispatcher
+from quantitative_trading.notification.jsonl import JsonlNotificationWriter
 from quantitative_trading.notification.repository import NotificationRepository
+from quantitative_trading.notification.service import NotificationService
 from quantitative_trading.storage.sqlite import connect, migrate
 
 
@@ -156,11 +161,14 @@ def test_outbox_claim_is_atomic_across_connections_and_recovers_expired_lease(tm
         assert recovered[0].status is EmailDeliveryStatus.SENDING
 
 
-def test_outbox_failure_uses_exact_backoff_then_dead_without_raising(tmp_path) -> None:
-    settings = Settings(database_path=tmp_path / "retry.db")
+def test_outbox_failure_uses_exact_backoff_then_dead_and_alerts_locally(
+    tmp_path,
+    caplog,
+) -> None:
+    settings = Settings(database_path=tmp_path / "retry.db", log_dir=tmp_path / "logs")
     sender = RecordingSender(
         error=RuntimeError(
-            "SMTP failed password=synthetic-password token=synthetic-token /tmp/mail.log"
+            "SMTP failed synthetic-password token=synthetic-token /tmp/mail.log"
         )
     )
     with connect(settings) as connection:
@@ -168,12 +176,25 @@ def test_outbox_failure_uses_exact_backoff_then_dead_without_raising(tmp_path) -
         seed_notification(connection)
         configure_smtp(connection)
         repository = EmailDeliveryRepository(connection)
+        audit_repository = AuditLogRepository(connection)
+        local_alert_dispatcher = LocalAlertDispatcher(
+            notification_service=NotificationService(NotificationRepository(connection)),
+            audit_service=AuditService(
+                audit_repository,
+                configured_secret_texts=("synthetic-password",),
+            ),
+            jsonl_writer=JsonlNotificationWriter(
+                settings,
+                configured_secret_texts=("synthetic-password",),
+            ),
+        )
         service = EmailDeliveryService(
             repository,
             SmtpSettingsRepository(connection),
             sender,
             id_factory=lambda: "delivery-1",
-            audit_repository=AuditLogRepository(connection),
+            audit_repository=audit_repository,
+            dead_delivery_alert=local_alert_dispatcher.dispatch_dead_email,
         )
         enqueue(service)
 
@@ -188,7 +209,8 @@ def test_outbox_failure_uses_exact_backoff_then_dead_without_raising(tmp_path) -
             assert delivery.next_attempt_at == current + timedelta(minutes=delay_minutes)
             current = delivery.next_attempt_at
 
-        service.process_due(now=current)
+        with caplog.at_level("ERROR"):
+            service.process_due(now=current)
         delivery = repository.get("delivery-1")
 
         assert delivery.status is EmailDeliveryStatus.DEAD
@@ -207,6 +229,20 @@ def test_outbox_failure_uses_exact_backoff_then_dead_without_raising(tmp_path) -
         )
         assert dead_audit.payload["delivery_id"] == "delivery-1"
         assert "synthetic-password" not in dead_audit.model_dump_json()
+        notifications = NotificationRepository(connection).list_recent(limit=20)
+        assert len(notifications) == 2
+        alert = next(item for item in notifications if item.action == "system_alert")
+        assert alert.reason == ["Email delivery permanently failed"]
+        records = (settings.log_dir / "notifications.jsonl").read_text().splitlines()
+        assert len(records) == 1
+        record = json.loads(records[0])
+        assert record["summary"]["notification_id"] == alert.notification_id
+        assert record["system_alert"]["event_type"] == "email.delivery.dead"
+        assert "email.delivery.dead" in caplog.text
+        local_outputs = "\n".join(records + [caplog.text]).lower()
+        assert "synthetic-password" not in local_outputs
+        assert "synthetic-token" not in local_outputs
+        assert "/tmp/mail.log" not in local_outputs
 
 
 def test_outbox_success_marks_sent(tmp_path) -> None:
@@ -234,3 +270,40 @@ def test_outbox_success_marks_sent(tmp_path) -> None:
         assert delivery.sent_at == NOW
         assert delivery.last_error == ""
         assert sender.calls == ["Trade decision"]
+
+
+def test_dead_delivery_remains_dead_when_local_alert_projection_fails(
+    tmp_path,
+    caplog,
+) -> None:
+    settings = Settings(database_path=tmp_path / "dead-alert-failure.db")
+    sender = RecordingSender(error=RuntimeError("SMTP unavailable synthetic-password"))
+
+    def failing_alert(**kwargs) -> None:  # noqa: ANN003
+        del kwargs
+        raise OSError("alert path unavailable synthetic-password /tmp/alerts.log")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_notification(connection)
+        configure_smtp(connection)
+        repository = EmailDeliveryRepository(connection)
+        service = EmailDeliveryService(
+            repository,
+            SmtpSettingsRepository(connection),
+            sender,
+            id_factory=lambda: "delivery-1",
+            retry_delays_minutes=(),
+            audit_repository=AuditLogRepository(connection),
+            dead_delivery_alert=failing_alert,
+        )
+        enqueue(service)
+
+        with caplog.at_level("ERROR"):
+            processed = service.process_due(now=NOW)
+
+        assert [item.status for item in processed] == [EmailDeliveryStatus.DEAD]
+        assert repository.get("delivery-1").status is EmailDeliveryStatus.DEAD
+        assert "email_dead_local_alert_failed" in caplog.text
+        assert "synthetic-password" not in caplog.text
+        assert "/tmp/alerts.log" not in caplog.text

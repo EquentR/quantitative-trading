@@ -74,6 +74,7 @@ class FeedbackRepository:
         *,
         recommendation_id: str | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> list[ExecutionFeedback]:
         if recommendation_id is None:
             rows = self.connection.execute(
@@ -81,9 +82,9 @@ class FeedbackRepository:
                 SELECT payload_json
                 FROM execution_feedback
                 ORDER BY created_at DESC, rowid DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (limit, offset),
             ).fetchall()
         else:
             rows = self.connection.execute(
@@ -92,8 +93,20 @@ class FeedbackRepository:
                 FROM execution_feedback
                 WHERE recommendation_id = ?
                 ORDER BY created_at DESC, rowid DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (recommendation_id, limit),
+                (recommendation_id, limit, offset),
             ).fetchall()
         return [ExecutionFeedback.model_validate_json(row["payload_json"]) for row in rows]
+
+    def count(self, *, recommendation_id: str | None = None) -> int:
+        if recommendation_id is None:
+            row = self.connection.execute(
+                "SELECT COUNT(*) AS count FROM execution_feedback"
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT COUNT(*) AS count FROM execution_feedback WHERE recommendation_id = ?",
+                (recommendation_id,),
+            ).fetchone()
+        return int(row["count"])

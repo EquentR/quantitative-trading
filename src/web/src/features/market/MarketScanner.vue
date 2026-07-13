@@ -15,18 +15,44 @@ const emit = defineEmits<{
 const actionFilter = ref<'all' | RecommendationAction>('all')
 const sourceFilter = ref<'all' | UniverseSource>('all')
 const anomaliesOnly = ref(false)
+const sortMode = ref<'recommendation' | 'change_desc' | 'symbol'>('recommendation')
 
 const actions: RecommendationAction[] = ['buy', 'sell', 'add', 'reduce', 'hold', 'watch', 'avoid']
+const actionPriority: Record<RecommendationAction, number> = {
+  sell: 0,
+  reduce: 1,
+  buy: 2,
+  add: 3,
+  hold: 4,
+  watch: 5,
+  avoid: 6,
+}
 
-const filteredSymbols = computed(() => props.symbols.filter((item) => {
-  if (actionFilter.value !== 'all' && item.recommendation_action !== actionFilter.value) return false
-  if (sourceFilter.value !== 'all' && !item.sources.includes(sourceFilter.value)) return false
-  if (anomaliesOnly.value) {
-    const healthy = item.quality_status === 'complete' || item.quality_status === 'ok'
-    if (healthy && item.unread_count === 0 && item.warnings.length === 0) return false
-  }
-  return true
-}))
+const filteredSymbols = computed(() => props.symbols
+  .map((item, index) => ({ item, index }))
+  .filter(({ item }) => {
+    if (actionFilter.value !== 'all' && item.recommendation_action !== actionFilter.value) return false
+    if (sourceFilter.value !== 'all' && !item.sources.includes(sourceFilter.value)) return false
+    if (anomaliesOnly.value) {
+      const healthy = item.quality_status === 'complete' || item.quality_status === 'ok'
+      if (healthy && item.unread_count === 0 && item.warnings.length === 0) return false
+    }
+    return true
+  })
+  .sort((left, right) => {
+    let comparison = 0
+    if (sortMode.value === 'recommendation') {
+      comparison = (left.item.recommendation_action === null ? 7 : actionPriority[left.item.recommendation_action])
+        - (right.item.recommendation_action === null ? 7 : actionPriority[right.item.recommendation_action])
+    } else if (sortMode.value === 'change_desc') {
+      comparison = (right.item.change_pct ?? Number.NEGATIVE_INFINITY)
+        - (left.item.change_pct ?? Number.NEGATIVE_INFINITY)
+    } else {
+      comparison = left.item.symbol.localeCompare(right.item.symbol)
+    }
+    return comparison || left.index - right.index
+  })
+  .map(({ item }) => item))
 
 function sourceText(sources: UniverseSource[]): string {
   return sources.map((source) => source === 'holding' ? '持仓' : '自选').join(' / ')
@@ -57,6 +83,17 @@ function formatChange(value: number | null): string {
 <template>
   <div class="flex h-full min-h-0 flex-col" aria-label="决策标的筛选">
     <div class="space-y-2 border-b border-border p-3">
+      <label class="block text-xs font-medium">
+        排序方式
+        <select
+          v-model="sortMode"
+          class="mt-1 block w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
+        >
+          <option value="recommendation">建议动作优先</option>
+          <option value="change_desc">涨跌幅从高到低</option>
+          <option value="symbol">代码升序</option>
+        </select>
+      </label>
       <label class="block text-xs font-medium">
         动作筛选
         <select

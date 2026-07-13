@@ -310,6 +310,9 @@ def test_close_late_run_requires_reason_and_writes_sanitized_audit(
         audits = AuditLogRepository(connection).list(
             event_type="service.workflow.run_requested"
         )
+        rejected = AuditLogRepository(connection).list(
+            event_type="service.workflow.run_rejected"
+        )
     assert len(audits) == 1
     assert audits[0].payload == {
         "workflow_type": "close",
@@ -321,6 +324,9 @@ def test_close_late_run_requires_reason_and_writes_sanitized_audit(
         "manual_reason": "verified late market data",
         "symbols": None,
     }
+    assert len(rejected) == 1
+    assert rejected[0].payload["error_code"] == "manual_reason_required"
+    assert rejected[0].payload["workflow_type"] == "close"
 
 
 def test_close_skip_calendar_and_force_require_reason_and_reach_workflow(
@@ -561,7 +567,7 @@ def test_workflow_failures_return_stable_sanitized_error(
 
     install_clock(monkeypatch, INTRADAY_TIME)
     install_workflow(monkeypatch, FailingWorkflow())
-    client, headers, _settings = authenticated_client(
+    client, headers, settings = authenticated_client(
         tmp_path,
         raise_server_exceptions=False,
     )
@@ -573,6 +579,12 @@ def test_workflow_failures_return_stable_sanitized_error(
     assert "supersecret" not in response.text
     assert "Bearer abc" not in response.text
     assert "/tmp/private" not in response.text
+    with connect(settings) as connection:
+        failed = AuditLogRepository(connection).list(
+            event_type="service.workflow.run_failed"
+        )
+    assert len(failed) == 1
+    assert failed[0].payload["error_code"] == "workflow_run_failed"
 
 
 def test_concurrent_workflow_returns_stable_conflict(tmp_path, monkeypatch) -> None:

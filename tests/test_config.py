@@ -11,6 +11,7 @@ RUNTIME_ENV_NAMES = (
     "QT_LOG_DIR",
     "QT_MARKET_PROVIDER",
     "QT_INTRADAY_INTERVAL_SECONDS",
+    "QT_MARKET_STALE_TRADING_MINUTES",
     "QT_TIMEZONE",
     "QT_ENABLE_MARKET_FETCH",
     "QT_API_HOST",
@@ -36,6 +37,7 @@ def test_settings_defaults_are_local_and_shanghai_time(monkeypatch) -> None:
     assert settings.log_dir == Path("data/logs")
     assert settings.market_provider == "akshare"
     assert settings.intraday_interval_seconds == 180
+    assert settings.market_stale_trading_minutes == 6
     assert settings.timezone == "Asia/Shanghai"
     assert settings.enable_market_fetch is True
 
@@ -53,6 +55,7 @@ def test_load_settings_reads_runtime_environment(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("QT_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("QT_MARKET_PROVIDER", "fake")
     monkeypatch.setenv("QT_INTRADAY_INTERVAL_SECONDS", "60")
+    monkeypatch.setenv("QT_MARKET_STALE_TRADING_MINUTES", "9")
     monkeypatch.setenv("QT_TIMEZONE", "Asia/Shanghai")
     monkeypatch.setenv("QT_ENABLE_MARKET_FETCH", "false")
 
@@ -62,6 +65,7 @@ def test_load_settings_reads_runtime_environment(monkeypatch, tmp_path) -> None:
     assert settings.log_dir == tmp_path / "logs"
     assert settings.market_provider == "fake"
     assert settings.intraday_interval_seconds == 60
+    assert settings.market_stale_trading_minutes == 9
     assert settings.timezone == "Asia/Shanghai"
     assert settings.enable_market_fetch is False
 
@@ -116,6 +120,14 @@ def test_load_settings_rejects_invalid_interval_environment(monkeypatch) -> None
 def test_load_settings_rejects_non_positive_interval_environment(monkeypatch) -> None:
     clear_runtime_environment(monkeypatch)
     monkeypatch.setenv("QT_INTRADAY_INTERVAL_SECONDS", "0")
+
+    with pytest.raises(ValidationError):
+        load_settings()
+
+
+def test_load_settings_rejects_non_positive_stale_threshold(monkeypatch) -> None:
+    clear_runtime_environment(monkeypatch)
+    monkeypatch.setenv("QT_MARKET_STALE_TRADING_MINUTES", "0")
 
     with pytest.raises(ValidationError):
         load_settings()

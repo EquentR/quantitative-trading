@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from quantitative_trading.cash.repository import CashAccountRepository
+from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.config import Settings
 from quantitative_trading.decision.workflow import (
     DecisionWorkflow,
@@ -13,6 +14,8 @@ from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
+    CaptureDataset,
+    CaptureResultStatus,
     DailyBar,
     DailyMoneyFlow,
     CaptureRunStatus,
@@ -29,6 +32,7 @@ from quantitative_trading.market.repositories import (
     MarketCaptureRunRepository,
     MoneyFlowRepository,
     IntradayStrengthSnapshotRepository,
+    MarketCaptureResultRepository,
 )
 from quantitative_trading.market.repository import MarketInputSnapshotRepository
 from quantitative_trading.planning.models import TradingPlanStatus
@@ -158,6 +162,12 @@ class FailingFlowProvider:
         raise RuntimeError("synthetic flow outage")
 
 
+class FailingRecommendationDispatcher:
+    def dispatch_recommendation(self, recommendation, *, plan_version, now):
+        del recommendation, plan_version, now
+        raise RuntimeError("synthetic downstream failure")
+
+
 def seed_account(connection) -> None:
     PositionRepository(connection).add(
         PositionInput(
@@ -227,6 +237,7 @@ def test_close_workflow_builds_traceable_next_day_plan_and_is_idempotent(
         assert market_input.capture_run_id == first.run_id
         assert market_input.history_snapshot_refs["600000"] > 0
         assert market_input.money_flow_snapshot_refs["600000"] > 0
+        assert market_input.data_time == calendar.session(TRADE_DATE).close_at
 
 
 def test_close_workflow_rejects_concurrent_active_run_without_calling_provider(
@@ -541,6 +552,28 @@ class OldIntradayProvider(RisingIntradayProvider):
         return super().get_minute_bars(symbol, trade_date, interval)[:10]
 
 
+class FailingIntradayProvider:
+    def get_minute_bars(self, symbol, trade_date, interval):
+        raise RuntimeError("synthetic minute outage")
+
+
+class TwentyDayDailyProvider(CalendarDailyProvider):
+    def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+        return super().get_daily_bars(symbol, start_date, end_date, adjustment)[-20:]
+
+
+class PartialAccountQuoteProvider(ClockQuoteProvider):
+    def get_quotes(self, symbols):
+        quotes = super().get_quotes(symbols)
+        quotes["000001"] = quotes["000001"].model_copy(
+            update={
+                "status": QuoteStatus.FAILED,
+                "warning": "synthetic quote outage",
+            }
+        )
+        return quotes
+
+
 class RecordingDispatcher:
     def __init__(self) -> None:
         self.calls = []
@@ -659,14 +692,82 @@ def test_intraday_workflow_consumes_plan_and_is_idempotent_per_three_minute_cycl
     assert recommendations[0].run_id == first.run_id
     assert strength is not None
     assert strength.label.value == "strong"
+    assert strength.thresholds["stale_minutes"] == 6
     assert market_input is not None
     assert market_input.intraday_strength_snapshot_refs["600000"] > 0
+    assert market_input.thresholds["stale_trading_minutes"] == 6
     assert len(dispatcher.calls) == 1
     assert run is not None
     assert run.provider_calls == 2
     assert run.recommendation_count == 1
     assert run.notification_count == 1
     assert run.email_outbox_count == 1
+
+
+def test_intraday_retry_keeps_prior_recommendation_when_conditions_change(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-material-change.db")
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(NOW)
+    daily_provider = CalendarDailyProvider(calendar)
+    flow_provider = CalendarFlowProvider(calendar)
+
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=flow_provider,
+            intraday_provider=NoopIntradayProvider(),
+            now=clock.now,
+        ).run_close(TRADE_DATE)
+        clock.value = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
+
+        with pytest.raises(RuntimeError, match="synthetic downstream failure"):
+            DecisionWorkflow(
+                connection,
+                calendar=calendar,
+                quote_provider=ClockQuoteProvider(clock),
+                daily_provider=daily_provider,
+                money_flow_provider=flow_provider,
+                intraday_provider=RisingIntradayProvider(calendar, clock),
+                now=clock.now,
+                notification_dispatcher=FailingRecommendationDispatcher(),
+            ).run_intraday()
+
+        first = RecommendationRepository(connection).list(limit=20)
+        assert len(first) == 1
+        failed_run = MarketCaptureRunRepository(connection).get(
+            "intraday-20260714-1000"
+        )
+        assert failed_run is not None
+        assert failed_run.status is CaptureRunStatus.FAILED
+
+        retried = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=StaleQuoteProvider(),
+            daily_provider=daily_provider,
+            money_flow_provider=flow_provider,
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday()
+        all_recommendations = RecommendationRepository(connection).list(limit=20)
+
+    assert retried.reused is False
+    assert len(all_recommendations) == 2
+    assert all_recommendations[0].action is not all_recommendations[1].action
+    assert all_recommendations[0].recommendation_id != all_recommendations[1].recommendation_id
+    assert {
+        recommendation.audit_id for recommendation in all_recommendations
+    } == {
+        f"audit-{recommendation.recommendation_id}"
+        for recommendation in all_recommendations
+    }
 
 
 def test_intraday_stale_minutes_cannot_confirm_add(tmp_path) -> None:
@@ -694,6 +795,7 @@ def test_intraday_stale_minutes_cannot_confirm_add(tmp_path) -> None:
             money_flow_provider=CalendarFlowProvider(calendar),
             intraday_provider=OldIntradayProvider(calendar, clock),
             now=clock.now,
+            stale_trading_minutes=7,
         )
 
         result = workflow.run_intraday()
@@ -703,10 +805,127 @@ def test_intraday_stale_minutes_cannot_confirm_add(tmp_path) -> None:
         strength = IntradayStrengthSnapshotRepository(connection).latest_for_symbol(
             "600000"
         )
+        assert recommendation is not None
+        assert recommendation.audit_id is not None
+        audit = AuditLogRepository(connection).get(recommendation.audit_id)
 
-    assert recommendation is not None
     assert recommendation.action is not RecommendationAction.ADD
     assert recommendation.data_quality["overall"] == "stale"
+    assert audit is not None
+    assert audit.event_type == "recommendation.generated"
+    assert audit.recommendation_id == recommendation.recommendation_id
     assert strength is not None
     assert strength.degraded is True
-    assert strength.thresholds["stale_minutes"] == 6
+    assert strength.thresholds["stale_minutes"] == 7
+
+
+def test_intraday_failure_persists_minute_and_strength_results(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-failure-results.db")
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=FailingIntradayProvider(),
+            now=clock.now,
+        ).run_intraday()
+        capture_results = MarketCaptureResultRepository(connection).list_for_run(
+            result.run_id
+        )
+
+    failures = {
+        item.dataset: item
+        for item in capture_results
+        if item.status is CaptureResultStatus.FAILED
+    }
+    assert failures.keys() >= {
+        CaptureDataset.MINUTE_BAR,
+        CaptureDataset.INTRADAY_STRENGTH,
+    }
+    assert failures[CaptureDataset.INTRADAY_STRENGTH].actual_rows == 0
+    assert (
+        "synthetic minute outage"
+        in failures[CaptureDataset.INTRADAY_STRENGTH].error_summary
+    )
+
+
+def test_intraday_partial_account_is_reflected_in_holding_recommendation(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-partial-account.db")
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="000001",
+                name="平安银行",
+                quantity=1000,
+                available_quantity=1000,
+                cost_price=9.0,
+                opened_at=date(2026, 7, 1),
+                note="manual",
+            ),
+            now=datetime(2026, 7, 12, 8, 0, tzinfo=UTC),
+        )
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=PartialAccountQuoteProvider(clock),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday()
+        recommendations = [
+            RecommendationRepository(connection).get(recommendation_id)
+            for recommendation_id in result.recommendation_ids
+        ]
+
+    recommendation = next(
+        item for item in recommendations if item is not None and item.symbol == "600000"
+    )
+    assert recommendation.data_references["account"]["status"] == "partial"
+    assert any(
+        "account totals unavailable" in warning
+        for warning in recommendation.data_quality["warnings"]
+    )
+    assert any("账户估值" in note for note in recommendation.risk["notes"])
+
+
+def test_close_plan_is_degraded_when_history_has_only_twenty_bars(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "close-short-history.db")
+    calendar = XSHGTradingCalendar()
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=RecordingQuoteProvider(),
+            daily_provider=TwentyDayDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=NoopIntradayProvider(),
+            now=lambda: NOW,
+        ).run_close(TRADE_DATE)
+        plan = TradingPlanRepository(connection).get(result.plan_id or "")
+
+    assert result.ready is True
+    assert plan is not None
+    assert plan.data_quality == "degraded"
+    assert plan.symbol_contexts["600000"].data_quality == "degraded"
+    feature_facts = plan.symbol_contexts["600000"].daily_feature_facts
+    assert feature_facts["ma60"] == {
+        "value": None,
+        "available": False,
+        "reason": "requires 60 daily bars",
+    }
+    assert any("expected 250 daily bars, got 20" in warning for warning in plan.warnings)

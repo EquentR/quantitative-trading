@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/vue-query'
 import { useApiClient } from '@/api/client-provider'
-import type { ServiceStatus } from '@/api/types'
+import type { ServiceStatus, WorkflowRunResponse } from '@/api/types'
 
 export const serviceStatusQueryKey = ['service', 'status'] as const
 
@@ -39,6 +39,21 @@ export function useRunOnceMutation() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: serviceStatusQueryKey })
       queryClient.invalidateQueries({ queryKey: ['account', 'snapshot'] })
+    },
+  })
+}
+
+export function useRunIntradayWorkflowMutation() {
+  const client = useApiClient()
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => client.post<WorkflowRunResponse>('/service/workflows/intraday/run'),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: serviceStatusQueryKey })
+      queryClient.invalidateQueries({ queryKey: ['recommendations'] })
+      queryClient.invalidateQueries({ queryKey: ['notifications'] })
+      queryClient.invalidateQueries({ queryKey: ['audit'] })
+      queryClient.invalidateQueries({ queryKey: ['market'] })
     },
   })
 }
