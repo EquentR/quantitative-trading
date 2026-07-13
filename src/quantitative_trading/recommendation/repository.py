@@ -3,7 +3,10 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 
-from quantitative_trading.recommendation.models import Recommendation
+from quantitative_trading.recommendation.models import (
+    Recommendation,
+    RecommendationAction,
+)
 
 
 class RecommendationRepository:
@@ -15,6 +18,7 @@ class RecommendationRepository:
         recommendations: list[Recommendation],
         *,
         created_at: datetime,
+        commit: bool = True,
     ) -> list[Recommendation]:
         rows = [
             (
@@ -53,20 +57,75 @@ class RecommendationRepository:
             """,
             rows,
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return recommendations
 
-    def list(self, *, limit: int = 50) -> list[Recommendation]:
+    def list(
+        self,
+        *,
+        symbol: str | None = None,
+        action: RecommendationAction | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Recommendation]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            parameters.append(symbol)
+        if action is not None:
+            clauses.append("action = ?")
+            parameters.append(action.value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.extend((limit, offset))
         rows = self.connection.execute(
+            f"""
+            SELECT payload_json
+            FROM recommendations
+            {where}
+            ORDER BY data_time DESC, created_at DESC, rowid ASC
+            LIMIT ? OFFSET ?
+            """,
+            parameters,
+        ).fetchall()
+        return [Recommendation.model_validate_json(row["payload_json"]) for row in rows]
+
+    def count(
+        self,
+        *,
+        symbol: str | None = None,
+        action: RecommendationAction | None = None,
+    ) -> int:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            parameters.append(symbol)
+        if action is not None:
+            clauses.append("action = ?")
+            parameters.append(action.value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        row = self.connection.execute(
+            f"SELECT COUNT(*) AS count FROM recommendations {where}",
+            parameters,
+        ).fetchone()
+        return int(row["count"])
+
+    def latest_for_symbol(self, symbol: str) -> Recommendation | None:
+        row = self.connection.execute(
             """
             SELECT payload_json
             FROM recommendations
-            ORDER BY created_at DESC, rowid ASC
-            LIMIT ?
+            WHERE symbol = ?
+            ORDER BY data_time DESC, created_at DESC, rowid DESC
+            LIMIT 1
             """,
-            (limit,),
-        ).fetchall()
-        return [Recommendation.model_validate_json(row["payload_json"]) for row in rows]
+            (symbol,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Recommendation.model_validate_json(row["payload_json"])
 
     def get(self, recommendation_id: str) -> Recommendation | None:
         row = self.connection.execute(

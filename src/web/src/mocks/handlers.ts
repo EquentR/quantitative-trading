@@ -14,6 +14,16 @@ import type {
   NotificationSummary,
   AuditLog,
   ExecutionFeedback,
+  DailyBarsResponse,
+  EmailDelivery,
+  EmailNotificationSettings,
+  IntradayStrengthResponse,
+  MarketOverview,
+  MarketCaptureRun,
+  MarketSnapshotTrace,
+  MarketSymbolSummary,
+  MinuteBarsResponse,
+  MoneyFlowResponse,
 } from '@/api/types'
 
 const now = '2026-07-07T10:30:00+08:00'
@@ -250,8 +260,253 @@ export const mockExecutionFeedback: ExecutionFeedback[] = [
     created_at: now,
   },
 ]
+
+export const mockMarketSymbols: MarketSymbolSummary[] = [
+  {
+    symbol: '600000',
+    name: '示例银行',
+    sources: ['holding'],
+    current_price: 10.12,
+    change_pct: 1.8,
+    recommendation_action: 'hold',
+    intraday_strength: 'strong',
+    plan_status: 'active',
+    quality_status: 'partial',
+    unread_count: 1,
+    data_time: '2026-07-13T10:21:00+08:00',
+    warnings: ['资金流数据更新较慢'],
+  },
+  {
+    symbol: '600519',
+    name: '示例白酒',
+    sources: ['watch_pinned'],
+    current_price: 1428.5,
+    change_pct: -0.4,
+    recommendation_action: 'watch',
+    intraday_strength: 'neutral',
+    plan_status: 'active',
+    quality_status: 'complete',
+    unread_count: 0,
+    data_time: '2026-07-13T10:21:00+08:00',
+    warnings: [],
+  },
+]
+
+export const mockMarketOverview: MarketOverview = {
+  symbol: '600000',
+  name: '示例银行',
+  snapshot_id: 'snapshot-101',
+  status: 'partial',
+  data_time: '2026-07-13T10:21:00+08:00',
+  fetched_at: '2026-07-13T10:22:00+08:00',
+  warnings: ['资金流数据更新较慢，当前建议已按后端降级规则处理。'],
+  position: {
+    quantity: 1000,
+    available_quantity: 1000,
+    cost_price: 9.5,
+    floating_pnl_pct: 6.5,
+  },
+  plan: {
+    plan_id: 'plan-20260713',
+    status: 'active',
+    allowed_actions: ['hold', 'reduce'],
+    invalid_if: ['跌破 9.70 后计划失效'],
+    valid_until: '2026-07-13T15:00:00+08:00',
+  },
+  recommendation: {
+    recommendation_id: 'rec-600000-001',
+    action: 'hold',
+    confidence: 'medium',
+    reason: ['价格保持在计划支撑位上方', '分时强弱为 strong'],
+    data_time: '2026-07-13T10:21:00+08:00',
+  },
+  market_structure: {
+    support: 9.7,
+    resistance: 10.4,
+    atr14: 0.21,
+    trend: '震荡偏强',
+    reason: '收盘特征显示价格保持在主要均线上方',
+  },
+  intraday_strength: {
+    label: 'strong',
+    confidence: 'medium',
+    degraded_reason: null,
+    components: [
+      {
+        key: 'momentum_15m',
+        label: '15 分钟动量',
+        value: 0.006,
+        status: 'complete',
+        direction: 1,
+        reason: '15 分钟价格动量为正',
+      },
+      {
+        key: 'vwap_position',
+        label: 'VWAP 位置',
+        value: 0.003,
+        status: 'complete',
+        direction: 1,
+        reason: '最新价位于后端 VWAP 上方',
+      },
+    ],
+  },
+  risks: ['行情和资金流可能存在时间差', '跌破 9.70 后计划失效'],
+}
+
+export const mockDailyBars: DailyBarsResponse = {
+  symbol: '600000',
+  adjustment: 'forward',
+  status: 'complete',
+  data_time: '2026-07-13T15:00:00+08:00',
+  fetched_at: '2026-07-13T15:06:00+08:00',
+  warnings: [],
+  bars: [
+    { trade_date: '2026-07-06', open: 9.68, high: 9.88, low: 9.62, close: 9.82, volume: 321000, amount: 3140000, ma5: 9.7, ma10: 9.61, ma20: 9.52, ma60: 9.41 },
+    { trade_date: '2026-07-07', open: 9.81, high: 9.96, low: 9.75, close: 9.91, volume: 356000, amount: 3500000, ma5: 9.76, ma10: 9.65, ma20: 9.55, ma60: 9.43 },
+    { trade_date: '2026-07-08', open: 9.9, high: 10.03, low: 9.84, close: 9.98, volume: 382000, amount: 3790000, ma5: 9.82, ma10: 9.7, ma20: 9.58, ma60: 9.45 },
+    { trade_date: '2026-07-09', open: 9.97, high: 10.12, low: 9.91, close: 10.08, volume: 411000, amount: 4120000, ma5: 9.9, ma10: 9.76, ma20: 9.62, ma60: 9.47 },
+    { trade_date: '2026-07-10', open: 10.06, high: 10.18, low: 10.0, close: 10.1, volume: 436000, amount: 4400000, ma5: 9.98, ma10: 9.81, ma20: 9.66, ma60: 9.49 },
+    { trade_date: '2026-07-13', open: 10.08, high: 10.2, low: 10.02, close: 10.12, volume: 462000, amount: 4670000, ma5: 10.04, ma10: 9.87, ma20: 9.7, ma60: 9.51 },
+  ],
+}
+
+export const mockMoneyFlow: MoneyFlowResponse = {
+  symbol: '600000',
+  status: 'partial',
+  data_time: '2026-07-13T15:00:00+08:00',
+  fetched_at: '2026-07-13T15:08:00+08:00',
+  warnings: ['最近一个交易日的小单数据暂缺'],
+  rows: [
+    { trade_date: '2026-07-09', main_net_amount: -820000, main_net_ratio: -2.7, super_large_net_amount: -410000, super_large_net_ratio: -1.35, large_net_amount: -410000, large_net_ratio: -1.35, medium_net_amount: 260000, medium_net_ratio: 0.85, small_net_amount: 560000, small_net_ratio: 1.85 },
+    { trade_date: '2026-07-10', main_net_amount: 1260000, main_net_ratio: 4.1, super_large_net_amount: 780000, super_large_net_ratio: 2.5, large_net_amount: 480000, large_net_ratio: 1.6, medium_net_amount: -330000, medium_net_ratio: -1.1, small_net_amount: -930000, small_net_ratio: -3 },
+    { trade_date: '2026-07-13', main_net_amount: 1680000, main_net_ratio: 5.2, super_large_net_amount: 920000, super_large_net_ratio: 2.8, large_net_amount: 760000, large_net_ratio: 2.4, medium_net_amount: -460000, medium_net_ratio: -1.4, small_net_amount: -1220000, small_net_ratio: -3.8 },
+  ],
+}
+
+export const mockMinuteBars: MinuteBarsResponse = {
+  symbol: '600000',
+  trade_date: '2026-07-13',
+  status: 'complete',
+  data_time: '2026-07-13T10:21:00+08:00',
+  fetched_at: '2026-07-13T10:22:00+08:00',
+  previous_close: 10.1,
+  warnings: [],
+  bars: [
+    { minute: '09:33', open: 10.08, high: 10.1, low: 10.06, close: 10.09, volume: 32000, amount: 323000, vwap: 10.08 },
+    { minute: '09:48', open: 10.09, high: 10.13, low: 10.08, close: 10.12, volume: 28000, amount: 283000, vwap: 10.09 },
+    { minute: '10:03', open: 10.12, high: 10.14, low: 10.1, close: 10.11, volume: 19000, amount: 192000, vwap: 10.1 },
+    { minute: '10:18', open: 10.11, high: 10.15, low: 10.1, close: 10.14, volume: 35000, amount: 354000, vwap: 10.11 },
+    { minute: '10:21', open: 10.14, high: 10.15, low: 10.11, close: 10.12, volume: 21000, amount: 213000, vwap: 10.11 },
+  ],
+  recommendation_markers: [
+    { time: '10:18', action: 'watch', price: 10.14, recommendation_id: 'rec-600000-001' },
+  ],
+}
+
+export const mockIntradayStrength: IntradayStrengthResponse = {
+  symbol: '600000',
+  status: 'complete',
+  label: 'strong',
+  confidence: 'medium',
+  data_time: '2026-07-13T10:21:00+08:00',
+  fetched_at: '2026-07-13T10:22:00+08:00',
+  coverage_ratio: 1,
+  last_minute: '10:21',
+  degraded_reason: null,
+  rule_version: 'intraday-strength-v1',
+  components: mockMarketOverview.intraday_strength!.components,
+  warnings: [],
+}
+
+export const mockMarketTrace: MarketSnapshotTrace = {
+  symbol: '600000',
+  run_id: 'run-20260713-001',
+  snapshot_id: 'snapshot-101',
+  plan_id: 'plan-20260713',
+  recommendation_id: 'rec-600000-001',
+  data_time: '2026-07-13T10:21:00+08:00',
+  fetched_at: '2026-07-13T10:22:00+08:00',
+  status: 'partial',
+  warnings: ['资金流数据延迟一个采集周期'],
+  datasets: [
+    { dataset: 'quote', reference_id: 'quote-101', status: 'complete', source: 'akshare', data_start: null, data_end: null, data_time: '2026-07-13T10:21:00+08:00', fetched_at: '2026-07-13T10:22:00+08:00', warnings: [] },
+    { dataset: 'history', reference_id: 'daily-101', status: 'complete', source: 'akshare', data_start: '2025-07-08', data_end: '2026-07-13', data_time: '2026-07-13T15:00:00+08:00', fetched_at: '2026-07-13T15:06:00+08:00', warnings: [] },
+    { dataset: 'money_flow', reference_id: 'flow-101', status: 'partial', source: 'akshare', data_start: '2026-04-13', data_end: '2026-07-13', data_time: '2026-07-13T15:00:00+08:00', fetched_at: '2026-07-13T15:08:00+08:00', warnings: ['小单数据暂缺'] },
+    { dataset: 'intraday_strength', reference_id: 'strength-101', status: 'complete', source: 'derived_backend', data_start: '2026-07-13T09:33:00+08:00', data_end: '2026-07-13T10:21:00+08:00', data_time: '2026-07-13T10:21:00+08:00', fetched_at: '2026-07-13T10:22:00+08:00', warnings: [] },
+  ],
+}
+
+export const mockMarketRuns: MarketCaptureRun[] = [
+  {
+    run_id: 'intraday-20260713-1021',
+    workflow_type: 'intraday',
+    trade_date: '2026-07-13',
+    period_start: '2026-07-13T10:21:00+08:00',
+    period_end: null,
+    idempotency_key: 'intraday:2026-07-13:1021',
+    status: 'degraded',
+    started_at: '2026-07-13T10:21:00+08:00',
+    finished_at: '2026-07-13T10:21:01.250+08:00',
+    duration_ms: 1250,
+    requested_symbols: 2,
+    processed_symbols: 2,
+    provider_calls: 3,
+    provider_duration_ms: 820,
+    rows_received: 62,
+    rows_written: 64,
+    cleaned_rows: 0,
+    plan_count: 0,
+    recommendation_count: 2,
+    notification_count: 2,
+    email_outbox_count: 1,
+    retry_count: 0,
+    warning_count: 1,
+    failure_count: 0,
+    error_summary: '',
+  },
+]
+
+export const mockEmailSettings: EmailNotificationSettings = {
+  configured: true,
+  host: 'smtp.test.local',
+  port: 587,
+  username: 'mailer',
+  sender: 'alerts@test.local',
+  recipient: 'owner@test.local',
+  security: 'starttls',
+  enabled: true,
+  password_configured: true,
+  updated_at: '2026-07-13T10:30:00+08:00',
+}
+
+export const mockEmailDeliveries: EmailDelivery[] = [
+  {
+    delivery_id: 'delivery-dead-001',
+    notification_id: 'notif-001',
+    dedup_key: '2026-07-13:rec-600000-001:owner@test.local',
+    recipient: 'owner@test.local',
+    subject: '示例建议通知',
+    body: '不包含凭据的示例邮件正文',
+    payload: { recommendation_id: 'rec-600000-001' },
+    status: 'dead',
+    attempt_count: 6,
+    next_attempt_at: null,
+    lease_expires_at: null,
+    last_error: '连接超时，凭据已隐藏',
+    sent_at: null,
+    created_at: '2026-07-13T10:18:00+08:00',
+    updated_at: '2026-07-13T10:24:00+08:00',
+  },
+]
+
 export const handlers = [
   http.get('/api/v1/service/status', () => HttpResponse.json(mockServiceStatus)),
+  http.get('/api/v1/market/runs', () => HttpResponse.json({
+    items: mockMarketRuns,
+    total: mockMarketRuns.length,
+    page: 1,
+    page_size: 20,
+  })),
   http.post('/api/v1/service/scheduler/start', () =>
     HttpResponse.json({ ...mockServiceStatus, scheduler_enabled: true, scheduler_running: true }),
   ),
@@ -354,4 +609,58 @@ export const handlers = [
       { status: 201 },
     )
   }),
+  http.get('/api/v1/market/symbols', () =>
+    HttpResponse.json({ items: mockMarketSymbols, total: mockMarketSymbols.length }),
+  ),
+  http.get('/api/v1/market/symbols/:symbol/overview', ({ params }) =>
+    HttpResponse.json({
+      ...mockMarketOverview,
+      symbol: String(params.symbol),
+      name: params.symbol === '600519' ? '示例白酒' : mockMarketOverview.name,
+    }),
+  ),
+  http.get('/api/v1/market/symbols/:symbol/daily-bars', ({ params }) =>
+    HttpResponse.json({ ...mockDailyBars, symbol: String(params.symbol) }),
+  ),
+  http.get('/api/v1/market/symbols/:symbol/money-flow', ({ params }) =>
+    HttpResponse.json({ ...mockMoneyFlow, symbol: String(params.symbol) }),
+  ),
+  http.get('/api/v1/market/symbols/:symbol/minute-bars', ({ params }) =>
+    HttpResponse.json({ ...mockMinuteBars, symbol: String(params.symbol) }),
+  ),
+  http.get('/api/v1/market/symbols/:symbol/intraday-strength/latest', ({ params }) =>
+    HttpResponse.json({ ...mockIntradayStrength, symbol: String(params.symbol) }),
+  ),
+  http.get('/api/v1/market/snapshots/:snapshot_id/trace', ({ params, request }) => {
+    const symbol = new URL(request.url).searchParams.get('symbol')
+    if (!symbol) {
+      return HttpResponse.json(
+        { error: { code: 'validation_error', message: 'symbol is required' } },
+        { status: 422 },
+      )
+    }
+    return HttpResponse.json({ ...mockMarketTrace, symbol, snapshot_id: String(params.snapshot_id) })
+  }),
+  http.get('/api/v1/settings/notifications/email', () => HttpResponse.json(mockEmailSettings)),
+  http.put('/api/v1/settings/notifications/email', async ({ request }) => {
+    const body = (await request.json()) as Partial<EmailNotificationSettings> & { password?: string }
+    return HttpResponse.json({
+      ...mockEmailSettings,
+      ...body,
+      password_configured: body.password ? true : mockEmailSettings.password_configured,
+      updated_at: '2026-07-13T10:31:00+08:00',
+      password: undefined,
+    })
+  }),
+  http.delete('/api/v1/settings/notifications/email/password', () =>
+    HttpResponse.json({ ...mockEmailSettings, password_configured: false }),
+  ),
+  http.post('/api/v1/notifications/email/settings/test-connection', () => HttpResponse.json({ status: 'connected' })),
+  http.post('/api/v1/settings/notifications/email/test', () => HttpResponse.json({ status: 'sent' })),
+  http.get('/api/v1/notifications/email-deliveries', () =>
+    HttpResponse.json(mockEmailDeliveries),
+  ),
+  http.post('/api/v1/notifications/email-deliveries/:delivery_id/retry', ({ params }) =>
+    HttpResponse.json({ ...mockEmailDeliveries[0], delivery_id: String(params.delivery_id), status: 'pending' }),
+  ),
 ]

@@ -23,6 +23,13 @@ def build_recommendation(
     valid_until: datetime,
     data_time: datetime,
     position_limit: str = DEFAULT_POSITION_LIMIT_TEXT,
+    created_at: datetime | None = None,
+    run_id: int | str | None = None,
+    market_input_snapshot_id: int | None = None,
+    plan_id: str | None = None,
+    data_references: dict[str, dict[str, Any]] | None = None,
+    data_quality: dict[str, Any] | None = None,
+    position_constraint: dict[str, Any] | None = None,
 ) -> Recommendation:
     final_action = RecommendationAction(risk_decision.action.value)
 
@@ -45,4 +52,12 @@ def build_recommendation(
         },
         valid_until=valid_until,
         data_time=data_time,
+        created_at=created_at or data_time,
+        run_id=run_id,
+        market_input_snapshot_id=market_input_snapshot_id,
+        plan_id=plan_id,
+        data_references=data_references or {},
+        data_quality=data_quality
+        or {"overall": "degraded", "warnings": ["input trace unavailable"]},
+        position_constraint=position_constraint or {"position_limit": position_limit},
     )

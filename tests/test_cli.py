@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -9,7 +9,38 @@ from typer.testing import CliRunner
 
 import quantitative_trading.cli as cli
 from quantitative_trading.cli import app
-from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
+from quantitative_trading.audit.repository import AuditLogRepository
+from quantitative_trading.config import Settings
+from quantitative_trading.email.models import SmtpSecurity, SmtpSettingsUpdate
+from quantitative_trading.email.outbox import (
+    EmailDeliveryRepository,
+    EmailDeliveryService,
+)
+from quantitative_trading.email.repository import SmtpSettingsRepository
+from quantitative_trading.email.service import SmtpSettingsService
+from quantitative_trading.market.calendar import XSHGTradingCalendar
+from quantitative_trading.market.models import (
+    CaptureRunStatus,
+    DailyBar,
+    DailyMoneyFlow,
+    MarketCaptureRun,
+    MinuteBar,
+    QuoteSnapshot,
+    QuoteStatus,
+)
+from quantitative_trading.market.repositories import (
+    MarketCaptureResultRepository,
+    MarketCaptureRunRepository,
+    MinuteBarRepository,
+)
+from quantitative_trading.notification.models import (
+    NotificationStatus,
+    NotificationSummary,
+)
+from quantitative_trading.notification.repository import NotificationRepository
+from quantitative_trading.planning.repository import TradingPlanRepository
+from quantitative_trading.storage.sqlite import connect, migrate
+from tests.planning_fixtures import persist_test_plan
 
 
 runner = CliRunner()
@@ -114,7 +145,10 @@ def test_ledger_import_and_export(tmp_path) -> None:
     assert import_result.exit_code == 0
     assert "已导入 1 条持仓" in import_result.output
     assert export_result.exit_code == 0
-    assert "symbol,name,quantity,available_quantity,cost_price,opened_at,note" in export_result.output
+    assert (
+        "symbol,name,quantity,available_quantity,cost_price,opened_at,note"
+        in export_result.output
+    )
     assert "600000,浦发银行,1000,800,9.5,2026-07-06,首批" in export_result.output
 
 
@@ -196,8 +230,7 @@ def test_watchlist_add_list_update_and_remove(tmp_path) -> None:
 def test_watchlist_import_and_export(tmp_path) -> None:
     csv_path = tmp_path / "watchlist.csv"
     csv_path.write_text(
-        "symbol,name,rank,plan_enabled,note\n"
-        "600000,浦发银行,1,true,观察\n",
+        "symbol,name,rank,plan_enabled,note\n600000,浦发银行,1,true,观察\n",
         encoding="utf-8",
     )
 
@@ -225,8 +258,7 @@ def test_watchlist_import_reports_missing_file_error(tmp_path) -> None:
 def test_watchlist_import_reports_invalid_header_error(tmp_path) -> None:
     csv_path = tmp_path / "watchlist.csv"
     csv_path.write_text(
-        "symbol,name,rank,plan_enabled,note,extra\n"
-        "600000,浦发银行,1,true,观察,x\n",
+        "symbol,name,rank,plan_enabled,note,extra\n600000,浦发银行,1,true,观察,x\n",
         encoding="utf-8",
     )
 
@@ -345,7 +377,9 @@ def test_service_run_polling_passes_interval_timezone_and_uses_snapshot_factory(
     factory_statuses = []
 
     class FakeDebugServiceRunner:
-        def __init__(self, *, snapshot_factory, account_service=None, log_dir=None) -> None:
+        def __init__(
+            self, *, snapshot_factory, account_service=None, log_dir=None
+        ) -> None:
             assert account_service is None
             self.snapshot_factory = snapshot_factory
             self.log_dir = log_dir
@@ -387,7 +421,9 @@ def test_service_run_polling_passes_interval_timezone_and_uses_snapshot_factory(
 
 
 def test_cash_init_show_and_transfer_commands(tmp_path) -> None:
-    init_result = run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
+    init_result = run_cli(
+        tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal"
+    )
     show_result = run_cli(tmp_path, "cash", "show")
     transfer_result = run_cli(
         tmp_path,
@@ -443,7 +479,9 @@ def test_cash_show_reports_not_initialized(tmp_path) -> None:
 
 
 def test_cash_init_rejects_duplicate_initialization_without_traceback(tmp_path) -> None:
-    first_result = run_cli(tmp_path, "cash", "init", "--cash", "1000", "--note", "initial principal")
+    first_result = run_cli(
+        tmp_path, "cash", "init", "--cash", "1000", "--note", "initial principal"
+    )
 
     second_result = run_cli(
         tmp_path,
@@ -479,7 +517,9 @@ def test_cash_transfer_out_rejects_excess_cash(tmp_path) -> None:
     assert "Traceback" not in result.output
 
 
-def test_cash_transfer_out_rejects_amount_above_net_principal_after_adjustment(tmp_path) -> None:
+def test_cash_transfer_out_rejects_amount_above_net_principal_after_adjustment(
+    tmp_path,
+) -> None:
     run_cli(tmp_path, "cash", "init", "--cash", "1000", "--note", "initial principal")
     run_cli(
         tmp_path,
@@ -552,9 +592,33 @@ def test_cash_transactions_lists_recent_cash_events(tmp_path) -> None:
 
 def test_cash_transactions_limit_uses_repository_order(tmp_path) -> None:
     run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
-    run_cli(tmp_path, "cash", "transfer-in", "--amount", "1000", "--note", "bank transfer in")
-    run_cli(tmp_path, "cash", "adjust", "--cash", "52000", "--note", "manual broker correction")
-    run_cli(tmp_path, "cash", "transfer-out", "--amount", "500", "--note", "bank transfer out")
+    run_cli(
+        tmp_path,
+        "cash",
+        "transfer-in",
+        "--amount",
+        "1000",
+        "--note",
+        "bank transfer in",
+    )
+    run_cli(
+        tmp_path,
+        "cash",
+        "adjust",
+        "--cash",
+        "52000",
+        "--note",
+        "manual broker correction",
+    )
+    run_cli(
+        tmp_path,
+        "cash",
+        "transfer-out",
+        "--amount",
+        "500",
+        "--note",
+        "bank transfer out",
+    )
 
     result = run_cli(tmp_path, "cash", "transactions", "--limit", "2")
 
@@ -607,7 +671,9 @@ def test_account_snapshot_with_position_uses_configured_akshare_provider(
                 )
             }
 
-    monkeypatch.setattr(cli, "AkShareMarketProvider", FakeAkShareProvider, raising=False)
+    monkeypatch.setattr(
+        cli, "AkShareMarketProvider", FakeAkShareProvider, raising=False
+    )
     run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
     add_result = run_cli(
         tmp_path,
@@ -753,9 +819,18 @@ def test_market_snapshot_captures_decision_enabled_symbols(
     assert "stale=0" in result.output
     assert "failed=0" in result.output
     assert "data_time=2026-07-07T02:30:00+00:00" in result.output
-    assert "warning=\u5386\u53f2K\u7ebf\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6" in result.output
-    assert "warning=\u8d44\u91d1\u6d41\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6" in result.output
-    assert "warning=\u5206\u65f6\u5f3a\u5f31\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6" in result.output
+    assert (
+        "warning=\u5386\u53f2K\u7ebf\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6"
+        in result.output
+    )
+    assert (
+        "warning=\u8d44\u91d1\u6d41\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6"
+        in result.output
+    )
+    assert (
+        "warning=\u5206\u65f6\u5f3a\u5f31\u5feb\u7167\u672a\u5728\u6b64\u9636\u6bb5\u91c7\u96c6"
+        in result.output
+    )
     assert FakeAkShareMarketProvider.calls == [["000001", "600000"]]
 
 
@@ -806,48 +881,35 @@ def test_market_snapshot_reports_empty_decision_universe(tmp_path) -> None:
     assert "stale=0" in result.output
     assert "failed=0" in result.output
     assert "data_time=-" in result.output
-    assert "warning=\u65e0\u51b3\u7b56\u542f\u7528\u6807\u7684\uff0c\u672a\u8c03\u7528\u884c\u60c5\u6570\u636e\u6e90" in result.output
-
-
-def test_plan_generate_and_latest_commands(tmp_path) -> None:
-    run_cli(
-        tmp_path,
-        "ledger",
-        "add",
-        "--symbol",
-        "600000",
-        "--name",
-        "浦发银行",
-        "--quantity",
-        "1000",
-        "--available-quantity",
-        "800",
-        "--cost-price",
-        "9.5",
-        "--opened-at",
-        "2026-07-06",
-    )
-    run_cli(
-        tmp_path,
-        "watchlist",
-        "add",
-        "--symbol",
-        "000001",
-        "--name",
-        "平安银行",
-        "--rank",
-        "2",
-        "--plan-enabled",
-        "true",
+    assert (
+        "warning=\u65e0\u51b3\u7b56\u542f\u7528\u6807\u7684\uff0c\u672a\u8c03\u7528\u884c\u60c5\u6570\u636e\u6e90"
+        in result.output
     )
 
-    generate_result = run_cli(tmp_path, "plan", "generate", "--date", "2026-07-09")
+
+def test_plan_generate_is_deprecated_without_persisting_data(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        migrate(connection)
+
+    result = run_cli(tmp_path, "plan", "generate", "--date", "2026-07-09")
+
+    assert result.exit_code != 0
+    assert "qt plan generate is deprecated" in result.output
+    assert "qt workflow close" in result.output
+    with connect(settings) as connection:
+        assert TradingPlanRepository(connection).count() == 0
+        universe_count = connection.execute(
+            "SELECT COUNT(*) FROM universe_snapshots"
+        ).fetchone()[0]
+    assert universe_count == 0
+
+
+def test_plan_latest_reads_existing_plan(tmp_path) -> None:
+    persist_test_plan(Settings(database_path=tmp_path / "ledger.db"))
+
     latest_result = run_cli(tmp_path, "plan", "latest")
 
-    assert generate_result.exit_code == 0
-    assert "plan_id=plan-20260709" in generate_result.output
-    assert "holdings=1" in generate_result.output
-    assert "watch=1" in generate_result.output
     assert latest_result.exit_code == 0
     assert "plan_id=plan-20260709" in latest_result.output
     assert "trading_day=2026-07-09" in latest_result.output
@@ -871,7 +933,7 @@ def test_recommendation_scan_list_and_show_commands(tmp_path, monkeypatch) -> No
         "--opened-at",
         "2026-07-06",
     )
-    run_cli(tmp_path, "plan", "generate", "--date", "2026-07-09")
+    persist_test_plan(Settings(database_path=tmp_path / "ledger.db"))
 
     class FixedDatetime(datetime):
         @classmethod
@@ -885,7 +947,9 @@ def test_recommendation_scan_list_and_show_commands(tmp_path, monkeypatch) -> No
 
     scan_result = run_cli(tmp_path, "recommendations", "scan")
     list_result = run_cli(tmp_path, "recommendations", "list")
-    show_result = run_cli(tmp_path, "recommendations", "show", "rec-plan-20260709-600000")
+    show_result = run_cli(
+        tmp_path, "recommendations", "show", "rec-plan-20260709-600000"
+    )
 
     assert scan_result.exit_code == 0
     assert "generated=1" in scan_result.output
@@ -924,7 +988,7 @@ def test_recommendation_scan_rejects_expired_plan_without_traceback(
         "--opened-at",
         "2026-07-06",
     )
-    run_cli(tmp_path, "plan", "generate", "--date", "2026-07-09")
+    persist_test_plan(Settings(database_path=tmp_path / "ledger.db"))
     monkeypatch.setattr(cli, "datetime", FakeDatetime)
 
     scan_result = run_cli(tmp_path, "recommendations", "scan")
@@ -937,7 +1001,9 @@ def test_recommendation_scan_rejects_expired_plan_without_traceback(
     assert "暂无建议" in list_result.output
 
 
-def test_service_run_once_uses_configured_akshare_provider(monkeypatch, tmp_path) -> None:
+def test_service_run_once_uses_configured_akshare_provider(
+    monkeypatch, tmp_path
+) -> None:
     class FakeAkShareProvider:
         calls: list[list[str]] = []
 
@@ -956,7 +1022,9 @@ def test_service_run_once_uses_configured_akshare_provider(monkeypatch, tmp_path
                 )
             }
 
-    monkeypatch.setattr(cli, "AkShareMarketProvider", FakeAkShareProvider, raising=False)
+    monkeypatch.setattr(
+        cli, "AkShareMarketProvider", FakeAkShareProvider, raising=False
+    )
     log_dir = tmp_path / "logs"
     run_cli(tmp_path, "cash", "init", "--cash", "50000", "--note", "initial principal")
     run_cli(
@@ -1037,7 +1105,9 @@ def test_cash_command_cleanup_receives_bad_parameter_exception(monkeypatch) -> N
 
     class FakeCashService:
         def transfer_out(self, amount: float, *, note: str):
-            raise cli.CashTransferError("transfer-out amount cannot exceed cash balance")
+            raise cli.CashTransferError(
+                "transfer-out amount cannot exceed cash balance"
+            )
 
     connection_cm = FakeConnectionManager()
 
@@ -1052,3 +1122,778 @@ def test_cash_command_cleanup_receives_bad_parameter_exception(monkeypatch) -> N
     assert "cannot exceed cash balance" in result.output
     assert connection_cm.exit_args is not None
     assert connection_cm.exit_args[0] is typer.BadParameter
+
+
+class CliDailyProvider:
+    calls: list[tuple[str, date, date, str]] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.calendar = XSHGTradingCalendar()
+
+    def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+        self.calls.append((symbol, start_date, end_date, adjustment))
+        return [
+            DailyBar(
+                symbol=symbol,
+                trade_date=day,
+                open=10,
+                high=11,
+                low=9,
+                close=10,
+                volume=100,
+                amount=1_000,
+                source="fake",
+                fetched_at=datetime(2026, 7, 13, 7, 0, tzinfo=UTC),
+            )
+            for day in self.calendar.trading_days(start_date, end_date)
+        ]
+
+
+class CliMoneyFlowProvider:
+    calls: list[tuple[str, date, date]] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.calendar = XSHGTradingCalendar()
+
+    def get_daily_money_flow(self, symbol, start_date, end_date):
+        self.calls.append((symbol, start_date, end_date))
+        return [
+            DailyMoneyFlow(
+                symbol=symbol,
+                trade_date=day,
+                main_net_amount=1,
+                main_net_pct=1,
+                super_large_net_amount=1,
+                super_large_net_pct=1,
+                large_net_amount=1,
+                large_net_pct=1,
+                medium_net_amount=-1,
+                medium_net_pct=-1,
+                small_net_amount=-1,
+                small_net_pct=-1,
+                source="fake",
+                fetched_at=datetime(2026, 7, 13, 7, 0, tzinfo=UTC),
+            )
+            for day in self.calendar.trading_days(start_date, end_date)
+        ]
+
+
+def install_cli_heavy_providers(monkeypatch) -> None:
+    CliDailyProvider.calls = []
+    CliMoneyFlowProvider.calls = []
+    monkeypatch.setattr(cli, "AkShareDailyBarProvider", CliDailyProvider)
+    monkeypatch.setattr(cli, "AkShareMoneyFlowProvider", CliMoneyFlowProvider)
+
+
+def test_market_backfill_defaults_to_decision_enabled_universe_and_json(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    install_cli_heavy_providers(monkeypatch)
+    run_cli(
+        tmp_path,
+        "ledger",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "Pufa Bank",
+        "--quantity",
+        "1000",
+        "--available-quantity",
+        "1000",
+        "--cost-price",
+        "9.5",
+        "--opened-at",
+        "2026-07-06",
+    )
+    run_cli(
+        tmp_path,
+        "watchlist",
+        "add",
+        "--symbol",
+        "000001",
+        "--name",
+        "Ping An Bank",
+        "--rank",
+        "1",
+        "--plan-enabled",
+        "true",
+    )
+    run_cli(
+        tmp_path,
+        "watchlist",
+        "add",
+        "--symbol",
+        "000002",
+        "--name",
+        "Vanke A",
+        "--rank",
+        "2",
+        "--plan-enabled",
+        "false",
+    )
+
+    result = run_cli(
+        tmp_path,
+        "market",
+        "backfill",
+        "--date",
+        "2026-07-13",
+        "--json",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["workflow_type"] == "backfill"
+    assert payload["status"] == "succeeded"
+    assert payload["symbols"] == ["000001", "600000"]
+    assert payload["requested_symbols"] == 2
+    assert payload["processed_symbols"] == 2
+    assert {call[0] for call in CliDailyProvider.calls} == {"000001", "600000"}
+    assert {call[0] for call in CliMoneyFlowProvider.calls} == {"000001", "600000"}
+
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        results = MarketCaptureResultRepository(connection).list_for_run(
+            payload["run_id"]
+        )
+    assert len(results) == 4
+
+
+def test_market_backfill_explicit_symbols_filter_enabled_universe_and_reuse_run(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    install_cli_heavy_providers(monkeypatch)
+    for symbol in ("600000", "000001"):
+        run_cli(
+            tmp_path,
+            "watchlist",
+            "add",
+            "--symbol",
+            symbol,
+            "--name",
+            symbol,
+            "--rank",
+            "1",
+            "--plan-enabled",
+            "true",
+        )
+
+    first = run_cli(
+        tmp_path,
+        "market",
+        "backfill",
+        "--date",
+        "2026-07-13",
+        "--symbol",
+        "600000",
+        "--symbol",
+        "000001",
+        "--json",
+    )
+    second = run_cli(
+        tmp_path,
+        "market",
+        "backfill",
+        "--date",
+        "2026-07-13",
+        "--symbol",
+        "000001",
+        "--symbol",
+        "600000",
+        "--json",
+    )
+
+    assert first.exit_code == second.exit_code == 0
+    assert json.loads(first.output)["reused"] is False
+    assert json.loads(second.output)["reused"] is True
+    assert len(CliDailyProvider.calls) == 2
+    assert len(CliMoneyFlowProvider.calls) == 2
+
+
+def test_market_backfill_rejects_symbol_outside_decision_enabled_universe(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    install_cli_heavy_providers(monkeypatch)
+
+    result = run_cli(
+        tmp_path,
+        "market",
+        "backfill",
+        "--date",
+        "2026-07-13",
+        "--symbol",
+        "600000",
+    )
+
+    assert result.exit_code != 0
+    assert "market backfill failed" in result.output
+    assert CliDailyProvider.calls == []
+    assert CliMoneyFlowProvider.calls == []
+
+
+def test_market_cleanup_retains_twenty_sessions_and_outputs_json(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    calendar = XSHGTradingCalendar()
+    days = calendar.sessions_ending(date(2026, 7, 13), 22)
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = MinuteBarRepository(connection)
+        for day in days:
+            repository.upsert_many(
+                [
+                    MinuteBar(
+                        symbol="600000",
+                        trade_date=day,
+                        minute=datetime(
+                            day.year,
+                            day.month,
+                            day.day,
+                            10,
+                            0,
+                            tzinfo=calendar.timezone,
+                        ),
+                        open=10,
+                        high=10,
+                        low=10,
+                        close=10,
+                        volume=100,
+                        amount=1_000,
+                        source="fake",
+                        fetched_at=datetime(2026, 7, 13, 7, 0, tzinfo=UTC),
+                    )
+                ]
+            )
+
+    result = run_cli(
+        tmp_path,
+        "market",
+        "cleanup",
+        "--date",
+        "2026-07-13",
+        "--json",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["workflow_type"] == "cleanup"
+    assert payload["status"] == "succeeded"
+    assert payload["deleted_rows"] == 2
+    with connect(settings) as connection:
+        assert MinuteBarRepository(connection).trade_dates("600000") == days[-20:]
+
+
+def test_market_runs_lists_latest_run_with_limit_and_json(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = MarketCaptureRunRepository(connection)
+        for index in range(2):
+            repository.get_or_create(
+                MarketCaptureRun(
+                    run_id=f"run-{index}",
+                    workflow_type="backfill",
+                    trade_date=date(2026, 7, 10 + index),
+                    idempotency_key=f"backfill:{index}",
+                    status=CaptureRunStatus.SUCCEEDED,
+                    started_at=datetime(2026, 7, 13, 7, index, tzinfo=UTC),
+                    finished_at=datetime(2026, 7, 13, 7, index, 30, tzinfo=UTC),
+                    requested_symbols=1,
+                    processed_symbols=1,
+                )
+            )
+
+    result = run_cli(tmp_path, "market", "runs", "--limit", "1", "--json")
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["count"] == 1
+    assert payload["runs"][0]["run_id"] == "run-1"
+    assert payload["runs"][0]["status"] == "succeeded"
+
+
+def test_market_backfill_failure_is_sanitized_without_database_path(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "synthetic-private.db"
+
+    class FailingWorkflow:
+        def run_backfill(self, *args, **kwargs):
+            raise sqlite3.OperationalError(
+                f"raw failure path={database_path} token=synthetic-token-secret"
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "_market_maintenance_workflow",
+        lambda connection: FailingWorkflow(),
+    )
+
+    result = run_cli(
+        tmp_path,
+        "market",
+        "backfill",
+        "--date",
+        "2026-07-13",
+    )
+
+    assert result.exit_code != 0
+    assert "market backfill failed" in result.output
+    assert str(database_path) not in result.output
+    assert "synthetic-token-secret" not in result.output
+    assert "raw failure" not in result.output
+
+
+def test_market_backfill_sparse_usable_data_is_degraded_not_failed(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class SparseDailyProvider(CliDailyProvider):
+        def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+            return super().get_daily_bars(symbol, end_date, end_date, adjustment)
+
+    class SparseFlowProvider(CliMoneyFlowProvider):
+        def get_daily_money_flow(self, symbol, start_date, end_date):
+            return super().get_daily_money_flow(symbol, end_date, end_date)
+
+    monkeypatch.setattr(cli, "AkShareDailyBarProvider", SparseDailyProvider)
+    monkeypatch.setattr(cli, "AkShareMoneyFlowProvider", SparseFlowProvider)
+    run_cli(
+        tmp_path,
+        "watchlist",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "600000",
+        "--rank",
+        "1",
+        "--plan-enabled",
+        "true",
+    )
+
+    result = run_cli(
+        tmp_path,
+        "market",
+        "backfill",
+        "--date",
+        "2026-07-13",
+        "--symbol",
+        "600000",
+        "--json",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "degraded"
+    assert {item["status"] for item in payload["results"]} == {"degraded"}
+
+
+def test_market_backfill_provider_failures_persist_failed_run_and_safe_errors(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class RaisingDailyProvider:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def get_daily_bars(self, *args, **kwargs):
+            raise RuntimeError(
+                "daily failed token=synthetic-token-secret at /tmp/private-market.csv"
+            )
+
+    class RaisingFlowProvider:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def get_daily_money_flow(self, *args, **kwargs):
+            raise RuntimeError(
+                "flow failed password=synthetic-password at /tmp/private-flow.csv"
+            )
+
+    monkeypatch.setattr(cli, "AkShareDailyBarProvider", RaisingDailyProvider)
+    monkeypatch.setattr(cli, "AkShareMoneyFlowProvider", RaisingFlowProvider)
+    run_cli(
+        tmp_path,
+        "watchlist",
+        "add",
+        "--symbol",
+        "600000",
+        "--name",
+        "600000",
+        "--rank",
+        "1",
+        "--plan-enabled",
+        "true",
+    )
+
+    result = run_cli(
+        tmp_path,
+        "market",
+        "backfill",
+        "--date",
+        "2026-07-13",
+        "--symbol",
+        "600000",
+        "--json",
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "failed"
+    assert payload["failure_count"] == 2
+    assert {item["status"] for item in payload["results"]} == {"failed"}
+    for unsafe in (
+        "synthetic-token-secret",
+        "synthetic-password",
+        "/tmp/private-market.csv",
+        "/tmp/private-flow.csv",
+    ):
+        assert unsafe not in result.output
+
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        run_id = payload["run_id"]
+        stored = MarketCaptureRunRepository(connection).get(run_id)
+        stored_results = MarketCaptureResultRepository(connection).list_for_run(run_id)
+    assert stored is not None
+    assert stored.status is CaptureRunStatus.FAILED
+    assert len(stored_results) == 2
+
+
+def _notification(
+    notification_id: str,
+    *,
+    status: NotificationStatus = NotificationStatus.UNREAD,
+    created_at: datetime,
+) -> NotificationSummary:
+    return NotificationSummary(
+        notification_id=notification_id,
+        recommendation_id=f"rec-{notification_id}",
+        symbol="600000",
+        action="reduce",
+        confidence="medium",
+        key_price=10.5,
+        reason=["risk rule"],
+        risk=["manual review"],
+        data_time=created_at,
+        audit_id=f"audit-{notification_id}",
+        status=status,
+        created_at=created_at,
+    )
+
+
+def _seed_smtp(connection, *, password: str) -> None:
+    SmtpSettingsService(SmtpSettingsRepository(connection)).update(
+        SmtpSettingsUpdate(
+            host="smtp.example.test",
+            port=587,
+            username="robot@example.test",
+            password=password,
+            sender="robot@example.test",
+            recipient="owner@example.test",
+            security=SmtpSecurity.STARTTLS,
+            enabled=True,
+        ),
+        now=datetime(2026, 7, 13, 6, 0, tzinfo=UTC),
+    )
+
+
+def test_notifications_cli_lists_counts_and_marks_read_with_audit(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    now = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = NotificationRepository(connection)
+        repository.save(_notification("notif-1", created_at=now))
+        repository.save(
+            _notification(
+                "notif-2",
+                created_at=now.replace(minute=1),
+            )
+        )
+        repository.save(
+            _notification(
+                "notif-3",
+                status=NotificationStatus.READ,
+                created_at=now.replace(minute=2),
+            )
+        )
+
+    listed = run_cli(
+        tmp_path,
+        "notifications",
+        "list",
+        "--status",
+        "unread",
+        "--limit",
+        "1",
+        "--offset",
+        "1",
+    )
+    unread = run_cli(tmp_path, "notifications", "unread")
+    marked = run_cli(tmp_path, "notifications", "read", "notif-1")
+
+    assert listed.exit_code == 0
+    assert "notif-1 600000 reduce status=unread" in listed.output
+    assert "notif-2" not in listed.output
+    assert unread.exit_code == 0
+    assert unread.output.strip() == "unread=2"
+    assert marked.exit_code == 0
+    assert "notification_id=notif-1 status=read" in marked.output
+    with connect(settings) as connection:
+        assert (
+            NotificationRepository(connection).get("notif-1").status
+            is NotificationStatus.READ
+        )
+        audits = AuditLogRepository(connection).list_recent(limit=20)
+    read_audit = next(item for item in audits if item.event_type == "notification.read")
+    assert read_audit.payload == {"notification_id": "notif-1"}
+
+
+def test_notifications_cli_read_missing_is_clear_and_has_no_traceback(tmp_path) -> None:
+    result = run_cli(tmp_path, "notifications", "read", "missing")
+
+    assert result.exit_code != 0
+    assert "notification not found: missing" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_email_cli_status_is_explicit_and_never_outputs_password(tmp_path) -> None:
+    synthetic_password = "synthetic-cli-smtp-password"
+    missing = run_cli(tmp_path, "email", "status")
+    missing_test = run_cli(tmp_path, "email", "test")
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        _seed_smtp(connection, password=synthetic_password)
+
+    configured = run_cli(tmp_path, "email", "status")
+
+    assert missing.exit_code == 0
+    assert "configured=false" in missing.output
+    assert "enabled=false" in missing.output
+    assert "password_configured=false" in missing.output
+    assert missing_test.exit_code == 0
+    assert missing_test.output.strip() == "smtp_test=not_configured"
+    assert configured.exit_code == 0
+    assert "configured=true" in configured.output
+    assert "enabled=true" in configured.output
+    assert "password_configured=true" in configured.output
+    assert synthetic_password not in missing.output + configured.output
+
+
+def test_email_cli_test_uses_sender_and_audits_sanitized_failure(
+    monkeypatch, tmp_path
+) -> None:
+    synthetic_password = "synthetic-cli-smtp-password"
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        _seed_smtp(connection, password=synthetic_password)
+
+    class FailingSender:
+        calls = 0
+
+        def send(self, settings, *, recipient, subject, body):  # noqa: ANN001
+            self.calls += 1
+            raise RuntimeError(
+                f"login failed password={synthetic_password} token=synthetic-token /tmp/mail.log"
+            )
+
+    sender = FailingSender()
+    monkeypatch.setattr(cli, "SmtplibEmailSender", lambda: sender, raising=False)
+
+    result = run_cli(tmp_path, "email", "test")
+
+    assert result.exit_code != 0
+    assert "smtp test failed" in result.output.lower()
+    assert "Traceback" not in result.output
+    assert sender.calls == 1
+    for secret in (synthetic_password, "synthetic-token", "/tmp/mail.log"):
+        assert secret not in result.output
+    with connect(settings) as connection:
+        audits = AuditLogRepository(connection).list_recent(limit=20)
+    failure = next(item for item in audits if item.event_type == "smtp.test.failed")
+    audit_text = failure.model_dump_json()
+    assert synthetic_password not in audit_text
+    assert "synthetic-token" not in audit_text
+
+
+def test_email_cli_deliveries_and_retry_share_outbox_service_and_write_audit(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    now = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+
+    class NoopSender:
+        def send(self, settings, *, recipient, subject, body):  # noqa: ANN001
+            pass
+
+    with connect(settings) as connection:
+        migrate(connection)
+        NotificationRepository(connection).save(
+            _notification("notif-1", created_at=now)
+        )
+        repository = EmailDeliveryRepository(connection)
+        delivery = EmailDeliveryService(
+            repository,
+            SmtpSettingsRepository(connection),
+            NoopSender(),
+            id_factory=lambda: "delivery-1",
+        ).enqueue(
+            dedup_key="condition-1",
+            notification_id="notif-1",
+            recipient="owner@example.test",
+            subject="Risk alert",
+            body="Review locally.",
+            payload={},
+            now=now,
+        )
+        connection.execute(
+            """
+            UPDATE email_deliveries
+            SET status = 'dead', attempt_count = 6, next_attempt_at = NULL,
+                last_error = 'safe failure'
+            WHERE delivery_id = ?
+            """,
+            (delivery.delivery_id,),
+        )
+        connection.commit()
+
+    listed = run_cli(
+        tmp_path,
+        "email",
+        "deliveries",
+        "--status",
+        "dead",
+    )
+    retried = run_cli(tmp_path, "email", "retry", "delivery-1")
+
+    assert listed.exit_code == 0
+    assert "delivery-1 status=dead attempts=6" in listed.output
+    assert retried.exit_code == 0
+    assert "delivery_id=delivery-1 status=pending attempts=0" in retried.output
+    with connect(settings) as connection:
+        assert (
+            EmailDeliveryRepository(connection).get("delivery-1").status.value
+            == "pending"
+        )
+        audits = AuditLogRepository(connection).list_recent(limit=20)
+    retry_audit = next(
+        item for item in audits if item.event_type == "email.delivery.retried"
+    )
+    assert retry_audit.payload == {"delivery_id": "delivery-1"}
+
+
+def test_workflow_intraday_cli_uses_shared_decision_workflow(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class FakeWorkflow:
+        def run_intraday(self):
+            calls.append("intraday")
+            return type(
+                "Result",
+                (),
+                {
+                    "run_id": "intraday-20260714-1000",
+                    "reused": False,
+                    "market_input_snapshot_id": 12,
+                    "recommendation_ids": ("rec-1",),
+                    "warnings": (),
+                },
+            )()
+
+    monkeypatch.setattr(
+        cli,
+        "build_decision_workflow",
+        lambda connection, settings, now: FakeWorkflow(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_workflow_now",
+        lambda: datetime(2026, 7, 14, 2, 0, tzinfo=UTC),
+        raising=False,
+    )
+
+    result = run_cli(tmp_path, "workflow", "intraday")
+
+    assert result.exit_code == 0
+    assert calls == ["intraday"]
+    assert "run_id=intraday-20260714-1000" in result.output
+    assert "recommendations=1" in result.output
+
+
+def test_workflow_close_cli_requires_reason_for_calendar_override_and_audits(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class FakeWorkflow:
+        def run_close(self, trade_date, *, skip_calendar=False):
+            calls.append((trade_date, skip_calendar))
+            return type(
+                "Result",
+                (),
+                {
+                    "run_id": "close-20260712",
+                    "ready": False,
+                    "reused": False,
+                    "market_input_snapshot_id": 13,
+                    "plan_id": None,
+                    "warnings": ("日线未就绪",),
+                },
+            )()
+
+    monkeypatch.setattr(
+        cli,
+        "build_decision_workflow",
+        lambda connection, settings, now: FakeWorkflow(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cli,
+        "_workflow_now",
+        lambda: datetime(2026, 7, 12, 7, 20, tzinfo=UTC),
+        raising=False,
+    )
+
+    rejected = run_cli(
+        tmp_path,
+        "workflow",
+        "close",
+        "--date",
+        "2026-07-12",
+        "--skip-calendar",
+    )
+    accepted = run_cli(
+        tmp_path,
+        "workflow",
+        "close",
+        "--date",
+        "2026-07-12",
+        "--skip-calendar",
+        "--reason",
+        "人工确认交易日历例外",
+    )
+
+    assert rejected.exit_code != 0
+    assert "reason is required" in rejected.output
+    assert accepted.exit_code == 0
+    assert calls == [(date(2026, 7, 12), True)]
+    assert "run_id=close-20260712" in accepted.output
+
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        audits = AuditLogRepository(connection).list_recent(limit=10)
+    assert audits[0].event_type == "workflow.manual_run"
+    assert audits[0].payload["manual_reason"] == "人工确认交易日历例外"

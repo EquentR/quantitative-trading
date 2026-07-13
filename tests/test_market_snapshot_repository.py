@@ -5,6 +5,9 @@ import pytest
 
 from quantitative_trading.config import Settings
 from quantitative_trading.market.models import (
+    CaptureDataset,
+    CaptureResultStatus,
+    DatasetQuality,
     MarketInputSnapshot,
     QuoteSnapshot,
     QuoteStatus,
@@ -337,3 +340,88 @@ def test_market_repositories_can_join_caller_owned_transaction(connection) -> No
 
     assert quote_repository.get(quote_id) is None
     assert market_repository.latest() is None
+
+
+def test_market_input_snapshot_round_trips_run_quality_and_matching_heavy_refs(
+    connection,
+) -> None:
+    universe_snapshot_id = UniverseSnapshotRepository(connection).save(universe_snapshot())
+    cursor = connection.execute(
+        """INSERT INTO history_snapshots (
+             run_id,symbol,adjustment,data_start,data_end,row_count,content_digest,
+             status,warning,fetched_at,payload_json
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "run-1",
+            "600000",
+            "forward",
+            None,
+            None,
+            0,
+            "a" * 64,
+            "degraded",
+            "empty fixture",
+            FETCHED_AT.isoformat(),
+            "{}",
+        ),
+    )
+    snapshot = MarketInputSnapshot(
+        universe_snapshot_id=universe_snapshot_id,
+        quote_snapshot_refs={},
+        history_snapshot_refs={"600000": int(cursor.lastrowid)},
+        money_flow_snapshot_refs={},
+        intraday_strength_snapshot_refs={},
+        dataset_quality={
+            "600000": {
+                CaptureDataset.DAILY_BAR: DatasetQuality(
+                    status=CaptureResultStatus.DEGRADED,
+                    expected_rows=250,
+                    actual_rows=0,
+                    warning="empty fixture",
+                )
+            }
+        },
+        capture_run_id="run-1",
+        fetched_at=FETCHED_AT,
+        warnings=["empty fixture"],
+    )
+
+    snapshot_id = MarketInputSnapshotRepository(connection).save(snapshot)
+
+    assert MarketInputSnapshotRepository(connection).get(snapshot_id) == snapshot
+
+
+def test_market_input_snapshot_save_rejects_symbol_mismatched_history_ref(connection) -> None:
+    universe_snapshot_id = UniverseSnapshotRepository(connection).save(universe_snapshot())
+    cursor = connection.execute(
+        """INSERT INTO history_snapshots (
+             run_id,symbol,adjustment,data_start,data_end,row_count,content_digest,
+             status,warning,fetched_at,payload_json
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "run-1",
+            "000001",
+            "forward",
+            None,
+            None,
+            0,
+            "a" * 64,
+            "degraded",
+            "empty fixture",
+            FETCHED_AT.isoformat(),
+            "{}",
+        ),
+    )
+    snapshot = MarketInputSnapshot(
+        universe_snapshot_id=universe_snapshot_id,
+        quote_snapshot_refs={},
+        history_snapshot_refs={"600000": int(cursor.lastrowid)},
+        money_flow_snapshot_refs={},
+        intraday_strength_snapshot_refs={},
+        capture_run_id="run-1",
+        fetched_at=FETCHED_AT,
+        warnings=[],
+    )
+
+    with pytest.raises(ValueError, match="invalid history snapshot reference"):
+        MarketInputSnapshotRepository(connection).save(snapshot)

@@ -4,6 +4,7 @@ import json
 import sqlite3
 
 from quantitative_trading.market.models import MarketInputSnapshot, QuoteSnapshot
+from quantitative_trading.market.repositories import validate_heavy_snapshot_references
 
 
 class QuoteSnapshotRepository:
@@ -73,6 +74,8 @@ class MarketInputSnapshotRepository:
             ).fetchone()
             if reference is None:
                 raise ValueError("invalid quote snapshot reference")
+
+        validate_heavy_snapshot_references(self.connection, snapshot)
 
         cursor = self.connection.execute(
             """

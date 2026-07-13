@@ -1,9 +1,25 @@
 import sqlite3
+import stat
 
 import pytest
 
 from quantitative_trading.config import Settings
 from quantitative_trading.storage.sqlite import connect, migrate
+
+
+def test_connect_restricts_database_and_parent_permissions(tmp_path) -> None:
+    database_dir = tmp_path / "local-data"
+    database_dir.mkdir(mode=0o755)
+    database_path = database_dir / "app.db"
+    database_path.touch(mode=0o644)
+    database_dir.chmod(0o755)
+    database_path.chmod(0o644)
+
+    with connect(Settings(database_path=database_path)) as connection:
+        connection.execute("SELECT 1")
+
+    assert stat.S_IMODE(database_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(database_path.stat().st_mode) == 0o600
 
 
 def insert_position(
@@ -282,17 +298,53 @@ def insert_trading_plan(
         ),
         (
             "notifications",
-            [
-                "notification_id",
-                "recommendation_id",
+                [
+                    "notification_id",
+                    "dedup_key",
+                    "recommendation_id",
                 "symbol",
                 "action",
                 "status",
                 "data_time",
                 "created_at",
                 "payload_json",
-            ],
-        ),
+                ],
+            ),
+            (
+                "smtp_settings",
+                [
+                    "id",
+                    "host",
+                    "port",
+                    "username",
+                    "password",
+                    "sender",
+                    "recipient",
+                    "security",
+                    "enabled",
+                    "updated_at",
+                ],
+            ),
+            (
+                "email_deliveries",
+                [
+                    "delivery_id",
+                    "notification_id",
+                    "dedup_key",
+                    "recipient",
+                    "subject",
+                    "body",
+                    "payload_json",
+                    "status",
+                    "attempt_count",
+                    "next_attempt_at",
+                    "lease_expires_at",
+                    "last_error",
+                    "sent_at",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
         (
             "execution_feedback",
             [
@@ -757,7 +809,7 @@ def test_trading_plans_reject_null_required_fields(tmp_path, field: str) -> None
             insert_trading_plan(connection, **{field: None})
 
 
-@pytest.mark.parametrize("status", ["draft", "ok", ""])
+@pytest.mark.parametrize("status", ["ok", "unknown", ""])
 def test_trading_plans_reject_unknown_status(tmp_path, status: str) -> None:
     settings = Settings(database_path=tmp_path / "planning.db")
 
@@ -766,3 +818,154 @@ def test_trading_plans_reject_unknown_status(tmp_path, status: str) -> None:
 
         with pytest.raises(sqlite3.IntegrityError):
             insert_trading_plan(connection, status=status)
+
+
+@pytest.mark.parametrize(
+    "status", ["draft", "active", "superseded", "expired", "stale"]
+)
+def test_trading_plans_accept_full_lifecycle_status(tmp_path, status: str) -> None:
+    settings = Settings(database_path=tmp_path / f"planning-{status}.db")
+
+    with connect(settings) as connection:
+        migrate(connection)
+        insert_trading_plan(connection, status=status)
+
+
+def test_migrate_expands_legacy_trading_plan_status_constraint(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "legacy-plan.db")
+    with connect(settings) as connection:
+        connection.execute(
+            """
+            CREATE TABLE trading_plans (
+              plan_id TEXT PRIMARY KEY NOT NULL,
+              trading_day TEXT NOT NULL,
+              generated_at TEXT NOT NULL,
+              valid_until TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (status IN ('active', 'expired', 'stale')),
+              payload_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO trading_plans
+              (plan_id, trading_day, generated_at, valid_until, status, payload_json)
+            VALUES ('legacy', '2026-07-09', '2026-07-08T07:00:00+00:00',
+                    '2026-07-09T15:00:00+08:00', 'active', '{}')
+            """
+        )
+        connection.commit()
+
+        migrate(connection)
+        insert_trading_plan(
+            connection,
+            plan_id="replacement",
+            status="superseded",
+        )
+        connection.commit()
+
+        rows = connection.execute(
+            "SELECT plan_id, status FROM trading_plans ORDER BY plan_id"
+        ).fetchall()
+
+    assert [(row["plan_id"], row["status"]) for row in rows] == [
+        ("legacy", "active"),
+        ("replacement", "superseded"),
+    ]
+
+
+def test_migrate_creates_market_decision_workflow_tables(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "market-decision.db")
+    expected = {
+        "market_capture_runs",
+        "market_capture_results",
+        "daily_bars",
+        "history_snapshots",
+        "history_snapshot_members",
+        "daily_money_flows",
+        "money_flow_snapshots",
+        "money_flow_snapshot_members",
+        "minute_bars",
+        "intraday_strength_snapshots",
+    }
+
+    with connect(settings) as connection:
+        migrate(connection)
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+
+    assert expected <= {row["name"] for row in rows}
+
+
+def test_migrate_adds_market_capture_observability_columns_to_existing_db(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "legacy-market-runs.db")
+    with connect(settings) as connection:
+        connection.execute(
+            """
+            CREATE TABLE market_capture_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT NOT NULL UNIQUE,
+              workflow_type TEXT NOT NULL,
+              trade_date TEXT NOT NULL,
+              period_start TEXT,
+              period_end TEXT,
+              idempotency_key TEXT NOT NULL UNIQUE,
+              status TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              finished_at TEXT,
+              requested_symbols INTEGER NOT NULL DEFAULT 0,
+              processed_symbols INTEGER NOT NULL DEFAULT 0,
+              provider_calls INTEGER NOT NULL DEFAULT 0,
+              rows_received INTEGER NOT NULL DEFAULT 0,
+              rows_written INTEGER NOT NULL DEFAULT 0,
+              warning_count INTEGER NOT NULL DEFAULT 0,
+              failure_count INTEGER NOT NULL DEFAULT 0,
+              error_summary TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO market_capture_runs (
+              run_id, workflow_type, trade_date, idempotency_key, status, started_at
+            ) VALUES (
+              'legacy-run', 'close', '2026-07-13', 'close:2026-07-13',
+              'succeeded', '2026-07-13T07:15:00+00:00'
+            )
+            """
+        )
+
+        migrate(connection)
+        migrate(connection)
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(market_capture_runs)"
+            ).fetchall()
+        }
+        row = connection.execute(
+            "SELECT * FROM market_capture_runs WHERE run_id='legacy-run'"
+        ).fetchone()
+
+    expected = {
+        "provider_duration_ms",
+        "cleaned_rows",
+        "plan_count",
+        "recommendation_count",
+        "notification_count",
+        "email_outbox_count",
+        "retry_count",
+    }
+    assert expected <= columns
+    assert {name: row[name] for name in expected} == {
+        "provider_duration_ms": 0.0,
+        "cleaned_rows": 0,
+        "plan_count": 0,
+        "recommendation_count": 0,
+        "notification_count": 0,
+        "email_outbox_count": 0,
+        "retry_count": 0,
+    }

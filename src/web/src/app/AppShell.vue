@@ -1,7 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { LayoutDashboard, ListChecks, Activity, ClipboardList, Settings, Sparkles } from 'lucide-vue-next'
+import {
+  Activity,
+  ChartCandlestick,
+  ClipboardList,
+  LayoutDashboard,
+  ListChecks,
+  Settings,
+  Sparkles,
+} from 'lucide-vue-next'
 import { useServiceStatusQuery } from '@/queries/service'
 import { useSessionStore } from '@/stores/session'
 import StatusBadges from '@/components/domain/StatusBadges.vue'
@@ -13,6 +21,7 @@ const session = useSessionStore()
 
 const nav = [
   { to: '/', label: '今日仪表盘', icon: LayoutDashboard },
+  { to: '/market', label: '行情', icon: ChartCandlestick },
   { to: '/prepare', label: '准备', icon: ListChecks },
   { to: '/monitor', label: '监控', icon: Activity },
   { to: '/recommendations', label: '建议', icon: Sparkles },
@@ -86,7 +95,7 @@ onUnmounted(() => window.removeEventListener('qt-console-auth-error', onAuthErro
         服务未设置访问密码，请先完成初始化设置。
       </Alert>
 
-      <main class="flex-1 overflow-x-hidden p-4">
+      <main class="min-w-0 flex-1 overflow-x-clip p-4">
         <RouterView />
       </main>
     </div>
@@ -95,7 +104,7 @@ onUnmounted(() => window.removeEventListener('qt-console-auth-error', onAuthErro
       class="fixed inset-x-0 bottom-0 border-t border-border bg-background md:hidden"
       aria-label="移动导航"
     >
-      <ul class="grid grid-cols-6">
+      <ul class="grid grid-cols-7">
         <li v-for="item in nav" :key="`mobile-${item.to}`">
           <RouterLink
             :to="item.to"

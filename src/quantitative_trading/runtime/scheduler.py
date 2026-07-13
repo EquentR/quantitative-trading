@@ -5,6 +5,7 @@ from threading import Lock
 from typing import Any
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
 from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 
@@ -53,35 +54,58 @@ class SchedulerManager:
 
             scheduler = self._scheduler_factory(timezone=self._timezone)
             scheduler.add_job(
-                # 调度器只传递触发原因，实际快照逻辑由注入的共享任务负责。
-                lambda: self._job("intraday"),
-                trigger="interval",
-                seconds=self._interval_seconds,
-                id="account_snapshot_intraday",
+                lambda: self._job("intraday_decision"),
+                trigger=_intraday_trigger(self._timezone),
+                id="decision_intraday",
                 max_instances=1,
+                coalesce=True,
                 replace_existing=True,
             )
             scheduler.add_job(
-                lambda: self._job("close_plan_daily"),
+                lambda: self._job("close_readiness"),
+                trigger=_close_readiness_trigger(self._timezone),
+                id="decision_close_readiness",
+                max_instances=1,
+                coalesce=True,
+                replace_existing=True,
+            )
+            scheduler.add_job(
+                lambda: self._job("minute_cleanup"),
                 trigger="cron",
                 day_of_week="mon-fri",
-                hour=15,
-                minute=30,
+                hour=16,
+                minute=35,
                 timezone=self._timezone,
-                id="close_plan_daily",
+                id="market_minute_cleanup",
                 max_instances=1,
+                coalesce=True,
                 replace_existing=True,
             )
             scheduler.add_job(
-                lambda: self._job("intraday_trigger"),
-                trigger=_intraday_trigger(self._timezone),
-                id="recommendation_intraday_trigger",
+                lambda: self._job("email_delivery"),
+                trigger="interval",
+                seconds=15,
+                id="email_delivery_worker",
                 max_instances=1,
+                coalesce=True,
                 replace_existing=True,
             )
+            if hasattr(scheduler, "add_listener"):
+                scheduler.add_listener(
+                    self._scheduler_skip_listener,
+                    EVENT_JOB_MAX_INSTANCES | EVENT_JOB_MISSED,
+                )
             scheduler.start()
             self._scheduler = scheduler
             return True
+
+    def _scheduler_skip_listener(self, event: Any) -> None:
+        event_type = (
+            "overrun"
+            if event.code == EVENT_JOB_MAX_INSTANCES
+            else "missed"
+        )
+        self._job(f"scheduler_{event_type}:{event.job_id}")
 
     def stop(self) -> bool:
         with self._lock:
@@ -101,31 +125,50 @@ def _intraday_trigger(timezone: str) -> OrTrigger:
             CronTrigger(
                 day_of_week="mon-fri",
                 hour=9,
-                minute="35-59",
+                minute="30-59/3",
                 timezone=timezone,
             ),
             CronTrigger(
                 day_of_week="mon-fri",
                 hour=10,
-                minute="*",
+                minute="0-59/3",
                 timezone=timezone,
             ),
             CronTrigger(
                 day_of_week="mon-fri",
                 hour=11,
-                minute="0-30",
+                minute="0-30/3",
                 timezone=timezone,
             ),
             CronTrigger(
                 day_of_week="mon-fri",
-                hour=13,
-                minute="*",
+                hour="13-14",
+                minute="0-59/3",
                 timezone=timezone,
             ),
             CronTrigger(
                 day_of_week="mon-fri",
-                hour=14,
-                minute="0-55",
+                hour=15,
+                minute=0,
+                timezone=timezone,
+            ),
+        ]
+    )
+
+
+def _close_readiness_trigger(timezone: str) -> OrTrigger:
+    return OrTrigger(
+        [
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=15,
+                minute="15-59/5",
+                timezone=timezone,
+            ),
+            CronTrigger(
+                day_of_week="mon-fri",
+                hour=16,
+                minute="0-30/5",
                 timezone=timezone,
             ),
         ]

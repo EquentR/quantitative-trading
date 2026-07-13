@@ -143,6 +143,38 @@ def test_feedback_changes_status_to_feedback_recorded(
     assert service.get("notif-1") == updated
 
 
+def test_notification_condition_key_deduplicates_only_identical_conditions(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "notification-dedup.db")
+    ids = iter(("notif-1", "notif-2", "notif-3"))
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = NotificationRepository(connection)
+        service = NotificationService(repository, id_factory=lambda: next(ids))
+
+        first = service.create_from_recommendation(
+            recommendation(),
+            audit_log(),
+            dedup_key="2026-07-13:600000:watch:plan-v1:fingerprint-a",
+            now=NOW,
+        )
+        duplicate = service.create_from_recommendation(
+            recommendation(recommendation_id="rec-duplicate"),
+            audit_log(recommendation_id="rec-duplicate"),
+            dedup_key="2026-07-13:600000:watch:plan-v1:fingerprint-a",
+            now=LATER,
+        )
+        changed = service.create_from_recommendation(
+            recommendation(recommendation_id="rec-changed"),
+            audit_log(recommendation_id="rec-changed"),
+            dedup_key="2026-07-13:600000:watch:plan-v1:fingerprint-b",
+            now=LATER,
+        )
+
+        assert duplicate == first
+        assert changed.notification_id == "notif-2"
+        assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 2
+
+
 def test_jsonl_writer_sanitizes_sensitive_keys_and_configured_secret_text(tmp_path) -> None:
     settings = Settings(
         log_dir=tmp_path / "logs",

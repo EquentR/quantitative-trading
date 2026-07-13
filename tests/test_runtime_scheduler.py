@@ -1,9 +1,15 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
 import pytest
 
 from quantitative_trading.config import Settings
-from quantitative_trading.runtime.scheduler import SchedulerManager
+from quantitative_trading.runtime.scheduler import (
+    SchedulerManager,
+    _close_readiness_trigger,
+    _intraday_trigger,
+)
 from quantitative_trading.storage.scheduler_state import SchedulerStateRepository
 from quantitative_trading.storage.sqlite import connect, migrate
 
@@ -179,11 +185,15 @@ def test_scheduler_manager_start_and_stop_are_idempotent(tmp_path) -> None:
         def __init__(self, *, timezone: str) -> None:
             self.timezone = timezone
             self.jobs = []
+            self.listeners = []
             self.running = False
             created_schedulers.append(self)
 
         def add_job(self, func, **kwargs) -> None:
             self.jobs.append((func, kwargs))
+
+        def add_listener(self, callback, mask) -> None:
+            self.listeners.append((callback, mask))
 
         def start(self) -> None:
             self.running = True
@@ -209,12 +219,75 @@ def test_scheduler_manager_start_and_stop_are_idempotent(tmp_path) -> None:
     assert first is True
     assert second is False
     assert manager.is_running is False
-    assert calls == ["intraday"]
-    assert len(scheduler.jobs) == 3
-    assert job_kwargs == {
-        "trigger": "interval",
-        "seconds": 7,
-        "id": "account_snapshot_intraday",
-        "max_instances": 1,
-        "replace_existing": True,
-    }
+    assert calls == ["intraday_decision"]
+    assert len(scheduler.jobs) == 4
+    assert job_kwargs["id"] == "decision_intraday"
+    assert str(job_kwargs["trigger"]) == str(_intraday_trigger("Asia/Shanghai"))
+    assert job_kwargs["max_instances"] == 1
+    assert job_kwargs["coalesce"] is True
+    assert job_kwargs["replace_existing"] is True
+
+    job_ids = [kwargs["id"] for _, kwargs in scheduler.jobs]
+    assert job_ids == [
+        "decision_intraday",
+        "decision_close_readiness",
+        "market_minute_cleanup",
+        "email_delivery_worker",
+    ]
+
+    close_job = scheduler.jobs[1]
+    cleanup_job = scheduler.jobs[2]
+    email_job = scheduler.jobs[3]
+
+    assert str(close_job[1]["trigger"]) == str(
+        _close_readiness_trigger("Asia/Shanghai")
+    )
+    assert cleanup_job[1]["trigger"] == "cron"
+    assert cleanup_job[1]["hour"] == 16
+    assert cleanup_job[1]["minute"] == 35
+    assert email_job[1]["trigger"] == "interval"
+    assert email_job[1]["seconds"] == 15
+
+    for func, _ in scheduler.jobs[1:]:
+        func()
+    listener, mask = scheduler.listeners[0]
+    listener(
+        SimpleNamespace(
+            code=EVENT_JOB_MAX_INSTANCES,
+            job_id="decision_intraday",
+        )
+    )
+    listener(
+        SimpleNamespace(
+            code=EVENT_JOB_MISSED,
+            job_id="decision_close_readiness",
+        )
+    )
+    assert mask == EVENT_JOB_MAX_INSTANCES | EVENT_JOB_MISSED
+    assert calls == [
+        "intraday_decision",
+        "close_readiness",
+        "minute_cleanup",
+        "email_delivery",
+        "scheduler_overrun:decision_intraday",
+        "scheduler_missed:decision_close_readiness",
+    ]
+
+
+def test_intraday_trigger_uses_three_minute_a_share_sessions() -> None:
+    trigger = _intraday_trigger("Asia/Shanghai")
+    rendered = [str(item) for item in trigger.triggers]
+
+    assert any("hour='9'" in item and "minute='30-59/3'" in item for item in rendered)
+    assert any("hour='10'" in item and "minute='0-59/3'" in item for item in rendered)
+    assert any("hour='11'" in item and "minute='0-30/3'" in item for item in rendered)
+    assert any("hour='13-14'" in item and "minute='0-59/3'" in item for item in rendered)
+    assert any("hour='15'" in item and "minute='0'" in item for item in rendered)
+
+
+def test_close_readiness_trigger_checks_every_five_minutes_until_1630() -> None:
+    trigger = _close_readiness_trigger("Asia/Shanghai")
+    rendered = [str(item) for item in trigger.triggers]
+
+    assert any("hour='15'" in item and "minute='15-59/5'" in item for item in rendered)
+    assert any("hour='16'" in item and "minute='0-30/5'" in item for item in rendered)

@@ -5,6 +5,7 @@ import { Save, LogOut } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
 import { useSessionStore } from '@/stores/session'
 import { useLogoutMutation } from '@/queries/auth'
+import EmailNotificationPanel from './EmailNotificationPanel.vue'
 
 const session = useSessionStore()
 const router = useRouter()
@@ -56,5 +57,7 @@ async function onLogout() {
       </Button>
       <p class="text-xs text-muted-foreground">退出登录只清除前端 token，不暗示后端 token 已撤销。</p>
     </section>
+
+    <EmailNotificationPanel />
   </div>
 </template>

@@ -22,6 +22,7 @@ test('左侧导航包含主要入口', async () => {
   await renderShell()
 
   expect(screen.getByRole('link', { name: '今日仪表盘' })).toBeInTheDocument()
+  expect(screen.getByRole('link', { name: '行情' })).toBeInTheDocument()
   expect(screen.getByRole('link', { name: '准备' })).toBeInTheDocument()
   expect(screen.getByRole('link', { name: '监控' })).toBeInTheDocument()
   expect(screen.getByRole('link', { name: '复盘' })).toBeInTheDocument()
@@ -37,6 +38,7 @@ test('顶部安全文案显示本地决策辅助说明', async () => {
 test('窄屏也提供移动导航入口', async () => {
   await renderShell()
 
+  expect(screen.getByRole('link', { name: '移动导航 行情' })).toBeInTheDocument()
   expect(screen.getByRole('link', { name: '移动导航 准备' })).toBeInTheDocument()
   expect(screen.getByRole('link', { name: '移动导航 监控' })).toBeInTheDocument()
 })

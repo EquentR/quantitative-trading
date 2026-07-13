@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC
 
-from quantitative_trading.notification.models import NotificationSummary
+from quantitative_trading.notification.models import NotificationStatus, NotificationSummary
 
 
 class NotificationRepository:
@@ -15,6 +15,7 @@ class NotificationRepository:
             """
             INSERT INTO notifications (
               notification_id,
+              dedup_key,
               recommendation_id,
               symbol,
               action,
@@ -30,9 +31,11 @@ class NotificationRepository:
               ?,
               ?,
               ?,
+              ?,
               ?
             )
             ON CONFLICT(notification_id) DO UPDATE SET
+              dedup_key = excluded.dedup_key,
               recommendation_id = excluded.recommendation_id,
               symbol = excluded.symbol,
               action = excluded.action,
@@ -43,6 +46,7 @@ class NotificationRepository:
             """,
             (
                 summary.notification_id,
+                summary.dedup_key,
                 summary.recommendation_id,
                 summary.symbol,
                 summary.action,
@@ -55,6 +59,15 @@ class NotificationRepository:
         if commit:
             self.connection.commit()
         return summary
+
+    def get_by_dedup_key(self, dedup_key: str) -> NotificationSummary | None:
+        row = self.connection.execute(
+            "SELECT payload_json FROM notifications WHERE dedup_key = ?",
+            (dedup_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return NotificationSummary.model_validate_json(row["payload_json"])
 
     def get(self, notification_id: str) -> NotificationSummary | None:
         row = self.connection.execute(
@@ -70,16 +83,49 @@ class NotificationRepository:
         return NotificationSummary.model_validate_json(row["payload_json"])
 
     def list_recent(self, *, limit: int = 50) -> list[NotificationSummary]:
+        return self.list(limit=limit)
+
+    def list(
+        self,
+        *,
+        status: NotificationStatus | None = None,
+        symbol: str | None = None,
+        action: str | None = None,
+        recommendation_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[NotificationSummary]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        for column, value in (
+            ("status", status.value if status is not None else None),
+            ("symbol", symbol),
+            ("action", action),
+            ("recommendation_id", recommendation_id),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                parameters.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.extend((limit, offset))
         rows = self.connection.execute(
-            """
+            f"""
             SELECT payload_json
             FROM notifications
-            ORDER BY created_at DESC, rowid DESC
-            LIMIT ?
+            {where}
+            ORDER BY created_at DESC, notification_id DESC
+            LIMIT ? OFFSET ?
             """,
-            (limit,),
+            parameters,
         ).fetchall()
         return [NotificationSummary.model_validate_json(row["payload_json"]) for row in rows]
+
+    def count_unread(self) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM notifications WHERE status = ?",
+            (NotificationStatus.UNREAD.value,),
+        ).fetchone()
+        return int(row["count"])
 
     def list_by_recommendation_id(
         self,

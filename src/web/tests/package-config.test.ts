@@ -30,4 +30,8 @@ describe('web package configuration', () => {
       expect(version, `${name} should use an exact version`).toMatch(exactVersionPattern)
     }
   })
+
+  test('uses Apache ECharts for market visualizations', () => {
+    expect(packageJson.dependencies?.echarts).toMatch(exactVersionPattern)
+  })
 })

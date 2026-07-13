@@ -7,17 +7,42 @@ import sys
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 import typer
 from pydantic import ValidationError
 
 from quantitative_trading.account.service import AccountService
-from quantitative_trading.cash.repository import CashAccountNotInitializedError, CashAccountRepository
-from quantitative_trading.cash.service import CashService, CashTransferError, ReadOnlyCashService
+from quantitative_trading.audit.repository import AuditLogRepository
+from quantitative_trading.audit.service import AuditService
+from quantitative_trading.cash.repository import (
+    CashAccountNotInitializedError,
+    CashAccountRepository,
+)
+from quantitative_trading.cash.service import (
+    CashService,
+    CashTransferError,
+    ReadOnlyCashService,
+)
 from quantitative_trading.config import Settings, load_settings
+from quantitative_trading.decision.factory import build_decision_workflow
+from quantitative_trading.decision.workflow import DecisionWorkflow
+from quantitative_trading.email.models import EmailDeliveryStatus
+from quantitative_trading.email.outbox import (
+    EmailDeliveryNotRetryableError,
+    EmailDeliveryRepository,
+    EmailDeliveryService,
+)
+from quantitative_trading.email.repository import SmtpSettingsRepository
+from quantitative_trading.email.service import (
+    SmtplibEmailSender,
+    SmtpSettingsNotConfiguredError,
+    SmtpSettingsService,
+    sanitized_email_error,
+)
 from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import (
     DuplicatePositionError,
@@ -30,9 +55,19 @@ from quantitative_trading.market.providers import (
     DisabledMarketProvider,
     MarketDataProvider,
 )
+from quantitative_trading.market.adapters import (
+    AkShareDailyBarProvider,
+    AkShareIntradayProvider,
+    AkShareMoneyFlowProvider,
+)
+from quantitative_trading.market.calendar import XSHGTradingCalendar
+from quantitative_trading.market.cli_service import MarketCliService
+from quantitative_trading.market.models import CaptureRunStatus
 from quantitative_trading.market.snapshot_service import MarketSnapshotService
+from quantitative_trading.notification.models import NotificationStatus
+from quantitative_trading.notification.repository import NotificationRepository
+from quantitative_trading.notification.service import NotificationService
 from quantitative_trading.planning.repository import TradingPlanRepository
-from quantitative_trading.planning.workflow import generate_trading_plan
 from quantitative_trading.recommendation.repository import RecommendationRepository
 from quantitative_trading.recommendation.scanner import (
     PlanNotScannableError,
@@ -40,6 +75,7 @@ from quantitative_trading.recommendation.scanner import (
 )
 from quantitative_trading.runtime.service_app import run_api_service
 from quantitative_trading.runtime.service_runner import DebugServiceRunner
+from quantitative_trading.sanitization import safe_error_summary
 from quantitative_trading.storage.sqlite import connect, migrate
 from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
 from quantitative_trading.watchlist.repository import (
@@ -62,6 +98,9 @@ market_app = typer.Typer()
 watchlist_app = typer.Typer()
 plan_app = typer.Typer()
 recommendations_app = typer.Typer()
+notifications_app = typer.Typer()
+email_app = typer.Typer()
+workflow_app = typer.Typer()
 
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(service_app, name="service")
@@ -71,6 +110,9 @@ app.add_typer(market_app, name="market")
 app.add_typer(watchlist_app, name="watchlist")
 app.add_typer(plan_app, name="plan")
 app.add_typer(recommendations_app, name="recommendations")
+app.add_typer(notifications_app, name="notifications")
+app.add_typer(email_app, name="email")
+app.add_typer(workflow_app, name="workflow")
 
 
 def _services() -> tuple[
@@ -104,7 +146,9 @@ def _services() -> tuple[
 
 @contextmanager
 def _connect_read_only(database_path: Path) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(f"{database_path.resolve().as_uri()}?mode=ro", uri=True)
+    connection = sqlite3.connect(
+        f"{database_path.resolve().as_uri()}?mode=ro", uri=True
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     try:
@@ -135,7 +179,9 @@ def _read_only_services() -> tuple[Any | None, ReadOnlyLedgerService | None]:
 def _service_scope() -> Iterator[
     tuple[LedgerService, ReadOnlyLedgerService, CashService, ReadOnlyCashService]
 ]:
-    connection_cm, ledger_service, ledger_read_only, cash_service, cash_read_only = _services()
+    connection_cm, ledger_service, ledger_read_only, cash_service, cash_read_only = (
+        _services()
+    )
     try:
         yield ledger_service, ledger_read_only, cash_service, cash_read_only
     finally:
@@ -606,7 +652,9 @@ def list_cash_transactions(
 
 
 @account_app.command("snapshot")
-def account_snapshot(json_output: Annotated[bool, typer.Option("--json")] = False) -> None:
+def account_snapshot(
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
     settings = load_settings()
     with _service_scope() as (_, ledger_read_only, _, cash_read_only):
         account_service = AccountService(
@@ -650,24 +698,305 @@ def market_snapshot() -> None:
         typer.echo(f"warning={warning}")
 
 
+def _market_cli_service(connection: sqlite3.Connection) -> MarketCliService:
+    calendar = XSHGTradingCalendar()
+    return MarketCliService(
+        connection,
+        calendar=calendar,
+        daily_provider=AkShareDailyBarProvider(calendar=calendar),
+        money_flow_provider=AkShareMoneyFlowProvider(calendar=calendar),
+    )
+
+
+def _market_maintenance_workflow(
+    connection: sqlite3.Connection,
+) -> DecisionWorkflow:
+    calendar = XSHGTradingCalendar()
+    return DecisionWorkflow(
+        connection,
+        calendar=calendar,
+        quote_provider=DisabledMarketProvider(),
+        daily_provider=AkShareDailyBarProvider(calendar=calendar),
+        money_flow_provider=AkShareMoneyFlowProvider(calendar=calendar),
+        intraday_provider=AkShareIntradayProvider(calendar=calendar),
+        now=lambda: datetime.now(UTC),
+    )
+
+
+def _echo_market_backfill(summary) -> None:
+    typer.echo(
+        f"run_id={summary.run_id} workflow=backfill "
+        f"date={summary.trade_date.isoformat()} status={summary.status.value} "
+        f"reused={str(summary.reused).lower()} requested={summary.requested_symbols} "
+        f"processed={summary.processed_symbols} failures={summary.failure_count}"
+    )
+    for result in summary.results:
+        typer.echo(
+            f"symbol={result.symbol} dataset={result.dataset.value} "
+            f"status={result.status.value} rows={result.actual_rows}/{result.expected_rows}"
+        )
+    for warning in summary.warnings:
+        typer.echo(f"warning={warning}")
+
+
+@market_app.command("backfill")
+def market_backfill(
+    date_text: Annotated[str, typer.Option("--date")],
+    symbols: Annotated[list[str] | None, typer.Option("--symbol")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    trading_day = _parse_trading_day(date_text)
+    try:
+        with _database_scope() as (settings, connection):
+            if (
+                not settings.enable_market_fetch
+                or settings.market_provider.strip().lower() != "akshare"
+            ):
+                raise ValueError("market backfill requires enabled akshare provider")
+            summary = _market_maintenance_workflow(connection).run_backfill(
+                trading_day,
+                symbols=symbols,
+            )
+    except Exception:
+        raise typer.BadParameter("market backfill failed") from None
+    if json_output:
+        typer.echo(summary.model_dump_json())
+    else:
+        _echo_market_backfill(summary)
+    if summary.status is CaptureRunStatus.FAILED:
+        raise typer.Exit(code=1)
+
+
+@market_app.command("cleanup")
+def market_cleanup(
+    date_text: Annotated[str, typer.Option("--date")],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    trading_day = _parse_trading_day(date_text)
+    try:
+        with _database_scope() as (_settings, connection):
+            result = _market_maintenance_workflow(connection).run_cleanup(trading_day)
+    except Exception:
+        raise typer.BadParameter("market cleanup failed") from None
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "run_id": result.run_id,
+                    "workflow_type": "cleanup",
+                    "trade_date": trading_day.isoformat(),
+                    "status": result.status.value,
+                    "reused": result.reused,
+                    "deleted_rows": result.cleaned_rows,
+                    "warnings": list(result.warnings),
+                },
+                ensure_ascii=False,
+            )
+        )
+    else:
+        typer.echo(
+            f"run_id={result.run_id} workflow=cleanup "
+            f"date={trading_day.isoformat()} status={result.status.value} "
+            f"reused={str(result.reused).lower()} deleted={result.cleaned_rows}"
+        )
+
+
+@market_app.command("runs")
+def market_runs(
+    limit: Annotated[int, typer.Option("--limit", min=1, max=200)] = 20,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    try:
+        with _database_scope() as (_settings, connection):
+            summary = _market_cli_service(connection).list_runs(limit=limit)
+    except Exception:
+        raise typer.BadParameter("market runs failed") from None
+    if json_output:
+        typer.echo(summary.model_dump_json())
+        return
+    if not summary.runs:
+        typer.echo("no market runs")
+        return
+    for run in summary.runs:
+        typer.echo(
+            f"run_id={run.run_id} workflow={run.workflow_type} "
+            f"date={run.trade_date.isoformat()} status={run.status.value} "
+            f"requested={run.requested_symbols} processed={run.processed_symbols} "
+            f"warnings={run.warning_count} failures={run.failure_count}"
+        )
+
+
+def _workflow_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _require_manual_reason(reason: str | None) -> str:
+    if reason is None or not reason.strip():
+        raise typer.BadParameter(
+            "reason is required for forced or calendar-override runs"
+        )
+    return reason.strip()
+
+
+def _audit_manual_workflow(
+    connection: sqlite3.Connection,
+    *,
+    workflow_type: str,
+    result,
+    now: datetime,
+    force: bool,
+    skip_calendar: bool,
+    manual_reason: str | None,
+) -> None:
+    AuditService(AuditLogRepository(connection)).record_event(
+        event_type="workflow.manual_run",
+        recommendation_id=None,
+        payload={
+            "workflow_type": workflow_type,
+            "run_id": result.run_id,
+            "force": force,
+            "skip_calendar": skip_calendar,
+            "manual_reason": manual_reason,
+        },
+        now=now,
+    )
+
+
+@workflow_app.command("intraday")
+def run_intraday_workflow(
+    force: Annotated[bool, typer.Option("--force")] = False,
+    reason: Annotated[str | None, typer.Option("--reason")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    now = _workflow_now()
+    calendar = XSHGTradingCalendar()
+    local_now = now.astimezone(calendar.timezone)
+    in_session = calendar.is_trading_day(
+        local_now.date()
+    ) and calendar.is_trading_minute(local_now)
+    manual_reason = reason.strip() if reason and reason.strip() else None
+    if not in_session:
+        if not force:
+            raise typer.BadParameter("intraday workflow is outside an XSHG session")
+        manual_reason = _require_manual_reason(manual_reason)
+    elif force:
+        manual_reason = _require_manual_reason(manual_reason)
+
+    try:
+        with _database_scope() as (settings, connection):
+            result = build_decision_workflow(
+                connection,
+                settings,
+                now=lambda: now,
+            ).run_intraday()
+            _audit_manual_workflow(
+                connection,
+                workflow_type="intraday",
+                result=result,
+                now=now,
+                force=force,
+                skip_calendar=False,
+                manual_reason=manual_reason,
+            )
+    except Exception as exc:
+        raise typer.BadParameter(
+            f"intraday workflow failed: {safe_error_summary(exc)}"
+        ) from None
+
+    payload = {
+        "run_id": result.run_id,
+        "reused": result.reused,
+        "market_input_snapshot_id": result.market_input_snapshot_id,
+        "recommendation_ids": list(result.recommendation_ids),
+        "warnings": list(result.warnings),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+        return
+    typer.echo(
+        f"run_id={result.run_id} workflow=intraday "
+        f"reused={str(result.reused).lower()} "
+        f"market_input_snapshot_id={result.market_input_snapshot_id} "
+        f"recommendations={len(result.recommendation_ids)}"
+    )
+    for warning in result.warnings:
+        typer.echo(f"warning={warning}")
+
+
+@workflow_app.command("close")
+def run_close_workflow(
+    date_text: Annotated[str | None, typer.Option("--date")] = None,
+    force: Annotated[bool, typer.Option("--force")] = False,
+    skip_calendar: Annotated[bool, typer.Option("--skip-calendar")] = False,
+    reason: Annotated[str | None, typer.Option("--reason")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    now = _workflow_now()
+    calendar = XSHGTradingCalendar()
+    local_now = now.astimezone(ZoneInfo("Asia/Shanghai"))
+    trade_date = (
+        local_now.date() if date_text is None else _parse_trading_day(date_text)
+    )
+    in_close_window = trade_date == local_now.date() and time(
+        15, 15
+    ) <= local_now.time().replace(tzinfo=None) <= time(16, 30)
+    manual_reason = reason.strip() if reason and reason.strip() else None
+    if force or skip_calendar or not in_close_window:
+        manual_reason = _require_manual_reason(manual_reason)
+    if (
+        trade_date == local_now.date()
+        and local_now.time().replace(tzinfo=None) < time(15, 15)
+        and not force
+    ):
+        raise typer.BadParameter("close workflow before 15:15 requires --force")
+    if not calendar.is_trading_day(trade_date) and not skip_calendar:
+        raise typer.BadParameter("close workflow requires an XSHG trading day")
+
+    try:
+        with _database_scope() as (settings, connection):
+            result = build_decision_workflow(
+                connection,
+                settings,
+                now=lambda: now,
+            ).run_close(trade_date, skip_calendar=skip_calendar)
+            _audit_manual_workflow(
+                connection,
+                workflow_type="close",
+                result=result,
+                now=now,
+                force=force,
+                skip_calendar=skip_calendar,
+                manual_reason=manual_reason,
+            )
+    except Exception as exc:
+        raise typer.BadParameter(
+            f"close workflow failed: {safe_error_summary(exc)}"
+        ) from None
+
+    payload = {
+        "run_id": result.run_id,
+        "ready": result.ready,
+        "reused": result.reused,
+        "market_input_snapshot_id": result.market_input_snapshot_id,
+        "plan_id": result.plan_id,
+        "warnings": list(result.warnings),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
+        return
+    typer.echo(
+        f"run_id={result.run_id} workflow=close "
+        f"ready={str(result.ready).lower()} reused={str(result.reused).lower()} "
+        f"market_input_snapshot_id={result.market_input_snapshot_id} "
+        f"plan_id={result.plan_id or '-'}"
+    )
+    for warning in result.warnings:
+        typer.echo(f"warning={warning}")
+
+
 @plan_app.command("generate")
 def generate_plan(date_text: Annotated[str, typer.Option("--date")]) -> None:
-    trading_day = _parse_trading_day(date_text)
-    with _database_scope() as (settings, connection):
-        created = generate_trading_plan(
-            connection,
-            trading_day=trading_day,
-            now=datetime.now(UTC),
-            timezone=settings.timezone,
-        )
-    typer.echo(
-        f"plan_id={created.plan_id} "
-        f"trading_day={created.plan.trading_day.isoformat()} "
-        f"holdings={len(created.plan.holding_symbols)} "
-        f"watch={len(created.plan.watch_symbols)}"
-    )
-    for warning in created.plan.warnings:
-        typer.echo(f"warning={warning}")
+    raise typer.BadParameter("qt plan generate is deprecated; use qt workflow close")
 
 
 @plan_app.command("latest")
@@ -733,6 +1062,178 @@ def show_recommendation(recommendation_id: Annotated[str, typer.Argument()]) -> 
         typer.echo("invalid_if=" + "; ".join(str(item) for item in invalid_if))
 
 
+@notifications_app.command("list")
+def list_notifications(
+    status: Annotated[NotificationStatus | None, typer.Option("--status")] = None,
+    symbol: Annotated[str | None, typer.Option("--symbol")] = None,
+    action: Annotated[str | None, typer.Option("--action")] = None,
+    recommendation_id: Annotated[
+        str | None,
+        typer.Option("--recommendation-id"),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=100)] = 50,
+    offset: Annotated[int, typer.Option("--offset", min=0)] = 0,
+) -> None:
+    with _database_scope() as (_settings, connection):
+        notifications = NotificationService(
+            NotificationRepository(connection)
+        ).list_notifications(
+            status=status,
+            symbol=symbol,
+            action=action,
+            recommendation_id=recommendation_id,
+            limit=limit,
+            offset=offset,
+        )
+    if not notifications:
+        typer.echo("暂无通知")
+        return
+    for notification in notifications:
+        typer.echo(
+            f"{notification.notification_id} "
+            f"{notification.symbol} "
+            f"{notification.action} "
+            f"status={notification.status.value} "
+            f"recommendation_id={notification.recommendation_id} "
+            f"data_time={notification.data_time.isoformat()}"
+        )
+
+
+@notifications_app.command("unread")
+def unread_notifications() -> None:
+    with _database_scope() as (_settings, connection):
+        count = NotificationService(NotificationRepository(connection)).unread_count()
+    typer.echo(f"unread={count}")
+
+
+@notifications_app.command("read")
+def read_notification(notification_id: Annotated[str, typer.Argument()]) -> None:
+    try:
+        with _database_scope() as (_settings, connection):
+            service = NotificationService(NotificationRepository(connection))
+            updated = service.mark_read(notification_id, commit=False)
+            AuditService(AuditLogRepository(connection)).record_event(
+                event_type="notification.read",
+                recommendation_id=updated.recommendation_id,
+                payload={"notification_id": notification_id},
+                commit=False,
+            )
+            connection.commit()
+    except KeyError:
+        raise typer.BadParameter(f"notification not found: {notification_id}") from None
+    typer.echo(
+        f"notification_id={updated.notification_id} status={updated.status.value}"
+    )
+
+
+@email_app.command("status")
+def email_status() -> None:
+    with _database_scope() as (_settings, connection):
+        settings = SmtpSettingsService(SmtpSettingsRepository(connection)).get_public()
+    typer.echo(
+        f"configured={str(settings.configured).lower()} "
+        f"enabled={str(settings.enabled).lower()} "
+        f"password_configured={str(settings.password_configured).lower()} "
+        f"host={settings.host or '-'} "
+        f"port={settings.port} "
+        f"security={settings.security.value} "
+        f"sender={settings.sender or '-'} "
+        f"recipient={settings.recipient or '-'}"
+    )
+
+
+@email_app.command("test")
+def test_email() -> None:
+    with _database_scope() as (_settings, connection):
+        repository = SmtpSettingsRepository(connection)
+        service = SmtpSettingsService(repository)
+        configured = repository.get()
+        if configured is None:
+            typer.echo("smtp_test=not_configured")
+            return
+        secret_texts = (configured.password,) if configured.password else ()
+        audit_service = AuditService(
+            AuditLogRepository(connection),
+            configured_secret_texts=secret_texts,
+        )
+        try:
+            tested = service.send_test(SmtplibEmailSender())
+        except SmtpSettingsNotConfiguredError:
+            typer.echo("smtp_test=not_configured")
+            return
+        except Exception as exc:
+            error = sanitized_email_error(exc, secret_texts=secret_texts)
+            audit_service.record_event(
+                event_type="smtp.test.failed",
+                recommendation_id=None,
+                payload={"error": error},
+            )
+            raise typer.BadParameter(f"smtp test failed: {error}") from None
+        audit_service.record_event(
+            event_type="smtp.test.succeeded",
+            recommendation_id=None,
+            payload={"recipient": tested.recipient},
+        )
+    typer.echo(f"smtp_test=sent recipient={tested.recipient}")
+
+
+def _email_delivery_service(connection: sqlite3.Connection) -> EmailDeliveryService:
+    return EmailDeliveryService(
+        EmailDeliveryRepository(connection),
+        SmtpSettingsRepository(connection),
+        SmtplibEmailSender(),
+        audit_repository=AuditLogRepository(connection),
+    )
+
+
+@email_app.command("deliveries")
+def list_email_deliveries(
+    status: Annotated[EmailDeliveryStatus | None, typer.Option("--status")] = None,
+    notification_id: Annotated[
+        str | None,
+        typer.Option("--notification-id"),
+    ] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=100)] = 50,
+    offset: Annotated[int, typer.Option("--offset", min=0)] = 0,
+) -> None:
+    with _database_scope() as (_settings, connection):
+        deliveries = _email_delivery_service(connection).list_deliveries(
+            status=status,
+            notification_id=notification_id,
+            limit=limit,
+            offset=offset,
+        )
+    if not deliveries:
+        typer.echo("暂无邮件投递")
+        return
+    for delivery in deliveries:
+        typer.echo(
+            f"{delivery.delivery_id} "
+            f"status={delivery.status.value} "
+            f"attempts={delivery.attempt_count} "
+            f"notification_id={delivery.notification_id or '-'} "
+            f"next_attempt_at="
+            f"{delivery.next_attempt_at.isoformat() if delivery.next_attempt_at else '-'}"
+        )
+
+
+@email_app.command("retry")
+def retry_email_delivery(delivery_id: Annotated[str, typer.Argument()]) -> None:
+    try:
+        with _database_scope() as (_settings, connection):
+            delivery = _email_delivery_service(connection).manual_retry(delivery_id)
+    except KeyError:
+        raise typer.BadParameter(f"email delivery not found: {delivery_id}") from None
+    except EmailDeliveryNotRetryableError:
+        raise typer.BadParameter(
+            f"email delivery is not retryable: {delivery_id}"
+        ) from None
+    typer.echo(
+        f"delivery_id={delivery.delivery_id} "
+        f"status={delivery.status.value} attempts={delivery.attempt_count}"
+    )
+
+
 @service_app.command("check")
 def check_service() -> None:
     with _read_only_service_scope() as read_only:
@@ -744,11 +1245,15 @@ def check_service() -> None:
 @service_app.command("run", help="Run the unified HTTP API and scheduler service.")
 def run_service() -> None:
     settings = load_settings()
-    typer.echo(f"api service starting host={settings.api_host} port={settings.api_port}")
+    typer.echo(
+        f"api service starting host={settings.api_host} port={settings.api_port}"
+    )
     run_api_service(settings)
 
 
-@service_app.command("debug-run", help="Run the debug foreground account snapshot service.")
+@service_app.command(
+    "debug-run", help="Run the debug foreground account snapshot service."
+)
 def debug_run_service(once: Annotated[bool, typer.Option("--once")] = False) -> None:
     settings = load_settings()
 
@@ -761,7 +1266,9 @@ def debug_run_service(once: Annotated[bool, typer.Option("--once")] = False) -> 
             )
             return account_service.create_snapshot()
 
-    runner = DebugServiceRunner(snapshot_factory=snapshot_factory, log_dir=settings.log_dir)
+    runner = DebugServiceRunner(
+        snapshot_factory=snapshot_factory, log_dir=settings.log_dir
+    )
     snapshot = runner.run_once(reason="startup")
     typer.echo(f"debug service started status={snapshot.status.value}")
     if once:

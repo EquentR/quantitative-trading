@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, time
 import logging
 from zoneinfo import ZoneInfo
 
@@ -9,10 +9,27 @@ import uvicorn
 
 from quantitative_trading.api.app import create_app
 from quantitative_trading.config import Settings
-from quantitative_trading.planning.workflow import generate_trading_plan
+from quantitative_trading.decision.factory import (
+    build_decision_workflow,
+    build_notification_dispatcher,
+)
+from quantitative_trading.email.outbox import (
+    EmailDeliveryRepository,
+    EmailDeliveryService,
+)
+from quantitative_trading.email.repository import SmtpSettingsRepository
+from quantitative_trading.email.service import SmtplibEmailSender
+from quantitative_trading.audit.repository import AuditLogRepository
+from quantitative_trading.market.calendar import XSHGTradingCalendar
+from quantitative_trading.market.models import (
+    CaptureRunAlreadyActiveError,
+    CaptureRunStatus,
+)
 from quantitative_trading.recommendation.scanner import PlanNotScannableError
 from quantitative_trading.recommendation.scanner import scan_latest_plan_recommendations
-from quantitative_trading.runtime.account_snapshot_job import create_and_save_account_snapshot
+from quantitative_trading.runtime.account_snapshot_job import (
+    create_and_save_account_snapshot,
+)
 from quantitative_trading.runtime.scheduler import SchedulerManager
 from quantitative_trading.sanitization import safe_error_summary
 from quantitative_trading.storage.scheduler_state import SchedulerState
@@ -32,6 +49,9 @@ class SchedulerJobResult:
     snapshot_id: int | None = None
     plan_id: str | None = None
     recommendation_ids: list[str] | None = None
+    run_id: str | None = None
+    cleaned_rows: int | None = None
+    delivery_ids: list[str] | None = None
 
 
 def run_api_service(settings: Settings) -> None:
@@ -39,13 +59,63 @@ def run_api_service(settings: Settings) -> None:
         started_at = datetime.now(UTC)
         try:
             result = _run_scheduler_task(settings, reason)
+        except CaptureRunAlreadyActiveError as exc:
+            result = SchedulerJobResult(
+                task_type=_task_type_for_reason(reason),
+                reason=f"scheduler_overrun:{reason}",
+                status="skipped",
+                error=safe_error_summary(exc),
+            )
         except Exception as exc:
+            error = safe_error_summary(exc)
             result = SchedulerJobResult(
                 task_type=_task_type_for_reason(reason),
                 reason=reason,
                 status="failed",
-                error=safe_error_summary(exc),
+                error=error,
             )
+            try:
+                _dispatch_runtime_alert(
+                    settings,
+                    reason=reason,
+                    error=error,
+                    now=started_at,
+                    event_type="workflow.failed",
+                )
+            except Exception as alert_exc:
+                LOGGER.warning(
+                    "runtime alert dispatch failed for task_type=%s: %s",
+                    result.task_type,
+                    safe_error_summary(alert_exc),
+                )
+
+        if result.status == "skipped" and result.reason.startswith(
+            ("scheduler_overrun:", "scheduler_missed:")
+        ):
+            event_type = (
+                "workflow.overrun"
+                if result.reason.startswith("scheduler_overrun:")
+                else "workflow.missed"
+            )
+            error = (
+                "scheduler job skipped because the previous run is already running"
+                if event_type == "workflow.overrun"
+                else "scheduler job skipped because its scheduled run time was missed"
+            )
+            try:
+                _dispatch_runtime_alert(
+                    settings,
+                    reason=result.reason,
+                    error=error,
+                    now=started_at,
+                    event_type=event_type,
+                )
+            except Exception as alert_exc:
+                LOGGER.warning(
+                    "runtime alert dispatch failed for task_type=%s: %s",
+                    result.task_type,
+                    safe_error_summary(alert_exc),
+                )
 
         finished_at = datetime.now(UTC)
         try:
@@ -72,13 +142,128 @@ def run_api_service(settings: Settings) -> None:
         job=run_trading_job,
     )
     if state.enabled and state.run_on_start:
-        run_trading_job("startup", suppress_record_errors=True)
+        recovery_reason = _startup_recovery_reason(datetime.now(UTC))
+        if recovery_reason is not None:
+            run_trading_job(recovery_reason, suppress_record_errors=True)
 
     app = create_app(settings, scheduler=scheduler, restore_scheduler=True)
     uvicorn.run(app, host=settings.api_host, port=settings.api_port)
 
 
-def _run_scheduler_task(settings: Settings, reason: str) -> SchedulerJobResult:
+def _run_scheduler_task(
+    settings: Settings,
+    reason: str,
+    *,
+    now: datetime | None = None,
+) -> SchedulerJobResult:
+    task_now = now or datetime.now(UTC)
+    if task_now.tzinfo is None or task_now.utcoffset() is None:
+        raise ValueError("scheduler task time must be timezone-aware")
+    calendar = XSHGTradingCalendar()
+    local_now = task_now.astimezone(calendar.timezone)
+    trade_date = local_now.date()
+
+    if reason.startswith(("scheduler_overrun:", "scheduler_missed:")):
+        return SchedulerJobResult(
+            task_type="scheduler",
+            reason=reason,
+            status="skipped",
+            recommendation_ids=[],
+        )
+
+    if reason == "intraday_decision":
+        if not calendar.is_trading_day(trade_date) or not calendar.is_trading_minute(
+            local_now
+        ):
+            return SchedulerJobResult(
+                task_type="intraday",
+                reason="not_trading_session",
+                status="skipped",
+                recommendation_ids=[],
+            )
+        with connect(settings) as connection:
+            migrate(connection)
+            workflow = _build_decision_workflow(connection, settings, task_now)
+            result = workflow.run_intraday()
+        return SchedulerJobResult(
+            task_type="intraday",
+            reason="intraday_reused" if result.reused else "intraday_completed",
+            status=(
+                "failed"
+                if result.status is CaptureRunStatus.FAILED
+                else "degraded"
+                if result.status is CaptureRunStatus.DEGRADED
+                else "success"
+            ),
+            snapshot_id=result.market_input_snapshot_id,
+            recommendation_ids=list(result.recommendation_ids),
+            run_id=result.run_id,
+        )
+
+    if reason == "close_readiness":
+        if not calendar.is_trading_day(trade_date) or not (
+            time(15, 15) <= local_now.time().replace(tzinfo=None) <= time(16, 30)
+        ):
+            return SchedulerJobResult(
+                task_type="close",
+                reason="outside_close_window",
+                status="skipped",
+                recommendation_ids=[],
+            )
+        with connect(settings) as connection:
+            migrate(connection)
+            workflow = _build_decision_workflow(connection, settings, task_now)
+            result = workflow.run_close(trade_date)
+        return SchedulerJobResult(
+            task_type="close",
+            reason=(
+                "close_reused"
+                if result.reused
+                else "close_published"
+                if result.ready
+                else "close_not_ready"
+            ),
+            status="success" if result.ready else "degraded",
+            snapshot_id=result.market_input_snapshot_id,
+            plan_id=result.plan_id,
+            recommendation_ids=[],
+            run_id=result.run_id,
+        )
+
+    if reason == "minute_cleanup":
+        if not calendar.is_trading_day(trade_date):
+            return SchedulerJobResult(
+                task_type="cleanup",
+                reason="not_trading_day",
+                status="skipped",
+                recommendation_ids=[],
+                cleaned_rows=0,
+            )
+        with connect(settings) as connection:
+            migrate(connection)
+            result = _build_decision_workflow(
+                connection, settings, task_now
+            ).run_cleanup(trade_date)
+        return SchedulerJobResult(
+            task_type="cleanup",
+            reason="minute_cleanup_completed",
+            recommendation_ids=[],
+            run_id=result.run_id,
+            cleaned_rows=result.cleaned_rows,
+        )
+
+    if reason == "email_delivery":
+        with connect(settings) as connection:
+            migrate(connection)
+            deliveries = _email_delivery_service(connection).process_due(now=task_now)
+        return SchedulerJobResult(
+            task_type="email_delivery",
+            reason="email_delivery_processed",
+            recommendation_ids=[],
+            delivery_ids=[delivery.delivery_id for delivery in deliveries],
+        )
+
+    # Backward-compatible manual snapshot entry. It is not registered by SchedulerManager.
     if reason in {"intraday", "startup", "manual_api"}:
         created = create_and_save_account_snapshot(settings)
         return SchedulerJobResult(
@@ -87,38 +272,64 @@ def _run_scheduler_task(settings: Settings, reason: str) -> SchedulerJobResult:
             snapshot_id=created.snapshot_id,
             recommendation_ids=[],
         )
-    if reason == "close_plan_daily":
-        return _run_close_plan_job(settings)
     if reason == "intraday_trigger":
         return _run_intraday_trigger_job(settings)
     raise ValueError("unknown scheduler task")
 
 
-def _run_close_plan_job(settings: Settings) -> SchedulerJobResult:
-    now = datetime.now(UTC)
-    local_now = now.astimezone(ZoneInfo(settings.timezone))
-    trading_day = _next_weekday(local_now.date())
-    with connect(settings) as connection:
-        migrate(connection)
-        created = generate_trading_plan(
-            connection,
-            trading_day=trading_day,
-            now=now,
-            timezone=settings.timezone,
-        )
-    return SchedulerJobResult(
-        task_type="close_plan_daily",
-        reason="close_plan_generated",
-        plan_id=created.plan_id,
-        recommendation_ids=[],
+def _build_decision_workflow(
+    connection,
+    settings: Settings,
+    now: datetime,
+):
+    return build_decision_workflow(connection, settings, now=lambda: now)
+
+
+def _email_delivery_service(connection) -> EmailDeliveryService:
+    return EmailDeliveryService(
+        EmailDeliveryRepository(connection),
+        SmtpSettingsRepository(connection),
+        SmtplibEmailSender(),
+        audit_repository=AuditLogRepository(connection),
     )
 
 
-def _next_weekday(current_day: date) -> date:
-    trading_day = current_day + timedelta(days=1)
-    while trading_day.weekday() >= 5:
-        trading_day += timedelta(days=1)
-    return trading_day
+def _dispatch_runtime_alert(
+    settings: Settings,
+    *,
+    reason: str,
+    error: str,
+    now: datetime,
+    event_type: str = "workflow.failed",
+) -> None:
+    with connect(settings) as connection:
+        migrate(connection)
+        build_notification_dispatcher(connection, settings).dispatch_system_alert(
+            alert_key=f"{reason}:{now.astimezone(ZoneInfo(settings.timezone)).date()}",
+            event_type=event_type,
+            message=f"workflow {reason}: {error}",
+            details={
+                "workflow_type": _task_type_for_reason(reason),
+                "status": "skipped" if event_type != "workflow.failed" else "failed",
+                "error": error,
+            },
+            now=now,
+        )
+
+
+def _startup_recovery_reason(now: datetime) -> str | None:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("startup recovery time must be timezone-aware")
+    calendar = XSHGTradingCalendar()
+    local_now = now.astimezone(calendar.timezone)
+    if not calendar.is_trading_day(local_now.date()):
+        return None
+    local_time = local_now.time().replace(tzinfo=None)
+    if time(15, 15) <= local_time <= time(16, 30):
+        return "close_readiness"
+    if calendar.is_trading_minute(local_now):
+        return "intraday_decision"
+    return None
 
 
 def _run_intraday_trigger_job(settings: Settings) -> SchedulerJobResult:
@@ -147,8 +358,7 @@ def _run_intraday_trigger_job(settings: Settings) -> SchedulerJobResult:
         reason="recommendations_generated",
         plan_id=scan.plan.plan_id,
         recommendation_ids=[
-            recommendation.recommendation_id
-            for recommendation in scan.recommendations
+            recommendation.recommendation_id for recommendation in scan.recommendations
         ],
     )
 
@@ -201,8 +411,16 @@ def _record_scheduler_result(
 
 
 def _task_type_for_reason(reason: str) -> str:
-    if reason == "close_plan_daily":
-        return "close_plan_daily"
+    if reason.startswith(("scheduler_overrun:", "scheduler_missed:")):
+        return "scheduler"
+    if reason == "intraday_decision":
+        return "intraday"
+    if reason == "close_readiness":
+        return "close"
+    if reason == "minute_cleanup":
+        return "cleanup"
+    if reason == "email_delivery":
+        return "email_delivery"
     if reason == "intraday_trigger":
         return "recommendation_intraday_trigger"
     return "account_snapshot"

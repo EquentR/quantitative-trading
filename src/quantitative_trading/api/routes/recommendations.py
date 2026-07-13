@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ValidationError
 
 from quantitative_trading.api.dependencies import (
@@ -13,6 +13,10 @@ from quantitative_trading.api.dependencies import (
     require_token,
 )
 from quantitative_trading.api.errors import ApiError
+from quantitative_trading.market.models import MarketInputSnapshot
+from quantitative_trading.market.repository import MarketInputSnapshotRepository
+from quantitative_trading.planning.models import TradingPlan
+from quantitative_trading.planning.repository import TradingPlanRepository
 from quantitative_trading.recommendation.models import Recommendation
 from quantitative_trading.recommendation.repository import RecommendationRepository
 from quantitative_trading.recommendation.scanner import (
@@ -31,6 +35,20 @@ router = APIRouter(
 class RecommendationScanResponse(BaseModel):
     count: int
     recommendations: list[Recommendation]
+
+
+class RecommendationListResponse(BaseModel):
+    items: list[Recommendation]
+    total: int
+    page: int
+    page_size: int
+
+
+class RecommendationTraceResponse(BaseModel):
+    recommendation: Recommendation
+    plan: TradingPlan | None
+    market_input_snapshot: MarketInputSnapshot | None
+    references: dict[str, dict[str, object]]
 
 
 def _current_time() -> datetime:
@@ -94,13 +112,65 @@ def scan_recommendations(
     )
 
 
-@router.get("", response_model=list[Recommendation])
+@router.get("", response_model=list[Recommendation] | RecommendationListResponse)
 def list_recommendations(
+    page: int | None = Query(default=None, ge=1),
+    page_size: int | None = Query(default=None, ge=1, le=100),
     container: ApiContainer = Depends(get_container),
-) -> list[Recommendation]:
+) -> list[Recommendation] | RecommendationListResponse:
     try:
         with connection_scope(container.settings) as connection:
-            return RecommendationRepository(connection).list()
+            repository = RecommendationRepository(connection)
+            if page is None and page_size is None:
+                return repository.list()
+            selected_page = page or 1
+            selected_page_size = page_size or 20
+            return RecommendationListResponse(
+                items=repository.list(
+                    limit=selected_page_size,
+                    offset=(selected_page - 1) * selected_page_size,
+                ),
+                total=repository.count(),
+                page=selected_page,
+                page_size=selected_page_size,
+            )
+    except (sqlite3.Error, ValidationError) as exc:
+        raise _recommendation_storage_failed() from exc
+
+
+@router.get(
+    "/{recommendation_id}/trace",
+    response_model=RecommendationTraceResponse,
+)
+def get_recommendation_trace(
+    recommendation_id: str,
+    container: ApiContainer = Depends(get_container),
+) -> RecommendationTraceResponse:
+    try:
+        with connection_scope(container.settings) as connection:
+            recommendation = RecommendationRepository(connection).get(recommendation_id)
+            if recommendation is None:
+                raise _recommendation_not_found()
+            plan = (
+                None
+                if recommendation.plan_id is None
+                else TradingPlanRepository(connection).get(recommendation.plan_id)
+            )
+            snapshot = (
+                None
+                if recommendation.market_input_snapshot_id is None
+                else MarketInputSnapshotRepository(connection).get(
+                    recommendation.market_input_snapshot_id
+                )
+            )
+            return RecommendationTraceResponse(
+                recommendation=recommendation,
+                plan=plan,
+                market_input_snapshot=snapshot,
+                references=recommendation.data_references,
+            )
+    except ApiError:
+        raise
     except (sqlite3.Error, ValidationError) as exc:
         raise _recommendation_storage_failed() from exc
 

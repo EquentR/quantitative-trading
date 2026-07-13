@@ -10,6 +10,19 @@ from quantitative_trading.strategy.models import PROFIT_PROMISE_PHRASES
 
 
 Confidence = Literal["low", "medium", "high"]
+DATA_REFERENCE_NAMES = (
+    "ledger",
+    "account",
+    "quote",
+    "history",
+    "money_flow",
+    "intraday",
+    "plan",
+)
+
+
+def _missing_data_references() -> dict[str, dict[str, str]]:
+    return {name: {"status": "missing"} for name in DATA_REFERENCE_NAMES}
 
 
 class RecommendationAction(StrEnum):
@@ -67,16 +80,47 @@ class Recommendation(BaseModel):
     risk: dict[str, Any]
     valid_until: datetime
     data_time: datetime
+    created_at: datetime | None = None
+    run_id: int | str | None = None
+    market_input_snapshot_id: int | None = Field(default=None, gt=0)
+    plan_id: str | None = None
+    data_references: dict[str, dict[str, Any]] = Field(
+        default_factory=_missing_data_references
+    )
+    data_quality: dict[str, Any] = Field(
+        default_factory=lambda: {"overall": "degraded", "warnings": ["input trace unavailable"]}
+    )
+    position_constraint: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("reason")
     @classmethod
     def reason_must_be_explanatory(cls, value: list[str]) -> list[str]:
         return _require_text_list(value, "reason")
 
-    @field_validator("valid_until", "data_time")
+    @field_validator("valid_until", "data_time", "created_at")
     @classmethod
-    def datetimes_must_be_timezone_aware(cls, value: datetime, info) -> datetime:
+    def datetimes_must_be_timezone_aware(
+        cls, value: datetime | None, info
+    ) -> datetime | None:
+        if value is None:
+            return None
         return _require_timezone_aware(value, info.field_name)
+
+    @field_validator("plan_id")
+    @classmethod
+    def plan_id_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("plan_id cannot be blank")
+        return value
+
+    @field_validator("run_id")
+    @classmethod
+    def run_id_must_be_valid(cls, value: int | str | None) -> int | str | None:
+        if isinstance(value, int) and value <= 0:
+            raise ValueError("run_id integer must be positive")
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("run_id cannot be blank")
+        return value
 
     @model_validator(mode="after")
     def constructive_outputs_must_have_invalidation(self) -> "Recommendation":
@@ -92,5 +136,15 @@ class Recommendation(BaseModel):
         notes = self.risk.get("notes")
         if isinstance(notes, list):
             self.risk["notes"] = _require_text_list(notes, "risk.notes")
+
+        references = {
+            name: dict(self.data_references.get(name, {"status": "missing"}))
+            for name in DATA_REFERENCE_NAMES
+        }
+        for name, reference in references.items():
+            status = reference.get("status")
+            if not isinstance(status, str) or not status.strip():
+                raise ValueError(f"data_references.{name}.status is required")
+        self.data_references = references
 
         return self

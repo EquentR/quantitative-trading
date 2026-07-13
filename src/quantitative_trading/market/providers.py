@@ -8,11 +8,16 @@ from typing import Any, Protocol
 
 import requests
 
-from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
+from quantitative_trading.market.models import (
+    LimitStatus,
+    QuoteSnapshot,
+    QuoteStatus,
+    TradingStatus,
+)
 from quantitative_trading.sanitization import safe_error_summary
 
 
-class MarketDataProvider(Protocol):
+class QuoteProvider(Protocol):
     """Boundary for market quote adapters.
 
     Providers may return a sparse mapping: if a requested symbol is absent,
@@ -22,6 +27,9 @@ class MarketDataProvider(Protocol):
 
     def get_quotes(self, symbols: Sequence[str]) -> dict[str, QuoteSnapshot]:
         ...
+
+
+MarketDataProvider = QuoteProvider
 
 
 class DisabledMarketProvider:
@@ -46,6 +54,12 @@ AKSHARE_SYMBOL_FIELD = "代码"
 AKSHARE_NAME_FIELD = "名称"
 AKSHARE_PRICE_FIELD = "最新价"
 AKSHARE_CHANGE_PCT_FIELD = "涨跌幅"
+AKSHARE_PREVIOUS_CLOSE_FIELD = "昨收"
+AKSHARE_OPEN_FIELD = "今开"
+AKSHARE_HIGH_FIELD = "最高"
+AKSHARE_LOW_FIELD = "最低"
+AKSHARE_VOLUME_FIELD = "成交量"
+AKSHARE_AMOUNT_FIELD = "成交额"
 EASTMONEY_SINGLE_QUOTE_URL = "https://82.push2.eastmoney.com/api/qt/stock/get"
 EASTMONEY_SINGLE_QUOTE_FIELDS = "f57,f58,f43,f170"
 EASTMONEY_SINGLE_QUOTE_TIMEOUT_SECONDS = 10.0
@@ -128,7 +142,10 @@ class AkShareMarketProvider:
                 warning=f"akshare quote mapping failed: {safe_error_summary(exc)}",
             )
 
-        warnings: list[str] = []
+        warnings: list[str] = [
+            "trading_status unavailable; kept unknown",
+            "limit_status unavailable; kept unknown",
+        ]
         name = ""
         try:
             name = _required_text(row, AKSHARE_NAME_FIELD)
@@ -143,16 +160,37 @@ class AkShareMarketProvider:
         except Exception as exc:
             warnings.append(f"{AKSHARE_CHANGE_PCT_FIELD} unavailable: {safe_error_summary(exc)}")
 
+        optional_values: dict[str, float | None] = {}
+        for model_field, source_field, positive, multiplier in (
+            ("previous_close", AKSHARE_PREVIOUS_CLOSE_FIELD, True, 1.0),
+            ("open_price", AKSHARE_OPEN_FIELD, True, 1.0),
+            ("high_price", AKSHARE_HIGH_FIELD, True, 1.0),
+            ("low_price", AKSHARE_LOW_FIELD, True, 1.0),
+            ("volume", AKSHARE_VOLUME_FIELD, False, 100.0),
+            ("amount", AKSHARE_AMOUNT_FIELD, False, 1.0),
+        ):
+            try:
+                value = _required_float(row, source_field, positive=positive)
+                if not positive and value < 0:
+                    raise ValueError(f"{source_field} must be nonnegative")
+                optional_values[model_field] = value * multiplier
+            except Exception as exc:
+                optional_values[model_field] = None
+                warnings.append(f"{source_field} unavailable: {safe_error_summary(exc)}")
+
         return QuoteSnapshot(
             symbol=symbol,
             name=name,
             current_price=current_price,
             change_pct=change_pct,
+            trading_status=TradingStatus.UNKNOWN,
+            limit_status=LimitStatus.UNKNOWN,
             data_time=fetched_at,
             fetched_at=fetched_at,
             source="akshare",
-            status=QuoteStatus.PARTIAL if warnings else QuoteStatus.OK,
+            status=QuoteStatus.PARTIAL,
             warning="; ".join(warnings),
+            **optional_values,
         )
 
     def _failed_quote(self, *, symbol: str, fetched_at: datetime, warning: str) -> QuoteSnapshot:
@@ -235,7 +273,11 @@ class AkShareMarketProvider:
             data_time=fetched_at,
             fetched_at=fetched_at,
             source="eastmoney_single_quote",
-            status=QuoteStatus.OK,
+            status=QuoteStatus.PARTIAL,
+            warning=(
+                "standard OHLC/volume/amount unavailable; "
+                "trading_status and limit_status kept unknown"
+            ),
         )
 
     def _tencent_quotes(
@@ -268,7 +310,11 @@ class AkShareMarketProvider:
                 data_time=fetched_at,
                 fetched_at=fetched_at,
                 source="tencent_quote",
-                status=QuoteStatus.OK,
+                status=QuoteStatus.PARTIAL,
+                warning=(
+                    "standard OHLC/volume/amount unavailable; "
+                    "trading_status and limit_status kept unknown"
+                ),
             )
         return quotes
 

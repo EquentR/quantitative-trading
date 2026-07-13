@@ -47,7 +47,9 @@ def scan_latest_plan_recommendations(
     if not _is_plan_scannable(plan, now=now):
         raise PlanNotScannableError(plan, now=now)
 
-    universe_snapshot = UniverseSnapshotRepository(connection).get(plan.universe_snapshot_id)
+    universe_snapshot = UniverseSnapshotRepository(connection).get(
+        plan.universe_snapshot_id
+    )
     members = [] if universe_snapshot is None else universe_snapshot.members
     positions = PositionRepository(connection).list()
     positions_by_symbol = {position.symbol: position for position in positions}
@@ -110,6 +112,33 @@ def _build_conservative_recommendation(
         price_context=_price_context(plan, member.symbol, account_snapshot),
         valid_until=plan.valid_until,
         data_time=now,
+        created_at=now,
+        run_id=plan.source_run_id,
+        market_input_snapshot_id=plan.market_input_snapshot_id,
+        plan_id=plan.plan_id,
+        data_references={
+            "ledger": {
+                "updated_at": None
+                if position is None
+                else position.updated_at.isoformat(),
+                "status": "missing" if position is None else "complete",
+            },
+            "account": {
+                "snapshot_id": (
+                    None if account_snapshot is None else account_snapshot.snapshot_id
+                ),
+                "status": "missing" if account_snapshot is None else "complete",
+            },
+            "quote": {"status": "missing"},
+            "history": {"status": "missing"},
+            "money_flow": {"status": "missing"},
+            "intraday": {"status": "missing"},
+            "plan": {"plan_id": plan.plan_id, "status": plan.status.value},
+        },
+        data_quality={
+            "overall": "degraded",
+            "warnings": ["兼容扫描未采集本轮实时行情，仅生成保守建议"],
+        },
     )
 
 

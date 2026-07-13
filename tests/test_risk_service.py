@@ -9,8 +9,8 @@ from quantitative_trading.account.models import (
     PositionValuation,
     PositionValuationStatus,
 )
-from quantitative_trading.risk.models import RiskConfig
-from quantitative_trading.risk.service import apply_risk
+from quantitative_trading.risk.models import RiskConfig, RiskContext
+from quantitative_trading.risk.service import apply_risk, calculate_buy_constraint
 from quantitative_trading.strategy.models import StrategyAction, StrategySignal
 
 
@@ -177,3 +177,142 @@ def test_single_position_ratio_above_limit_blocks_add() -> None:
     assert decision.allowed is False
     assert decision.action is StrategyAction.WATCH
     assert any("单票仓位" in reason for reason in decision.reasons)
+
+
+def test_proposed_buy_cannot_exceed_available_cash() -> None:
+    decision = apply_risk(
+        signal(StrategyAction.BUY),
+        snapshot(available_buying_cash=5000),
+        position=None,
+        config=RiskConfig(),
+        context=RiskContext(proposed_value=6000),
+    )
+
+    assert decision.allowed is False
+    assert decision.action is StrategyAction.WATCH
+    assert any("可用买入资金" in reason for reason in decision.reasons)
+
+
+def test_daily_new_buy_limit_includes_proposed_value() -> None:
+    decision = apply_risk(
+        signal(StrategyAction.BUY),
+        snapshot(total_assets=60000),
+        position=None,
+        config=RiskConfig(daily_new_buy_limit=0.20),
+        context=RiskContext(
+            proposed_value=4000,
+            daily_new_buy_value=9000,
+        ),
+    )
+
+    assert decision.allowed is False
+    assert any("单日新增买入" in reason for reason in decision.reasons)
+
+
+def test_trade_count_and_loss_cooldown_block_new_buy() -> None:
+    decision = apply_risk(
+        signal(StrategyAction.BUY),
+        snapshot(),
+        position=None,
+        config=RiskConfig(daily_trade_count_limit=3),
+        context=RiskContext(
+            proposed_value=1000,
+            daily_trade_count=3,
+            in_loss_cooldown=True,
+            consecutive_losses=2,
+        ),
+    )
+
+    assert decision.allowed is False
+    assert any("交易次数" in reason for reason in decision.reasons)
+    assert any("连续亏损冷却" in reason for reason in decision.reasons)
+
+
+def test_liquidity_threshold_blocks_buy_but_not_risk_sell() -> None:
+    config = RiskConfig(liquidity_amount_threshold=1_000_000)
+    context = RiskContext(liquidity_amount=900_000)
+
+    buy_decision = apply_risk(
+        signal(StrategyAction.BUY),
+        snapshot(),
+        position=None,
+        config=config,
+        context=context,
+    )
+    sell_decision = apply_risk(
+        signal(StrategyAction.SELL),
+        snapshot(),
+        position=valuation(),
+        config=config,
+        context=context,
+    )
+
+    assert buy_decision.action is StrategyAction.WATCH
+    assert any("流动性" in reason for reason in buy_decision.reasons)
+    assert sell_decision.allowed is True
+    assert sell_decision.action is StrategyAction.SELL
+
+
+def test_add_uses_projected_position_value_for_single_symbol_limit() -> None:
+    decision = apply_risk(
+        signal(StrategyAction.ADD),
+        snapshot(total_assets=60000),
+        position=valuation(market_value=17000),
+        config=RiskConfig(single_position_limit=0.30),
+        context=RiskContext(proposed_value=2000),
+    )
+
+    assert decision.allowed is False
+    assert any("加仓后单票仓位" in reason for reason in decision.reasons)
+
+
+def test_new_buy_constraint_uses_first_position_cap_and_rounds_to_board_lot() -> None:
+    constraint = calculate_buy_constraint(
+        current_price=10.01,
+        total_assets=60_000,
+        available_cash=50_000,
+        current_position_value=0,
+        current_total_position_value=10_000,
+        current_daily_new_buy_value=0,
+        has_position=False,
+        config=RiskConfig(),
+    )
+
+    assert constraint.suggested_quantity == 800
+    assert constraint.suggested_value == pytest.approx(8008)
+    assert constraint.board_lot == 100
+    assert "first_watch_position_max" in constraint.limiting_factors
+
+
+def test_add_constraint_respects_remaining_single_symbol_capacity() -> None:
+    constraint = calculate_buy_constraint(
+        current_price=10,
+        total_assets=60_000,
+        available_cash=50_000,
+        current_position_value=17_000,
+        current_total_position_value=20_000,
+        current_daily_new_buy_value=0,
+        has_position=True,
+        config=RiskConfig(single_position_limit=0.30),
+    )
+
+    assert constraint.suggested_quantity == 100
+    assert constraint.suggested_value == 1000
+    assert "single_position_limit" in constraint.limiting_factors
+
+
+def test_buy_constraint_returns_zero_when_cash_cannot_cover_one_board_lot() -> None:
+    constraint = calculate_buy_constraint(
+        current_price=10,
+        total_assets=60_000,
+        available_cash=999,
+        current_position_value=0,
+        current_total_position_value=10_000,
+        current_daily_new_buy_value=0,
+        has_position=False,
+        config=RiskConfig(),
+    )
+
+    assert constraint.suggested_quantity == 0
+    assert constraint.suggested_value == 0
+    assert "available_cash" in constraint.limiting_factors

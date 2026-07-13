@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -26,10 +27,12 @@ class NotificationService:
         recommendation: Recommendation,
         audit_ref: AuditLog,
         *,
+        dedup_key: str | None = None,
         now: datetime | None = None,
     ) -> NotificationSummary:
         return NotificationSummary(
             notification_id=self._id_factory(),
+            dedup_key=dedup_key,
             recommendation_id=recommendation.recommendation_id,
             symbol=recommendation.symbol,
             action=recommendation.action.value,
@@ -48,10 +51,29 @@ class NotificationService:
         recommendation: Recommendation,
         audit_ref: AuditLog,
         *,
+        dedup_key: str | None = None,
         now: datetime | None = None,
     ) -> NotificationSummary:
-        summary = self.build_summary(recommendation, audit_ref, now=now)
-        return self.repository.save(summary)
+        if dedup_key is not None:
+            existing = self.repository.get_by_dedup_key(dedup_key)
+            if existing is not None:
+                return existing
+        summary = self.build_summary(
+            recommendation,
+            audit_ref,
+            dedup_key=dedup_key,
+            now=now,
+        )
+        try:
+            return self.repository.save(summary)
+        except sqlite3.IntegrityError:
+            if dedup_key is None:
+                raise
+            self.repository.connection.rollback()
+            existing = self.repository.get_by_dedup_key(dedup_key)
+            if existing is None:
+                raise
+            return existing
 
     def mark_read(
         self,
@@ -80,6 +102,31 @@ class NotificationService:
     def get(self, notification_id: str) -> NotificationSummary | None:
         return self.repository.get(notification_id)
 
+    def get_by_dedup_key(self, dedup_key: str) -> NotificationSummary | None:
+        return self.repository.get_by_dedup_key(dedup_key)
+
+    def list_notifications(
+        self,
+        *,
+        status: NotificationStatus | None = None,
+        symbol: str | None = None,
+        action: str | None = None,
+        recommendation_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[NotificationSummary]:
+        return self.repository.list(
+            status=status,
+            symbol=symbol,
+            action=action,
+            recommendation_id=recommendation_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    def unread_count(self) -> int:
+        return self.repository.count_unread()
+
     def _set_status(
         self,
         notification_id: str,
@@ -90,6 +137,13 @@ class NotificationService:
         existing = self.repository.get(notification_id)
         if existing is None:
             raise KeyError(f"notification not found: {notification_id}")
+        if (
+            status is NotificationStatus.READ
+            and existing.status is NotificationStatus.FEEDBACK_RECORDED
+        ):
+            return existing
+        if existing.status is status:
+            return existing
         updated = existing.model_copy(update={"status": status})
         return self.repository.save(updated, commit=commit)
 

@@ -249,3 +249,285 @@ export interface ExecutionFeedback {
   note: string
   created_at: string
 }
+
+export type MarketQualityStatus =
+  | 'complete'
+  | 'ok'
+  | 'partial'
+  | 'degraded'
+  | 'stale'
+  | 'failed'
+  | 'unavailable'
+export type IntradayStrengthLabel = 'strong' | 'neutral' | 'weak' | 'unavailable'
+export type EmailSecurityMode = 'none' | 'starttls' | 'ssl'
+export type EmailDeliveryStatus = 'pending' | 'sending' | 'retry' | 'sent' | 'dead'
+
+export interface PaginatedResponse<T> {
+  items: T[]
+  total: number
+  page?: number
+  page_size?: number
+}
+
+export interface MarketSymbolSummary {
+  symbol: string
+  name: string
+  sources: UniverseSource[]
+  current_price: number | null
+  change_pct: number | null
+  recommendation_action: RecommendationAction | null
+  intraday_strength: IntradayStrengthLabel
+  plan_status: string | null
+  quality_status: MarketQualityStatus
+  unread_count: number
+  data_time: string | null
+  warnings: string[]
+}
+
+export interface MarketStrengthComponent {
+  key: string
+  label: string
+  value: number | null
+  status: MarketQualityStatus
+  direction: -1 | 0 | 1 | null
+  reason: string
+}
+
+export interface MarketOverview {
+  symbol: string
+  name: string
+  snapshot_id: string | number | null
+  status: MarketQualityStatus
+  data_time: string | null
+  fetched_at: string
+  warnings: string[]
+  position: {
+    quantity: number
+    available_quantity: number
+    cost_price: number
+    floating_pnl_pct: number | null
+  } | null
+  plan: {
+    plan_id: string
+    status: string
+    allowed_actions: string[]
+    invalid_if: string[]
+    valid_until: string
+  } | null
+  recommendation: {
+    recommendation_id: string
+    action: RecommendationAction
+    confidence: RecommendationConfidence
+    reason: string[]
+    data_time: string
+  } | null
+  market_structure: {
+    support: number | null
+    resistance: number | null
+    atr14: number | null
+    trend: string
+    reason: string
+  } | null
+  intraday_strength: {
+    label: IntradayStrengthLabel
+    confidence: RecommendationConfidence
+    components: MarketStrengthComponent[]
+    degraded_reason: string | null
+  } | null
+  risks: string[]
+}
+
+export interface DailyBar {
+  trade_date: string
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+  amount: number
+  ma5: number | null
+  ma10: number | null
+  ma20: number | null
+  ma60: number | null
+}
+
+export interface DailyBarsResponse {
+  symbol: string
+  adjustment: 'forward'
+  status: MarketQualityStatus
+  data_time: string | null
+  fetched_at: string
+  warnings: string[]
+  bars: DailyBar[]
+}
+
+export interface MoneyFlowRow {
+  trade_date: string
+  main_net_amount: number
+  main_net_ratio: number
+  super_large_net_amount: number
+  super_large_net_ratio: number
+  large_net_amount: number
+  large_net_ratio: number
+  medium_net_amount: number
+  medium_net_ratio: number
+  small_net_amount: number
+  small_net_ratio: number
+}
+
+export interface MoneyFlowResponse {
+  symbol: string
+  status: MarketQualityStatus
+  data_time: string | null
+  fetched_at: string
+  warnings: string[]
+  rows: MoneyFlowRow[]
+}
+
+export interface MinuteBar {
+  minute: string
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+  amount: number
+  vwap: number | null
+}
+
+export interface RecommendationMarker {
+  time: string
+  action: RecommendationAction
+  price: number
+  recommendation_id: string
+}
+
+export interface MinuteBarsResponse {
+  symbol: string
+  trade_date: string
+  status: MarketQualityStatus
+  data_time: string | null
+  fetched_at: string
+  previous_close: number | null
+  warnings: string[]
+  bars: MinuteBar[]
+  recommendation_markers: RecommendationMarker[]
+}
+
+export interface IntradayStrengthResponse {
+  symbol: string
+  status: MarketQualityStatus
+  label: IntradayStrengthLabel
+  confidence: RecommendationConfidence
+  data_time: string | null
+  fetched_at: string
+  coverage_ratio: number | null
+  last_minute: string | null
+  degraded_reason: string | null
+  rule_version: string
+  components: MarketStrengthComponent[]
+  warnings: string[]
+}
+
+export interface MarketTraceDataset {
+  dataset: 'quote' | 'history' | 'money_flow' | 'intraday_strength'
+  reference_id: string | number | null
+  status: MarketQualityStatus
+  source: string
+  data_start: string | null
+  data_end: string | null
+  data_time: string | null
+  fetched_at: string | null
+  warnings: string[]
+}
+
+export interface MarketSnapshotTrace {
+  symbol: string
+  run_id: string
+  snapshot_id: string | number
+  plan_id: string | null
+  recommendation_id: string | null
+  data_time: string | null
+  fetched_at: string
+  status: MarketQualityStatus
+  warnings: string[]
+  datasets: MarketTraceDataset[]
+}
+
+export interface MarketCaptureRun {
+  run_id: string
+  workflow_type: 'close' | 'intraday' | 'backfill' | 'cleanup'
+  trade_date: string
+  period_start: string | null
+  period_end: string | null
+  idempotency_key: string
+  status: 'running' | 'succeeded' | 'degraded' | 'failed'
+  started_at: string
+  finished_at: string | null
+  duration_ms: number | null
+  requested_symbols: number
+  processed_symbols: number
+  provider_calls: number
+  provider_duration_ms: number
+  rows_received: number
+  rows_written: number
+  cleaned_rows: number
+  plan_count: number
+  recommendation_count: number
+  notification_count: number
+  email_outbox_count: number
+  retry_count: number
+  warning_count: number
+  failure_count: number
+  error_summary: string
+}
+
+export interface EmailNotificationSettings {
+  configured: boolean
+  host: string
+  port: number
+  username: string
+  sender: string
+  recipient: string
+  security: EmailSecurityMode
+  enabled: boolean
+  password_configured: boolean
+  updated_at: string | null
+}
+
+export interface EmailNotificationSettingsUpdate {
+  host: string
+  port: number
+  username: string
+  sender: string
+  recipient: string
+  security: EmailSecurityMode
+  enabled: boolean
+  password?: string
+}
+
+export interface EmailTestResult {
+  status: 'sent'
+}
+
+export interface EmailConnectionTestResult {
+  status: 'connected'
+}
+
+export interface EmailDelivery {
+  delivery_id: string
+  notification_id: string | null
+  dedup_key: string
+  recipient: string
+  subject: string
+  body: string
+  payload: Record<string, unknown>
+  status: EmailDeliveryStatus
+  attempt_count: number
+  next_attempt_at: string | null
+  lease_expires_at: string | null
+  last_error: string
+  sent_at: string | null
+  created_at: string
+  updated_at: string
+}

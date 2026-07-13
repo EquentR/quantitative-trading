@@ -76,7 +76,7 @@ class FakeAkShare:
         )
 
 
-def test_akshare_provider_maps_dataframe_to_ok_quote() -> None:
+def test_akshare_provider_maps_sparse_dataframe_to_partial_quote() -> None:
     fetched_at = datetime(2026, 7, 7, 2, 30, tzinfo=UTC)
     provider = AkShareMarketProvider(akshare_module=FakeAkShare, now=lambda: fetched_at)
 
@@ -89,7 +89,7 @@ def test_akshare_provider_maps_dataframe_to_ok_quote() -> None:
     assert quotes["600000"].data_time == fetched_at
     assert quotes["600000"].fetched_at == fetched_at
     assert quotes["600000"].source == "akshare"
-    assert quotes["600000"].status is QuoteStatus.OK
+    assert quotes["600000"].status is QuoteStatus.PARTIAL
 
 
 def test_akshare_provider_returns_failed_quote_when_symbol_not_found() -> None:
@@ -98,7 +98,7 @@ def test_akshare_provider_returns_failed_quote_when_symbol_not_found() -> None:
 
     quotes = provider.get_quotes(["600000", "300750"])
 
-    assert quotes["600000"].status is QuoteStatus.OK
+    assert quotes["600000"].status is QuoteStatus.PARTIAL
     assert quotes["300750"].symbol == "300750"
     assert quotes["300750"].status is QuoteStatus.FAILED
     assert quotes["300750"].source == "akshare"
@@ -190,15 +190,15 @@ def test_akshare_provider_falls_back_to_single_quote_fetch_when_batch_fetch_fail
 
     quotes = provider.get_quotes(["002555", "515880", "603459"])
 
-    assert quotes["002555"].status is QuoteStatus.OK
+    assert quotes["002555"].status is QuoteStatus.PARTIAL
     assert quotes["002555"].name == "三七互娱"
     assert quotes["002555"].current_price == 18.83
     assert quotes["002555"].change_pct == -3.09
-    assert quotes["515880"].status is QuoteStatus.OK
+    assert quotes["515880"].status is QuoteStatus.PARTIAL
     assert quotes["515880"].name == "通信ETF国泰"
     assert quotes["515880"].current_price == 0.78
     assert quotes["515880"].change_pct == 2.5
-    assert quotes["603459"].status is QuoteStatus.OK
+    assert quotes["603459"].status is QuoteStatus.PARTIAL
     assert quotes["603459"].name == "红板科技"
     assert quotes["603459"].current_price == 89.72
     assert quotes["603459"].change_pct == -0.02
@@ -240,15 +240,15 @@ def test_akshare_provider_falls_back_to_tencent_quotes_when_eastmoney_single_quo
 
     quotes = provider.get_quotes(["002555", "515880", "603459"])
 
-    assert quotes["002555"].status is QuoteStatus.OK
+    assert quotes["002555"].status is QuoteStatus.PARTIAL
     assert quotes["002555"].name == "三七互娱"
     assert quotes["002555"].current_price == 18.83
     assert quotes["002555"].change_pct == -3.09
-    assert quotes["515880"].status is QuoteStatus.OK
+    assert quotes["515880"].status is QuoteStatus.PARTIAL
     assert quotes["515880"].name == "通信ETF国泰"
     assert quotes["515880"].current_price == 0.78
     assert quotes["515880"].change_pct == 2.5
-    assert quotes["603459"].status is QuoteStatus.OK
+    assert quotes["603459"].status is QuoteStatus.PARTIAL
     assert quotes["603459"].name == "红板科技"
     assert quotes["603459"].current_price == 89.72
     assert quotes["603459"].change_pct == -0.02
@@ -392,7 +392,7 @@ def test_akshare_provider_bad_price_does_not_block_other_quotes() -> None:
     assert quotes["600000"].status is QuoteStatus.FAILED
     assert "akshare quote mapping failed" in quotes["600000"].warning
     assert "最新价" in quotes["600000"].warning
-    assert quotes["000001"].status is QuoteStatus.OK
+    assert quotes["000001"].status is QuoteStatus.PARTIAL
     assert quotes["000001"].current_price == 12.3
 
 

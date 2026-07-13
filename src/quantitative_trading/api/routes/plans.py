@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, date, datetime
-from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ValidationError
 
 from quantitative_trading.api.dependencies import (
@@ -16,7 +14,6 @@ from quantitative_trading.api.dependencies import (
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.planning.models import TradingPlan
 from quantitative_trading.planning.repository import TradingPlanRepository
-from quantitative_trading.planning.workflow import CreatedTradingPlan, generate_trading_plan
 
 
 router = APIRouter(
@@ -26,17 +23,11 @@ router = APIRouter(
 )
 
 
-class GeneratePlanRequest(BaseModel):
-    trading_day: date | None = None
-
-
-class CreatedPlanResponse(BaseModel):
-    plan_id: str
-    plan: TradingPlan
-
-
-def _current_time() -> datetime:
-    return datetime.now(UTC)
+class PlanListResponse(BaseModel):
+    items: list[TradingPlan]
+    total: int
+    page: int
+    page_size: int
 
 
 def _plan_not_found() -> ApiError:
@@ -55,34 +46,40 @@ def _plan_storage_failed() -> ApiError:
     )
 
 
-def _created_plan_response(created: CreatedTradingPlan) -> CreatedPlanResponse:
-    return CreatedPlanResponse(plan_id=created.plan_id, plan=created.plan)
-
-
-def _default_trading_day(container: ApiContainer, now: datetime) -> date:
-    return now.astimezone(ZoneInfo(container.settings.timezone)).date()
-
-
-@router.post("", response_model=CreatedPlanResponse, status_code=201)
-def create_plan(
-    request: GeneratePlanRequest | None = None,
-    container: ApiContainer = Depends(get_container),
-) -> CreatedPlanResponse:
-    now = _current_time()
-    trading_day = (
-        request.trading_day
-        if request is not None and request.trading_day is not None
-        else _default_trading_day(container, now)
+def _plan_write_deprecated() -> ApiError:
+    return ApiError(
+        status_code=410,
+        code="plan_write_deprecated",
+        message="direct plan generation is deprecated; use the close decision workflow",
+        details={
+            "api_workflow": "close",
+            "cli": "qt workflow close",
+        },
     )
+
+
+@router.post("", status_code=410)
+def reject_legacy_plan_write() -> None:
+    raise _plan_write_deprecated()
+
+
+@router.get("", response_model=PlanListResponse)
+def list_plans(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    container: ApiContainer = Depends(get_container),
+) -> PlanListResponse:
     try:
         with connection_scope(container.settings) as connection:
-            return _created_plan_response(
-                generate_trading_plan(
-                    connection,
-                    trading_day=trading_day,
-                    now=now,
-                    timezone=container.settings.timezone,
-                )
+            repository = TradingPlanRepository(connection)
+            return PlanListResponse(
+                items=repository.list(
+                    limit=page_size,
+                    offset=(page - 1) * page_size,
+                ),
+                total=repository.count(),
+                page=page,
+                page_size=page_size,
             )
     except (sqlite3.Error, ValidationError) as exc:
         raise _plan_storage_failed() from exc

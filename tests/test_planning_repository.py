@@ -163,3 +163,40 @@ def test_save_persists_query_columns_and_payload_json(
     assert row["valid_until"] == VALID_UNTIL.isoformat()
     assert row["status"] == "stale"
     assert TradingPlan.model_validate_json(row["payload_json"]) == plan
+
+
+def test_activate_supersedes_previous_active_plan_for_same_trading_day(
+    repository: TradingPlanRepository,
+) -> None:
+    first = trading_plan("plan-20260709-v1").model_copy(update={"version": 1})
+    second = trading_plan(
+        "plan-20260709-v2",
+        generated_at=LATER,
+        status=TradingPlanStatus.DRAFT,
+    ).model_copy(update={"version": 2})
+
+    active_first = repository.activate(first)
+    active_second = repository.activate(second)
+
+    restored_first = repository.get(first.plan_id)
+    restored_second = repository.get(second.plan_id)
+    assert active_first.status is TradingPlanStatus.ACTIVE
+    assert active_second.status is TradingPlanStatus.ACTIVE
+    assert restored_first is not None
+    assert restored_first.status is TradingPlanStatus.SUPERSEDED
+    assert restored_second == active_second
+    assert repository.active_for_day(date(2026, 7, 9)) == active_second
+
+
+def test_next_version_increments_highest_version_for_trading_day(
+    repository: TradingPlanRepository,
+) -> None:
+    assert repository.next_version(date(2026, 7, 9)) == 1
+    repository.save(trading_plan("plan-20260709-v1").model_copy(update={"version": 1}))
+    repository.save(
+        trading_plan("plan-20260709-v3", generated_at=LATER).model_copy(
+            update={"version": 3}
+        )
+    )
+
+    assert repository.next_version(date(2026, 7, 9)) == 4

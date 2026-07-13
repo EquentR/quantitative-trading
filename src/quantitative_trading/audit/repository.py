@@ -10,7 +10,7 @@ class AuditLogRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
 
-    def save(self, audit: AuditLog) -> AuditLog:
+    def save(self, audit: AuditLog, *, commit: bool = True) -> AuditLog:
         self.connection.execute(
             """
             INSERT INTO audit_logs (
@@ -40,7 +40,8 @@ class AuditLogRepository:
                 audit.model_dump_json(),
             ),
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return audit
 
     def get(self, audit_id: str) -> AuditLog | None:
@@ -57,13 +58,35 @@ class AuditLogRepository:
         return AuditLog.model_validate_json(row["payload_json"])
 
     def list_recent(self, *, limit: int = 50) -> list[AuditLog]:
+        return self.list(limit=limit)
+
+    def list(
+        self,
+        *,
+        event_type: str | None = None,
+        recommendation_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[AuditLog]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        for column, value in (
+            ("event_type", event_type),
+            ("recommendation_id", recommendation_id),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                parameters.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.extend((limit, offset))
         rows = self.connection.execute(
-            """
+            f"""
             SELECT payload_json
             FROM audit_logs
-            ORDER BY created_at DESC, rowid DESC
-            LIMIT ?
+            {where}
+            ORDER BY created_at DESC, audit_id DESC
+            LIMIT ? OFFSET ?
             """,
-            (limit,),
+            parameters,
         ).fetchall()
         return [AuditLog.model_validate_json(row["payload_json"]) for row in rows]

@@ -29,6 +29,7 @@ class AuditService:
         recommendation_id: str | None,
         payload: dict[str, Any] | None = None,
         now: datetime | None = None,
+        commit: bool = True,
     ) -> AuditLog:
         created_at = now or datetime.now(UTC)
         audit = AuditLog(
@@ -41,7 +42,7 @@ class AuditService:
             ),
             created_at=created_at,
         )
-        return self.repository.save(audit)
+        return self.repository.save(audit, commit=commit)
 
     def get(self, audit_id: str) -> AuditLog | None:
         return self.repository.get(audit_id)

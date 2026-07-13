@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from quantitative_trading.strategy.models import Confidence, StrategyAction, StrategySignal
 
 
@@ -96,3 +98,81 @@ def watch_buy_observation_signals(
             invalid_if=[f"跌破 {_format_price(breakout_price)}", "成交量回落至计划阈值下方"],
         ),
     ]
+
+
+def planned_entry_signal(
+    *,
+    symbol: str,
+    has_position: bool,
+    plan_active: bool,
+    plan_allows_entry: bool,
+    plan_condition_met: bool,
+    daily_structure_confirmed: bool,
+    intraday_strength: Literal["strong", "neutral", "weak"],
+    money_flow_confirmed: bool | None,
+    data_quality: Literal["complete", "degraded", "failed", "stale"],
+    invalid_if: list[str],
+) -> StrategySignal:
+    if data_quality == "failed":
+        return StrategySignal(
+            symbol=symbol,
+            action=StrategyAction.AVOID,
+            confidence="low",
+            machine_reason=["required_market_data_failed"],
+            human_reason=["关键行情数据不可用，当前不参与"],
+            invalid_if=invalid_if,
+        )
+
+    blockers: list[tuple[str, str]] = []
+    if not plan_active:
+        blockers.append(("active_plan_missing", "缺少当日有效收盘计划"))
+    if not plan_allows_entry:
+        blockers.append(("plan_entry_not_allowed", "收盘计划未允许新增买入或加仓"))
+    if not plan_condition_met:
+        blockers.append(("plan_condition_not_met", "尚未命中计划内条件"))
+    if not daily_structure_confirmed:
+        blockers.append(("daily_structure_not_confirmed", "日线结构尚未确认"))
+    if intraday_strength != "strong":
+        blockers.append(("intraday_strength_not_confirmed", "分时强弱尚未确认"))
+    if money_flow_confirmed is False:
+        blockers.append(("money_flow_filtered", "资金流条件形成过滤"))
+    if data_quality == "stale":
+        blockers.append(("market_data_stale", "行情数据已经过期"))
+
+    if blockers:
+        return StrategySignal(
+            symbol=symbol,
+            action=StrategyAction.WATCH,
+            confidence="low",
+            machine_reason=[machine_reason for machine_reason, _ in blockers],
+            human_reason=[human_reason for _, human_reason in blockers],
+            invalid_if=invalid_if,
+        )
+
+    machine_reason = [
+        "active_plan_gate_passed",
+        "plan_condition_met",
+        "daily_structure_confirmed",
+        "intraday_strength_confirmed",
+    ]
+    human_reason = ["命中当日活动计划", "日线结构与分时强弱共同确认"]
+    if money_flow_confirmed is True:
+        machine_reason.append("money_flow_confirmed")
+        human_reason.append("资金流提供额外确认")
+    else:
+        machine_reason.append("money_flow_unavailable")
+        human_reason.append("资金流不可用，未计入确认")
+
+    confidence: Confidence = (
+        "high"
+        if money_flow_confirmed is True and data_quality == "complete"
+        else "medium"
+    )
+    return StrategySignal(
+        symbol=symbol,
+        action=StrategyAction.ADD if has_position else StrategyAction.BUY,
+        confidence=confidence,
+        machine_reason=machine_reason,
+        human_reason=human_reason,
+        invalid_if=invalid_if,
+    )

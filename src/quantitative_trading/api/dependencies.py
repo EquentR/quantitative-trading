@@ -11,13 +11,15 @@ from quantitative_trading.api.auth import AuthService, InvalidTokenError, TokenC
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.config import Settings
 from quantitative_trading.storage.api_auth import ApiAuthRepository
-from quantitative_trading.storage.sqlite import connect, migrate
+from quantitative_trading.storage.sqlite import connect, migrate  # noqa: F401
 
 
 @dataclass(frozen=True)
 class ApiContainer:
     settings: Settings
     scheduler: object | None = None
+    email_sender: object | None = None
+    smtp_connection_tester: object | None = None
 
 
 def get_container() -> ApiContainer:

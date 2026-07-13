@@ -145,3 +145,76 @@ def test_risk_downgrade_overrides_stronger_strategy_action() -> None:
     assert "放量突破观察位" in recommendation.reason
     assert recommendation.risk["invalid_if"] == ["跌破 10.4"]
     assert recommendation.risk["notes"] == ["总仓位 81.00% 高于上限 80.00%，禁止新增买入"]
+
+
+def test_recommendation_preserves_complete_decision_trace() -> None:
+    signal = StrategySignal(
+        symbol="600000",
+        action=StrategyAction.BUY,
+        confidence="high",
+        machine_reason=["active_plan_gate_passed", "intraday_strength_confirmed"],
+        human_reason=["收盘计划与盘中强弱共同确认"],
+        invalid_if=["跌破计划支撑位"],
+    )
+    decision = RiskDecision(
+        allowed=True,
+        original_action=StrategyAction.BUY,
+        action=StrategyAction.BUY,
+        reasons=[],
+    )
+
+    recommendation = build_recommendation(
+        signal,
+        decision,
+        recommendation_id="rec-trace-1",
+        name="浦发银行",
+        position_context={"source": "manual_ledger", "quantity": 0},
+        account_context={"source": "manual_cash_account", "total_assets": 60000},
+        price_context={"current_price": 10.5},
+        valid_until=VALID_UNTIL,
+        data_time=DATA_TIME,
+        created_at=DATA_TIME,
+        run_id=12,
+        market_input_snapshot_id=34,
+        plan_id="plan-20260709-v1",
+        data_references={
+            "ledger": {"snapshot_id": 2, "status": "complete"},
+            "account": {"snapshot_id": 3, "status": "complete"},
+            "quote": {"snapshot_id": 4, "status": "complete"},
+            "history": {"snapshot_id": 5, "status": "complete"},
+            "money_flow": {"snapshot_id": 6, "status": "complete"},
+            "intraday": {"snapshot_id": 7, "status": "complete"},
+            "plan": {"plan_id": "plan-20260709-v1", "status": "active"},
+        },
+        data_quality={"overall": "complete", "warnings": []},
+        position_constraint={
+            "suggested_quantity": 1000,
+            "max_position_ratio": 0.30,
+            "max_total_position_ratio": 0.80,
+        },
+    )
+
+    assert recommendation.run_id == 12
+    assert recommendation.market_input_snapshot_id == 34
+    assert recommendation.plan_id == "plan-20260709-v1"
+    assert recommendation.created_at == DATA_TIME
+    assert recommendation.data_references["intraday"]["snapshot_id"] == 7
+    assert recommendation.position_constraint["suggested_quantity"] == 1000
+
+
+def test_recommendation_defaults_to_explicit_missing_data_references() -> None:
+    recommendation = Recommendation(**recommendation_data())
+
+    assert set(recommendation.data_references) == {
+        "ledger",
+        "account",
+        "quote",
+        "history",
+        "money_flow",
+        "intraday",
+        "plan",
+    }
+    assert all(
+        reference["status"] == "missing"
+        for reference in recommendation.data_references.values()
+    )

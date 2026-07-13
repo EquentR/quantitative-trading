@@ -13,15 +13,18 @@ import {
   useStopSchedulerMutation,
 } from '@/queries/service'
 import { useLatestSnapshotQuery } from '@/queries/account'
+import { useMarketRunsQuery } from '@/queries/market'
 
 const serviceQuery = useServiceStatusQuery()
 const snapshotQuery = useLatestSnapshotQuery()
 const startMutation = useStartSchedulerMutation()
 const stopMutation = useStopSchedulerMutation()
 const runOnceMutation = useRunOnceMutation()
+const marketRunsQuery = useMarketRunsQuery()
 
 const service = () => serviceQuery.data.value
 const snapshot = () => snapshotQuery.data.value
+const marketRuns = () => marketRunsQuery.data.value?.items ?? []
 
 interface TaskRow {
   label: string
@@ -30,23 +33,20 @@ interface TaskRow {
 }
 
 const taskRows: TaskRow[] = [
-  { label: '账户快照任务', job_id: 'account_snapshot_intraday', task_type: 'account_snapshot' },
-  { label: '收盘计划任务', job_id: 'close_plan_daily', task_type: 'close_plan_daily' },
-  { label: '盘中触发任务', job_id: 'recommendation_intraday_trigger', task_type: 'recommendation_intraday_trigger' },
+  { label: '盘中决策', job_id: 'decision_intraday', task_type: 'intraday' },
+  { label: '收盘就绪', job_id: 'decision_close_readiness', task_type: 'close' },
+  { label: '分钟清理', job_id: 'market_minute_cleanup', task_type: 'cleanup' },
+  { label: '邮件投递', job_id: 'email_delivery_worker', task_type: 'email_delivery' },
 ]
 
 const taskStatuses = computed(() => {
   const s = service()
   if (!s) return new Map<string, string>()
   const m = new Map<string, string>()
-  if (s.last_task_type === taskRows[0].task_type && s.last_status) {
-    m.set(taskRows[0].task_type, s.last_status)
-  }
-  if (s.last_task_type === taskRows[1].task_type && s.last_status) {
-    m.set(taskRows[1].task_type, s.last_status)
-  }
-  if (s.last_task_type === taskRows[2].task_type && s.last_status) {
-    m.set(taskRows[2].task_type, s.last_status)
+  for (const row of taskRows) {
+    if (s.last_task_type === row.task_type && s.last_status) {
+      m.set(row.task_type, s.last_status)
+    }
   }
   return m
 })
@@ -68,6 +68,19 @@ const snapshotErrorMessage = () => {
 
 const runMessage = ref('')
 
+function formatDuration(value: number | null): string {
+  if (value === null) return '进行中'
+  if (value < 1000) return `${Math.round(value)} ms`
+  return `${(value / 1000).toFixed(1)} s`
+}
+
+const workflowLabels: Record<string, string> = {
+  close: '收盘',
+  intraday: '盘中',
+  backfill: '回填',
+  cleanup: '清理',
+}
+
 async function onGenerate() {
   await runOnceMutation.mutateAsync()
   runMessage.value = '已请求生成账户快照'
@@ -88,11 +101,11 @@ async function onGenerate() {
       <div class="flex flex-wrap gap-2">
         <Button variant="primary" :loading="startMutation.isPending.value" @click="startMutation.mutate()">
           <Play class="size-4" />
-          启动账户快照调度
+          启动工作流调度
         </Button>
         <Button variant="danger" :loading="stopMutation.isPending.value" @click="stopMutation.mutate()">
           <Square class="size-4" />
-          停止账户快照调度
+          停止工作流调度
         </Button>
         <Button variant="secondary" :loading="runOnceMutation.isPending.value" @click="onGenerate">
           <Camera class="size-4" />
@@ -100,6 +113,58 @@ async function onGenerate() {
         </Button>
       </div>
       <p v-if="runMessage" class="text-sm text-emerald-700">{{ runMessage }}</p>
+    </section>
+
+    <section class="space-y-2">
+      <div class="flex items-center justify-between gap-2">
+        <h2 class="text-sm font-medium">工作流运行</h2>
+        <span class="text-xs text-muted-foreground">最近 {{ marketRuns().length }} 轮</span>
+      </div>
+      <Alert v-if="marketRunsQuery.isError.value" variant="warning">运行记录加载失败</Alert>
+      <div v-else class="overflow-x-auto border-y border-border">
+        <table class="min-w-[1120px] w-full text-sm">
+          <thead class="text-left text-xs text-muted-foreground">
+            <tr>
+              <th class="py-2 pr-3">开始时间</th>
+              <th class="py-2 pr-3">工作流</th>
+              <th class="py-2 pr-3">状态</th>
+              <th class="py-2 pr-3">总耗时</th>
+              <th class="py-2 pr-3">Provider</th>
+              <th class="py-2 pr-3">数据行</th>
+              <th class="py-2 pr-3">产物</th>
+              <th class="py-2 pr-3">重试</th>
+              <th class="py-2">告警 / 错误</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="marketRuns().length === 0" class="border-t border-border">
+              <td colspan="9" class="py-3 text-muted-foreground">暂无工作流运行记录</td>
+            </tr>
+            <tr
+              v-for="run in marketRuns()"
+              :key="run.run_id"
+              class="border-t border-border align-top"
+            >
+              <td class="py-2 pr-3 whitespace-nowrap"><FormatValues kind="time" :value="run.started_at" /></td>
+              <td class="py-2 pr-3">
+                <div>{{ workflowLabels[run.workflow_type] ?? run.workflow_type }}</div>
+                <div class="max-w-44 truncate text-xs text-muted-foreground" :title="run.run_id">{{ run.run_id }}</div>
+              </td>
+              <td class="py-2 pr-3">{{ run.status }}</td>
+              <td class="py-2 pr-3 whitespace-nowrap">{{ formatDuration(run.duration_ms) }}</td>
+              <td class="py-2 pr-3 whitespace-nowrap">{{ run.provider_calls }} 次 / {{ formatDuration(run.provider_duration_ms) }}</td>
+              <td class="py-2 pr-3 whitespace-nowrap">收 {{ run.rows_received }} / 写 {{ run.rows_written }} / 清 {{ run.cleaned_rows }}</td>
+              <td class="py-2 pr-3 whitespace-nowrap">计划 {{ run.plan_count }} / 建议 {{ run.recommendation_count }} / 通知 {{ run.notification_count }} / 邮件 {{ run.email_outbox_count }}</td>
+              <td class="py-2 pr-3">{{ run.retry_count }}</td>
+              <td class="max-w-64 py-2 break-words">
+                <span v-if="run.error_summary">{{ run.error_summary }}</span>
+                <span v-else-if="run.warning_count || run.failure_count">warning {{ run.warning_count }} / failed {{ run.failure_count }}</span>
+                <span v-else class="text-muted-foreground">-</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </section>
 
     <section class="space-y-2">

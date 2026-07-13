@@ -7,43 +7,40 @@ from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.planning.models import TradingPlanStatus
 from quantitative_trading.planning.repository import TradingPlanRepository
-from quantitative_trading.planning.workflow import generate_trading_plan
 from quantitative_trading.recommendation.repository import RecommendationRepository
 from quantitative_trading.recommendation.scanner import (
     PlanNotScannableError,
     scan_latest_plan_recommendations,
 )
 from quantitative_trading.storage.sqlite import connect, migrate
+from tests.planning_fixtures import persist_test_plan
 
 
-def _seed_plan(connection, *, trading_day: date = date(2026, 7, 9)) -> None:
-    PositionRepository(connection).add(
-        PositionInput(
-            symbol="600000",
-            name="浦发银行",
-            quantity=1000,
-            available_quantity=800,
-            cost_price=9.5,
-            opened_at=date(2026, 7, 6),
-            note="manual ledger",
-        ),
-        now=datetime(2026, 7, 8, 1, 0, tzinfo=UTC),
-    )
-    generate_trading_plan(
-        connection,
-        trading_day=trading_day,
-        now=datetime(2026, 7, 8, 7, 0, tzinfo=UTC),
-        timezone="Asia/Shanghai",
-    )
+def _seed_plan(settings: Settings, *, trading_day: date = date(2026, 7, 9)) -> None:
+    with connect(settings) as connection:
+        migrate(connection)
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="600000",
+                name="浦发银行",
+                quantity=1000,
+                available_quantity=800,
+                cost_price=9.5,
+                opened_at=date(2026, 7, 6),
+                note="manual ledger",
+            ),
+            now=datetime(2026, 7, 8, 1, 0, tzinfo=UTC),
+        )
+    persist_test_plan(settings, trading_day=trading_day)
 
 
 def test_scanner_rejects_expired_plan_before_persisting(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "scanner.db")
+    _seed_plan(settings)
     with connect(settings) as connection:
-        migrate(connection)
-        _seed_plan(connection)
-
-        with pytest.raises(PlanNotScannableError, match="trading plan is not scannable"):
+        with pytest.raises(
+            PlanNotScannableError, match="trading plan is not scannable"
+        ):
             scan_latest_plan_recommendations(
                 connection,
                 now=datetime(2026, 7, 9, 8, 0, tzinfo=UTC),
@@ -61,9 +58,8 @@ def test_scanner_rejects_inactive_plan_status_before_persisting(
     status: TradingPlanStatus,
 ) -> None:
     settings = Settings(database_path=tmp_path / "scanner.db")
+    _seed_plan(settings)
     with connect(settings) as connection:
-        migrate(connection)
-        _seed_plan(connection)
         plan = TradingPlanRepository(connection).latest()
         assert plan is not None
         inactive_plan = plan.model_copy(update={"status": status})

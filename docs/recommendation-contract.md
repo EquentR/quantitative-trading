@@ -46,7 +46,27 @@
     "notes": ["行情数据可能延迟"]
   },
   "valid_until": "2026-07-07T15:00:00+08:00",
-  "data_time": "2026-07-07T10:30:00+08:00"
+  "data_time": "2026-07-07T10:30:00+08:00",
+  "run_id": "intraday-20260707-1030",
+  "market_input_snapshot_id": 101,
+  "plan_id": "plan-20260707-v2",
+  "data_references": {
+    "ledger": {"status": "complete", "updated_at": "2026-07-07T09:00:00+08:00"},
+    "account": {"status": "complete", "snapshot_id": 88},
+    "quote": {"status": "complete", "snapshot_id": 501},
+    "history": {"status": "complete", "snapshot_id": 301},
+    "money_flow": {"status": "degraded", "snapshot_id": 201},
+    "intraday": {"status": "complete", "snapshot_id": 401},
+    "plan": {"status": "active", "plan_id": "plan-20260707-v2"}
+  },
+  "data_quality": {
+    "overall": "degraded",
+    "warnings": ["资金流最近一日暂缺"]
+  },
+  "position_constraint": {
+    "suggested_range": [0.1, 0.15],
+    "effective_cap": 0.15
+  }
 }
 ```
 
@@ -112,15 +132,27 @@
 
 建议使用的数据时间戳。推送时间不能替代数据时间。
 
+### 工作流和数据引用
+
+`run_id`、`market_input_snapshot_id` 和 `plan_id` 将建议连接到实际执行轮次、固化的行情输入和活动计划。`data_references` 必须包含 `ledger`、`account`、`quote`、`history`、`money_flow`、`intraday` 和 `plan`；每项至少包含稳定 `status`，可用时附实际引用 ID、数据时间和来源，不可用时必须明确 `missing/failed/stale`，不能省略后让调用方猜测。
+
+`data_quality` 保存总体质量、逐数据集状态、warnings 和实际生效的 stale/降级语义。`position_constraint` 保存建议仓位区间、建议数量以及经过现金、单票、总仓位、T+1 和流动性裁决后真正生效的上限。所有这些字段由后端生成，前端不得补算。
+
 ## 4. 首版实现约束
 
 首版建议模型必须校验 `valid_until` 和 `data_time` 为带时区时间。`reason` 必须非空，且不得包含确定性收益或保证正收益表述。
 
 `buy`、`add`、`hold`、`watch` 类型建议必须包含非空 `risk.invalid_if`。最终建议动作必须以风控结果为准；当风控将策略信号降级时，建议中的 `action` 使用降级后的动作，同时保留原始策略原因和风控说明用于复核。
 
-建议扫描必须以最新有效收盘计划为入口。持仓股票始终可被扫描；非持仓自选置顶股票只有在计划中的 `plan_enabled=true` 时才可生成 `watch` 类建议。若最新计划不存在、过期或状态不是 `active`，API 和 CLI 不得静默生成建议。
+`buy/add` 必须以适用于当日的活动收盘计划为硬门禁：标的和动作在计划中被允许、命中机器条件、获得至少两个独立有效因子确认并通过硬性风控。资金流只能确认或过滤，不能独立触发动作。计划外机会和无活动计划的非持仓标的只能 `watch/avoid`。
 
-当前建议扫描读取最新计划、手动持仓台账、最新账户快照和计划对应的股票池快照。未接入实时行情时，只能生成保守 `hold` 或 `watch` 建议，并在风险说明中保留行情缺口和人工复核要求。
+持仓风险管理不受买入侧计划门禁阻断。无活动计划或原计划条件失效时，持仓新出现的止损、回撤、跌破结构或仓位超限仍可生成 `sell/reduce/avoid`；建议必须保存原计划条件、覆盖原因和风控裁决。关键报价、成本、数量或可用数量缺失时不得猜测，必须降级为保守 `hold` 和人工复核。
+
+每轮盘中工作流重新读取手动台账和资金账户。计划中的数量和账户上下文只是历史引用，不能覆盖最新权威台账。
+
+### 建议去重
+
+去重键至少包含交易日、3 分钟周期、标的、最终动作、计划版本和条件指纹。条件指纹覆盖触发规则、风险、失效条件和仓位约束。相同输入和条件的幂等重跑复用已有建议；动作、风险、失效条件、数量、仓位上限或计划版本发生实质变化时允许生成新建议。
 
 ## 5. HTTP API 契约
 
@@ -130,6 +162,7 @@
 POST /api/v1/recommendations/scan
 GET /api/v1/recommendations
 GET /api/v1/recommendations/{recommendation_id}
+GET /api/v1/recommendations/{recommendation_id}/trace
 ```
 
 `POST /scan` 返回：
@@ -141,7 +174,7 @@ GET /api/v1/recommendations/{recommendation_id}
 }
 ```
 
-`recommendations` 数组中的每一项必须满足本文定义的建议模型。最新计划不存在时返回 `plan_not_found`；计划不可扫描时返回 `plan_not_scannable`，并在 `details` 中包含 `plan_id`、`status` 和 `valid_until`。列表接口返回最近保存的建议，详情接口按 `recommendation_id` 返回单条建议。
+`recommendations` 数组中的每一项必须满足本文定义的建议模型。对于非持仓买入侧，最新计划不存在时返回或降级为稳定的计划门禁结果；计划不可消费时必须保留 `plan_id`、`status` 和 `valid_until`。持仓风险例外不能被计划错误整体阻断。列表接口返回稳定排序和分页结果，详情接口按 `recommendation_id` 返回单条建议，trace 接口解析实际输入和审计引用。
 
 ## 6. 通知与反馈状态
 
@@ -155,13 +188,16 @@ GET /api/v1/recommendations/{recommendation_id}
 
 人工执行反馈字段为 `recommendation_id`、`executed`、`execution_price`、`execution_quantity`、`note` 和 `created_at`。反馈写入后可以把同一建议关联通知标记为 `feedback_recorded`，但不得修改手动持仓台账、手动资金账户、现金余额、净本金或账户快照。反馈只用于复盘和策略改进，不代表系统确认真实成交。
 
-当前后端已经具备通知和审计日志持久化服务，并提供反馈写入与查询接口；通知创建、审计写入工作流和通知/审计 HTTP 读取路由尚未作为稳定 API 开放。前端在这些读取接口不可用时必须降级展示，不得影响建议、台账或资金维护。
+通知和审计读取路由是稳定 API：通知支持列表、未读数和标记已读，审计支持列表和按 ID 查询。通知去重键包含交易日、标的、动作、计划版本和条件指纹；相同条件不重复创建，实质变化允许新通知。
+
+`buy/add/sell/reduce` 在本地通知成功后立即写入邮件 outbox；`hold/watch/avoid` 只在收盘计划发布后进入同一活动计划版本的一封每日摘要。邮件失败独立重试，不得回滚建议、通知或重跑 `DecisionWorkflow`。通知、邮件和审计中的错误只能保存经过清理的安全摘要。
 
 ## 7. 日志要求
 
 结构化日志应记录：
 
 - 建议 ID。
+- `run_id`、`market_input_snapshot_id` 和 `plan_id`。
 - 输入数据快照引用。
 - 手动持仓台账快照引用。
 - 策略信号。
@@ -169,6 +205,7 @@ GET /api/v1/recommendations/{recommendation_id}
 - 最终建议。
 - 推送渠道和推送状态。
 - 用户是否执行以及人工反馈。
+- 通知去重键、邮件 delivery ID 和安全投递状态。
 
 ## 8. 推送格式
 

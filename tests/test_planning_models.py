@@ -3,7 +3,12 @@ from datetime import UTC, date, datetime
 import pytest
 from pydantic import ValidationError
 
-from quantitative_trading.planning.models import TradingPlan, TradingPlanStatus
+from quantitative_trading.planning.models import (
+    PlanCondition,
+    PlanSymbolContext,
+    TradingPlan,
+    TradingPlanStatus,
+)
 
 
 GENERATED_AT = datetime(2026, 7, 8, 7, 5, tzinfo=UTC)
@@ -102,3 +107,78 @@ def test_trading_plan_accepts_missing_optional_account_and_ledger_reference() ->
 
     assert plan.account_snapshot_id is None
     assert plan.ledger_max_updated_at is None
+
+
+def test_trading_plan_preserves_versioned_market_decision_context() -> None:
+    context = PlanSymbolContext(
+        symbol="600000",
+        name="浦发银行",
+        sources=["holding", "watch_pinned"],
+        is_holding=True,
+        trend={"classification": "bullish", "ma5": 10.1, "ma20": 9.8},
+        volume_price={"volume_ratio": 1.4},
+        money_flow={"status": "complete", "main_net_amount": 1_000_000},
+        conditions=[
+            PlanCondition(
+                condition_id="breakout-1",
+                metric="current_price",
+                operator="gte",
+                threshold=10.4,
+                required=True,
+                rationale="突破计划压力位",
+            )
+        ],
+        allowed_actions=["hold", "add", "reduce"],
+        prohibited_actions=["buy"],
+        position_constraint={"max_position_ratio": 0.30},
+        risks=["跌破支撑后转弱"],
+        invalid_if=["跌破 9.70"],
+        data_quality="complete",
+        warnings=[],
+    )
+
+    plan = TradingPlan(
+        **plan_data(
+            plan_id="plan-20260709-v1",
+            version=1,
+            source_run_id=12,
+            market_input_snapshot_id=34,
+            data_time=GENERATED_AT,
+            data_quality="complete",
+            symbol_contexts={"600000": context},
+        )
+    )
+
+    assert plan.version == 1
+    assert plan.source_run_id == 12
+    assert plan.market_input_snapshot_id == 34
+    assert plan.data_time == GENERATED_AT
+    assert plan.symbol_contexts["600000"].conditions[0].operator == "gte"
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        TradingPlanStatus.DRAFT,
+        TradingPlanStatus.ACTIVE,
+        TradingPlanStatus.SUPERSEDED,
+        TradingPlanStatus.EXPIRED,
+        TradingPlanStatus.STALE,
+    ],
+)
+def test_trading_plan_supports_full_lifecycle(status: TradingPlanStatus) -> None:
+    assert TradingPlan(**plan_data(status=status)).status is status
+
+
+def test_plan_symbol_context_rejects_mismatched_map_symbol() -> None:
+    context = PlanSymbolContext(
+        symbol="000001",
+        name="平安银行",
+        sources=["watch_pinned"],
+        is_holding=False,
+        allowed_actions=["watch"],
+        invalid_if=["计划到期"],
+    )
+
+    with pytest.raises(ValidationError, match="symbol context key"):
+        TradingPlan(**plan_data(symbol_contexts={"600000": context}))

@@ -51,7 +51,7 @@ def test_env_example_contains_api_placeholders_only() -> None:
     text = Path(".env.example").read_text(encoding="utf-8")
     values = parse_env_example()
 
-    assert values["QT_API_HOST"] == "127.0.0.1"
+    assert values["QT_API_HOST"] == "0.0.0.0"
     assert values["QT_API_ACCESS_PASSWORD"] == ""
     assert values["QT_API_TOKEN_SECRET"] == ""
     assert "QT_SERVICE_RUN_ON_START_WHEN_SCHEDULER_ENABLED=true" in text

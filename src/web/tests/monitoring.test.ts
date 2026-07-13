@@ -24,8 +24,8 @@ test('展示调度和快照控制按钮及安全文案', async () => {
   renderMonitoring()
 
   expect(screen.getByRole('heading', { name: '监控' })).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '启动账户快照调度' })).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '停止账户快照调度' })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '启动工作流调度' })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '停止工作流调度' })).toBeInTheDocument()
   expect(screen.getByRole('button', { name: '生成一次账户快照' })).toBeInTheDocument()
   expect(screen.getByText(/不执行真实交易/)).toBeInTheDocument()
 })
@@ -40,36 +40,49 @@ test('点击生成快照后显示已请求提示', async () => {
 })
 
 
-test('展示任务状态行并标记非最近运行任务', async () => {
+test('展示实际调度任务并标记非最近运行任务', async () => {
   server.use(
     http.get('/api/v1/service/status', () =>
-      HttpResponse.json({ ...mockServiceStatus, last_task_type: 'close_plan_daily', last_status: 'success' }),
+      HttpResponse.json({ ...mockServiceStatus, last_task_type: 'close', last_status: 'success' }),
     ),
   )
   renderMonitoring()
 
-  await waitFor(() => expect(screen.getByText('账户快照任务')).toBeInTheDocument())
-  expect(screen.getByText('收盘计划任务')).toBeInTheDocument()
-  expect(screen.getByText('盘中触发任务')).toBeInTheDocument()
+  await waitFor(() => expect(screen.getByText('盘中决策')).toBeInTheDocument())
+  expect(screen.getByText('收盘就绪')).toBeInTheDocument()
+  expect(screen.getByText('分钟清理')).toBeInTheDocument()
+  expect(screen.getByText('邮件投递')).toBeInTheDocument()
   expect(screen.getByText(/仅显示全局最近一次任务结果/)).toBeInTheDocument()
 
-  const closePlanRow = screen.getByText('收盘计划任务').closest('tr')!
+  const closePlanRow = screen.getByText('收盘就绪').closest('tr')!
   await waitFor(() => expect(closePlanRow).toHaveTextContent('success'))
-  expect(screen.getAllByText('非最近运行')).toHaveLength(2)
+  expect(screen.getAllByText('非最近运行')).toHaveLength(3)
 })
 
-test('last_task_type 匹配账户快照任务时展示对应状态', async () => {
+test('last_task_type 匹配盘中决策时展示对应状态', async () => {
   server.use(
     http.get('/api/v1/service/status', () =>
-      HttpResponse.json({ ...mockServiceStatus, last_task_type: 'account_snapshot', last_status: 'success' }),
+      HttpResponse.json({ ...mockServiceStatus, last_task_type: 'intraday', last_status: 'success' }),
     ),
   )
   renderMonitoring()
-  await waitFor(() => expect(screen.getByText('账户快照任务')).toBeInTheDocument())
+  await waitFor(() => expect(screen.getByText('盘中决策')).toBeInTheDocument())
   await waitFor(() => {
-    const row = screen.getByText('账户快照任务').closest('tr')!
+    const row = screen.getByText('盘中决策').closest('tr')!
     expect(row).toHaveTextContent('success')
   })
+})
+
+test('展示每轮工作流成本和产物计数', async () => {
+  renderMonitoring()
+
+  await waitFor(() => expect(screen.getByText('intraday-20260713-1021')).toBeInTheDocument())
+  const row = screen.getByText('intraday-20260713-1021').closest('tr')!
+  expect(row).toHaveTextContent('1.3 s')
+  expect(row).toHaveTextContent('3 次 / 820 ms')
+  expect(row).toHaveTextContent('收 62 / 写 64 / 清 0')
+  expect(row).toHaveTextContent('计划 0 / 建议 2 / 通知 2 / 邮件 1')
+  expect(row).toHaveTextContent('warning 1 / failed 0')
 })
 
 test('展示最近错误和数据缺口', async () => {

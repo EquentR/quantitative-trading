@@ -19,6 +19,17 @@ class RiskConfig(BaseModel):
     liquidity_amount_threshold: float = Field(default=0, ge=0)
 
 
+class RiskContext(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    proposed_value: float = Field(default=0, ge=0, allow_inf_nan=False)
+    daily_new_buy_value: float = Field(default=0, ge=0, allow_inf_nan=False)
+    daily_trade_count: int = Field(default=0, ge=0)
+    consecutive_losses: int = Field(default=0, ge=0)
+    in_loss_cooldown: bool = False
+    liquidity_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
 class RiskDecision(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -37,3 +48,22 @@ class RiskDecision(BaseModel):
                 raise ValueError("risk reasons cannot contain empty text")
             cleaned.append(stripped)
         return cleaned
+
+
+class PositionConstraint(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    suggested_quantity: int = Field(ge=0)
+    suggested_value: float = Field(ge=0, allow_inf_nan=False)
+    board_lot: int = Field(default=100, gt=0)
+    max_position_ratio: float = Field(gt=0, le=1)
+    max_total_position_ratio: float = Field(gt=0, le=1)
+    max_daily_new_buy_ratio: float = Field(gt=0, le=1)
+    limiting_factors: list[str] = Field(default_factory=list)
+
+    @field_validator("suggested_quantity")
+    @classmethod
+    def quantity_must_use_board_lots(cls, value: int) -> int:
+        if value % 100 != 0:
+            raise ValueError("suggested quantity must use 100-share board lots")
+        return value

@@ -22,6 +22,7 @@ class NotificationSummary(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     notification_id: str = Field(min_length=1)
+    dedup_key: str | None = Field(default=None, min_length=1, max_length=500)
     recommendation_id: str = Field(min_length=1)
     symbol: str = Field(pattern=r"^\d{6}$")
     action: str = Field(min_length=1)
