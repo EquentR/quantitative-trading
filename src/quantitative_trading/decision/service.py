@@ -75,6 +75,7 @@ def decide_symbol(
         price_context=decision_input.price_context,
         valid_until=decision_input.valid_until,
         data_time=decision_input.data_time,
+        fetched_at=decision_input.fetched_at,
         created_at=created_at,
         run_id=decision_input.run_id,
         market_input_snapshot_id=decision_input.market_input_snapshot_id,

@@ -88,6 +88,7 @@ def decision_input(**overrides: object) -> DecisionSymbolInput:
         },
         "invalid_if": ["跌破计划支撑位", "计划收盘失效"],
         "data_time": NOW,
+        "fetched_at": NOW,
         "valid_until": VALID_UNTIL,
         "run_id": 7,
         "market_input_snapshot_id": 8,

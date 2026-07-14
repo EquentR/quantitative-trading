@@ -1416,6 +1416,7 @@ class DecisionWorkflow:
                 invalid_if=invalid_if,
                 warnings=_stable_unique([*warnings, *account_snapshot.warnings]),
                 data_time=decision_data_time,
+                fetched_at=market_input.fetched_at,
                 valid_until=(
                     plan.valid_until
                     if plan is not None
@@ -1994,9 +1995,50 @@ class DecisionWorkflow:
             dataset: CaptureDataset,
         ) -> dict[str, Any]:
             quality = snapshot.dataset_quality.get(symbol, {}).get(dataset)
+            reference_id = mapping.get(symbol)
+            fetched_at = None
+            if reference_id is not None:
+                if dataset is CaptureDataset.QUOTE:
+                    referenced = QuoteSnapshotRepository(self.connection).get(
+                        reference_id
+                    )
+                elif dataset is CaptureDataset.DAILY_BAR:
+                    referenced = HistorySnapshotRepository(self.connection).get(
+                        reference_id
+                    )
+                elif dataset is CaptureDataset.MONEY_FLOW:
+                    referenced = MoneyFlowSnapshotRepository(self.connection).get(
+                        reference_id
+                    )
+                elif dataset is CaptureDataset.INTRADAY_STRENGTH:
+                    referenced = IntradayStrengthSnapshotRepository(
+                        self.connection
+                    ).get(reference_id)
+                else:
+                    referenced = None
+                fetched_at = None if referenced is None else referenced.fetched_at
             return {
-                "snapshot_id": mapping.get(symbol),
+                "snapshot_id": reference_id,
                 "status": "missing" if quality is None else quality.status.value,
+                "source": "" if quality is None else quality.source,
+                "data_start": (
+                    None
+                    if quality is None or quality.data_start is None
+                    else quality.data_start.isoformat()
+                ),
+                "data_end": (
+                    None
+                    if quality is None or quality.data_end is None
+                    else quality.data_end.isoformat()
+                ),
+                "data_time": (
+                    None
+                    if quality is None or quality.data_time is None
+                    else quality.data_time.isoformat()
+                ),
+                "fetched_at": (
+                    None if fetched_at is None else fetched_at.isoformat()
+                ),
             }
 
         return {

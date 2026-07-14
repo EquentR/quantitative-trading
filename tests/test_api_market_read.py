@@ -897,6 +897,52 @@ def test_market_snapshot_trace_resolves_all_dataset_and_decision_references(
     assert all(dataset["status"] == "complete" for dataset in body["datasets"])
 
 
+@pytest.mark.parametrize(
+    ("quality_status", "quality_warning"),
+    [
+        (CaptureResultStatus.FAILED, "latest history capture failed"),
+        (CaptureResultStatus.STALE, "latest history capture is stale"),
+    ],
+)
+def test_market_snapshot_trace_preserves_latest_persisted_quality(
+    tmp_path,
+    quality_status: CaptureResultStatus,
+    quality_warning: str,
+) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    snapshot_id = seed_market_data(settings)
+    with connect(settings) as connection:
+        repository = MarketInputSnapshotRepository(connection)
+        snapshot = repository.get(snapshot_id)
+        assert snapshot is not None
+        snapshot_id = repository.save(
+            snapshot.model_copy(
+                update={
+                    "dataset_quality": {
+                        "600000": {
+                            CaptureDataset.DAILY_BAR: DatasetQuality(
+                                status=quality_status,
+                                warning=quality_warning,
+                            )
+                        }
+                    }
+                }
+            )
+        )
+
+    response = client.get(
+        f"/api/v1/market/snapshots/{snapshot_id}/trace?symbol=600000",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    history = next(
+        item for item in response.json()["datasets"] if item["dataset"] == "history"
+    )
+    assert history["status"] == quality_status.value
+    assert quality_warning in history["warnings"]
+
+
 def test_strength_trace_keeps_stable_range_after_raw_minute_cleanup(tmp_path) -> None:
     client, headers, settings = authenticated_client(tmp_path)
     snapshot_id = seed_market_data(settings)

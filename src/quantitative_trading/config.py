@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     api_token_ttl_seconds: int = Field(default=3600, ge=60)
     # 调度恢复后是否立即跑一次快照，避免重启后长时间等到下一个轮询周期。
     service_run_on_start_when_scheduler_enabled: bool = Field(default=True)
+    email_retry_delays_minutes: tuple[int, ...] = Field(
+        default=(1, 5, 15, 30, 60), min_length=1
+    )
+    email_lease_seconds: int = Field(default=60, ge=1)
 
     @field_validator("api_access_password", "api_token_secret", mode="before")
     @classmethod
@@ -49,6 +53,8 @@ class Settings(BaseSettings):
             raise ValueError("strength position high must exceed position low")
         if self.market_strength_volume_high <= self.market_strength_volume_low:
             raise ValueError("strength volume high must exceed volume low")
+        if any(delay < 0 for delay in self.email_retry_delays_minutes):
+            raise ValueError("email retry delays must be non-negative")
         return self
 
 

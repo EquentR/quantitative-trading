@@ -47,6 +47,7 @@
   },
   "valid_until": "2026-07-07T15:00:00+08:00",
   "data_time": "2026-07-07T10:30:00+08:00",
+  "fetched_at": "2026-07-07T10:30:03+08:00",
   "run_id": "intraday-20260707-1030",
   "market_input_snapshot_id": 101,
   "plan_id": "plan-20260707-v2",
@@ -132,9 +133,13 @@
 
 建议使用的数据时间戳。推送时间不能替代数据时间。
 
+### `fetched_at`
+
+本轮固化市场输入的系统获取时间。它与 `data_time` 和建议 `created_at` 分别表示获取时间、市场数据时间和建议生成时间，三者不能互相替代。
+
 ### 工作流和数据引用
 
-`run_id`、`market_input_snapshot_id` 和 `plan_id` 将建议连接到实际执行轮次、固化的行情输入和活动计划。`data_references` 必须包含 `ledger`、`account`、`quote`、`history`、`money_flow`、`intraday` 和 `plan`；每项至少包含稳定 `status`，可用时附实际引用 ID、数据时间和来源，不可用时必须明确 `missing/failed/stale`，不能省略后让调用方猜测。
+`run_id`、`market_input_snapshot_id` 和 `plan_id` 将建议连接到实际执行轮次、固化的行情输入和活动计划。`data_references` 必须包含 `ledger`、`account`、`quote`、`history`、`money_flow`、`intraday` 和 `plan`；每项至少包含稳定 `status`，可用时附实际引用 ID、数据时间或覆盖区间、获取时间和来源，不可用时必须明确 `missing/failed/stale`，不能省略后让调用方猜测。
 
 `data_quality` 保存总体质量、逐数据集状态、warnings 和实际生效的 stale/降级语义。`position_constraint` 保存建议仓位区间、建议数量以及经过现金、单票、总仓位、T+1 和流动性裁决后真正生效的上限。所有这些字段由后端生成，前端不得补算。
 

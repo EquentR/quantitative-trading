@@ -16,7 +16,10 @@ from quantitative_trading.api.dependencies import (
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.audit.service import AuditService
-from quantitative_trading.decision.factory import build_decision_workflow
+from quantitative_trading.decision.factory import (
+    build_decision_workflow,
+    dispatch_workflow_failure_alert,
+)
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
     CaptureRunAlreadyActiveError,
@@ -255,10 +258,47 @@ def _audit_failed_request(
                 },
                 now=now,
             )
+            if exc.status_code >= 500:
+                details = exc.details or {}
+                dispatch_workflow_failure_alert(
+                    connection,
+                    container.settings,
+                    workflow_type=workflow_type,
+                    error=str(details.get("error", exc.message)),
+                    source="http",
+                    now=now,
+                )
     except Exception as audit_exc:
         LOGGER.warning(
             "workflow request outcome audit failed: %s",
             safe_error_summary(audit_exc),
+        )
+
+
+def _dispatch_failed_result_alert(
+    connection,
+    container: ApiContainer,
+    *,
+    workflow_type: WorkflowType,
+    run_id: str,
+    warnings: list[str] | tuple[str, ...],
+    now: datetime,
+) -> None:
+    error = "; ".join(warnings) or "workflow returned failed status"
+    try:
+        dispatch_workflow_failure_alert(
+            connection,
+            container.settings,
+            workflow_type=workflow_type,
+            error=error,
+            source="http",
+            now=now,
+            run_id=run_id,
+        )
+    except Exception as alert_exc:
+        LOGGER.warning(
+            "workflow failed-result alert dispatch failed: %s",
+            safe_error_summary(alert_exc),
         )
 
 
@@ -354,6 +394,15 @@ def _run_intraday(
             )
             result = workflow.run_intraday()
             plan = TradingPlanRepository(connection).active_for_day(local_now.date())
+            if result.status is CaptureRunStatus.FAILED:
+                _dispatch_failed_result_alert(
+                    connection,
+                    container,
+                    workflow_type="intraday",
+                    run_id=result.run_id,
+                    warnings=result.warnings,
+                    now=now,
+                )
     except ApiError:
         raise
     except CaptureRunAlreadyActiveError as exc:
@@ -415,6 +464,15 @@ def _run_backfill(
                 trade_date,
                 symbols=request.symbols,
             )
+            if summary.status is CaptureRunStatus.FAILED:
+                _dispatch_failed_result_alert(
+                    connection,
+                    container,
+                    workflow_type="backfill",
+                    run_id=summary.run_id,
+                    warnings=summary.warnings,
+                    now=now,
+                )
     except ApiError:
         raise
     except CaptureRunAlreadyActiveError as exc:

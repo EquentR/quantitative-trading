@@ -457,6 +457,8 @@ worker 必须使用原子 claim 防止同一邮件被多个执行器同时投递
 
 邮件 worker 在服务运行期间每 15 秒轮询一次，不受交易时段限制，且 `max_instances=1`。轮询只 claim 已到 `next_attempt_at` 的有限批次，避免邮件积压占用决策工作流线程。
 
+首次失败后的重试间隔和发送租约通过 `QT_EMAIL_RETRY_DELAYS_MINUTES`（JSON 数组，默认 `[1,5,15,30,60]`）与 `QT_EMAIL_LEASE_SECONDS`（默认 `60`）配置，并将实际生效值用于 outbox worker。
+
 ### SMTP Web 配置
 
 设置页支持：

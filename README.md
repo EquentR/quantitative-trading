@@ -200,6 +200,8 @@ qt email deliveries --status dead
 qt email retry <delivery_id>
 ```
 
+邮件 worker 默认在首次失败后按 1、5、15、30、60 分钟重试，发送 claim 租约为 60 秒。可通过 `.env` 中的 `QT_EMAIL_RETRY_DELAYS_MINUTES=[1,5,15,30,60]` 和 `QT_EMAIL_LEASE_SECONDS=60` 调整。
+
 SMTP 密码经用户确认后明文保存在本地 SQLite，这是项目唯一的秘密存储例外。读取 API、CLI、Web 回填、日志、审计、错误和 outbox 永远不得包含原值；密码输入留空保留已有值，替换和清除必须是明确操作。数据库导出和备份会包含 SMTP 明文密码，因此 `data/`、备份和本地运行数据必须保持 git 忽略并限制为本机用户可读。
 
 `buy/add/sell/reduce` 在本地通知成功后立即进入 outbox，`hold/watch/avoid` 只进入收盘每日摘要。关键工作流故障先写数据库/Web 通知、控制台和 JSONL，再在 SMTP 可用时进入邮件 outbox。投递失败按 1、5、15、30、60 分钟退避，达到最多 6 次尝试后成为 `dead`，同时生成去重的数据库/Web、控制台和 JSONL 本地告警。邮件失败不会回滚建议，也不会重跑决策工作流；SMTP 禁用、未配置或自身故障不能压制本地告警。

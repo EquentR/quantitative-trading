@@ -13,6 +13,7 @@ from quantitative_trading.cash.repository import CashAccountRepository
 from quantitative_trading.config import Settings
 from quantitative_trading.decision.workflow import WorkflowAlreadyRunningError
 from quantitative_trading.market.models import CaptureRunStatus
+from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.storage.sqlite import connect
 
 
@@ -200,7 +201,7 @@ def test_backfill_passes_explicit_symbols_and_maps_failed_summary(
 
     install_clock(monkeypatch, INTRADAY_TIME)
     install_workflow(monkeypatch, FakeWorkflow())
-    client, headers, _settings = authenticated_client(
+    client, headers, settings = authenticated_client(
         tmp_path,
         enable_market_fetch=True,
     )
@@ -224,6 +225,10 @@ def test_backfill_passes_explicit_symbols_and_maps_failed_summary(
     assert response.json()["run_id"] == "backfill-failed"
     assert response.json()["warnings"] == ["all requested datasets failed"]
     assert calls == [(date(2026, 7, 13), ["600000", "000001"])]
+    with connect(settings) as connection:
+        alerts = NotificationRepository(connection).list_recent(limit=10)
+    assert len(alerts) == 1
+    assert alerts[0].action == "system_alert"
     assert invalid_symbol.status_code == 422
     assert invalid_symbol.json()["error"]["code"] == "validation_error"
 
@@ -507,6 +512,33 @@ def test_intraday_uses_current_period_and_rejects_outside_trading_session(
     assert calls == ["intraday"]
 
 
+def test_intraday_failed_result_dispatches_system_alert(tmp_path, monkeypatch) -> None:
+    class FailedWorkflow:
+        def run_intraday(self):
+            return SimpleNamespace(
+                run_id="intraday-20260714-1000",
+                reused=False,
+                status=CaptureRunStatus.FAILED,
+                market_input_snapshot_id=24,
+                recommendation_ids=(),
+                warnings=("all requested quotes unavailable",),
+            )
+
+    install_clock(monkeypatch, INTRADAY_TIME)
+    install_workflow(monkeypatch, FailedWorkflow())
+    client, headers, settings = authenticated_client(tmp_path)
+
+    response = client.post("/api/v1/service/workflows/intraday/run", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    with connect(settings) as connection:
+        alerts = NotificationRepository(connection).list_recent(limit=10)
+    assert len(alerts) == 1
+    assert alerts[0].action == "system_alert"
+    assert alerts[0].reason[0].startswith("intraday workflow failed:")
+
+
 def test_cleanup_uses_retention_service_and_defaults_as_of(
     tmp_path,
     monkeypatch,
@@ -584,8 +616,13 @@ def test_workflow_failures_return_stable_sanitized_error(
         failed = AuditLogRepository(connection).list(
             event_type="service.workflow.run_failed"
         )
+        alerts = NotificationRepository(connection).list_recent(limit=10)
     assert len(failed) == 1
     assert failed[0].payload["error_code"] == "workflow_run_failed"
+    assert len(alerts) == 1
+    assert alerts[0].action == "system_alert"
+    assert "supersecret" not in alerts[0].model_dump_json()
+    assert "/tmp/private" not in alerts[0].model_dump_json()
 
 
 def test_concurrent_workflow_returns_stable_conflict(tmp_path, monkeypatch) -> None:

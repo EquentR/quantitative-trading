@@ -33,11 +33,12 @@ class DecisionSymbolInput(BaseModel):
     invalid_if: list[str] = Field(min_length=1)
     warnings: list[str] = Field(default_factory=list)
     data_time: datetime
+    fetched_at: datetime
     valid_until: datetime
     run_id: int | str
     market_input_snapshot_id: int = Field(gt=0)
 
-    @field_validator("data_time", "valid_until")
+    @field_validator("data_time", "fetched_at", "valid_until")
     @classmethod
     def times_must_be_timezone_aware(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.audit.service import AuditService
@@ -31,6 +33,7 @@ from quantitative_trading.notification.jsonl import JsonlNotificationWriter
 from quantitative_trading.notification.local_alert import LocalAlertDispatcher
 from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.notification.service import NotificationService
+from quantitative_trading.sanitization import safe_error_summary
 
 
 class DisabledHeavyMarketProvider:
@@ -142,6 +145,8 @@ def build_notification_dispatcher(
         EmailDeliveryRepository(connection),
         smtp_repository,
         SmtplibEmailSender(),
+        retry_delays_minutes=settings.email_retry_delays_minutes,
+        lease_seconds=settings.email_lease_seconds,
         audit_repository=audit_repository,
         dead_delivery_alert=local_alert_dispatcher.dispatch_dead_email,
     )
@@ -152,4 +157,34 @@ def build_notification_dispatcher(
         email_service=email_service,
         smtp_settings_service=SmtpSettingsService(smtp_repository),
         local_alert_dispatcher=local_alert_dispatcher,
+    )
+
+
+def dispatch_workflow_failure_alert(
+    connection: sqlite3.Connection,
+    settings: Settings,
+    *,
+    workflow_type: str,
+    error: str,
+    source: str,
+    now: datetime,
+    run_id: str | None = None,
+) -> None:
+    safe_error = safe_error_summary(RuntimeError(error))
+    fingerprint = hashlib.sha256(safe_error.encode("utf-8")).hexdigest()[:16]
+    local_day = now.astimezone(ZoneInfo(settings.timezone)).date().isoformat()
+    build_notification_dispatcher(connection, settings).dispatch_system_alert(
+        alert_key=(
+            f"workflow-failed:{workflow_type}:{local_day}:{fingerprint}"
+        ),
+        event_type="workflow.failed",
+        message=f"{workflow_type} workflow failed: {safe_error}",
+        details={
+            "workflow_type": workflow_type,
+            "status": "failed",
+            "source": source,
+            "run_id": run_id,
+            "error": safe_error,
+        },
+        now=now,
     )

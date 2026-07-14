@@ -1490,9 +1490,12 @@ def test_market_backfill_provider_failures_persist_failed_run_and_safe_errors(
         run_id = payload["run_id"]
         stored = MarketCaptureRunRepository(connection).get(run_id)
         stored_results = MarketCaptureResultRepository(connection).list_for_run(run_id)
+        alerts = NotificationRepository(connection).list_recent(limit=10)
     assert stored is not None
     assert stored.status is CaptureRunStatus.FAILED
     assert len(stored_results) == 2
+    assert len(alerts) == 1
+    assert alerts[0].action == "system_alert"
 
 
 def _notification(
@@ -1741,6 +1744,7 @@ def test_workflow_intraday_cli_uses_shared_decision_workflow(
                 {
                     "run_id": "intraday-20260714-1000",
                     "reused": False,
+                    "status": CaptureRunStatus.SUCCEEDED,
                     "market_input_snapshot_id": 12,
                     "recommendation_ids": ("rec-1",),
                     "warnings": (),
@@ -1766,6 +1770,47 @@ def test_workflow_intraday_cli_uses_shared_decision_workflow(
     assert calls == ["intraday"]
     assert "run_id=intraday-20260714-1000" in result.output
     assert "recommendations=1" in result.output
+
+
+def test_workflow_intraday_cli_failed_result_alerts_and_exits_nonzero(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class FailedWorkflow:
+        def run_intraday(self):
+            return type(
+                "Result",
+                (),
+                {
+                    "run_id": "intraday-20260714-1000",
+                    "reused": False,
+                    "status": CaptureRunStatus.FAILED,
+                    "market_input_snapshot_id": 12,
+                    "recommendation_ids": (),
+                    "warnings": ("all requested quotes unavailable",),
+                },
+            )()
+
+    monkeypatch.setattr(
+        cli,
+        "build_decision_workflow",
+        lambda connection, settings, now: FailedWorkflow(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_workflow_now",
+        lambda: datetime(2026, 7, 14, 2, 0, tzinfo=UTC),
+    )
+
+    result = run_cli(tmp_path, "workflow", "intraday")
+
+    assert result.exit_code == 1
+    assert "status=failed" in result.output
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        alerts = NotificationRepository(connection).list_recent(limit=10)
+    assert len(alerts) == 1
+    assert alerts[0].action == "system_alert"
 
 
 def test_plan_read_command_supports_json(tmp_path) -> None:

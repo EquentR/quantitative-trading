@@ -80,6 +80,7 @@ class Recommendation(BaseModel):
     risk: dict[str, Any]
     valid_until: datetime
     data_time: datetime
+    fetched_at: datetime | None = None
     created_at: datetime | None = None
     run_id: int | str | None = None
     market_input_snapshot_id: int | None = Field(default=None, gt=0)
@@ -106,7 +107,7 @@ class Recommendation(BaseModel):
     def reason_must_be_explanatory(cls, value: list[str]) -> list[str]:
         return _require_text_list(value, "reason")
 
-    @field_validator("valid_until", "data_time", "created_at")
+    @field_validator("valid_until", "data_time", "fetched_at", "created_at")
     @classmethod
     def datetimes_must_be_timezone_aware(
         cls, value: datetime | None, info

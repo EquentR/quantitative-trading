@@ -1359,6 +1359,19 @@ def _quality_dataset(
     )
 
 
+def _merge_trace_quality(
+    status: QualityStatus,
+    warnings: list[str],
+    dataset: CaptureDataset,
+    quality: DatasetQuality | None,
+) -> tuple[QualityStatus, list[str]]:
+    return _merge_persisted_quality(
+        status,
+        warnings,
+        {} if quality is None else {dataset: quality},
+    )
+
+
 def _quote_trace(
     repository: QuoteSnapshotRepository,
     reference_id: int | None,
@@ -1370,6 +1383,12 @@ def _quote_trace(
     status: QualityStatus = (
         "complete" if quote.status is QuoteStatus.OK else quote.status.value
     )
+    status, warnings = _merge_trace_quality(
+        status,
+        [quote.warning] if quote.warning else [],
+        CaptureDataset.QUOTE,
+        quality,
+    )
     return MarketTraceDataset(
         dataset="quote",
         reference_id=reference_id,
@@ -1379,7 +1398,7 @@ def _quote_trace(
         data_end=None,
         data_time=quote.data_time,
         fetched_at=quote.fetched_at,
-        warnings=[quote.warning] if quote.warning else [],
+        warnings=warnings,
     )
 
 
@@ -1400,10 +1419,16 @@ def _history_trace(
         for member in members
         if member.bar.source_updated_at is not None
     ]
+    status, warnings = _merge_trace_quality(
+        snapshot.status.value,
+        [snapshot.warning] if snapshot.warning else [],
+        CaptureDataset.DAILY_BAR,
+        quality,
+    )
     return MarketTraceDataset(
         dataset="history",
         reference_id=reference_id,
-        status=snapshot.status.value,
+        status=status,
         source=source,
         data_start=None
         if snapshot.data_start is None
@@ -1411,7 +1436,7 @@ def _history_trace(
         data_end=None if snapshot.data_end is None else snapshot.data_end.isoformat(),
         data_time=max(source_times) if source_times else None,
         fetched_at=snapshot.fetched_at,
-        warnings=[snapshot.warning] if snapshot.warning else [],
+        warnings=warnings,
     )
 
 
@@ -1432,10 +1457,16 @@ def _money_flow_trace(
         for member in members
         if member.flow.source_updated_at is not None
     ]
+    status, warnings = _merge_trace_quality(
+        snapshot.status.value,
+        [snapshot.warning] if snapshot.warning else [],
+        CaptureDataset.MONEY_FLOW,
+        quality,
+    )
     return MarketTraceDataset(
         dataset="money_flow",
         reference_id=reference_id,
-        status=snapshot.status.value,
+        status=status,
         source=source,
         data_start=None
         if snapshot.data_start is None
@@ -1443,7 +1474,7 @@ def _money_flow_trace(
         data_end=None if snapshot.data_end is None else snapshot.data_end.isoformat(),
         data_time=max(source_times) if source_times else None,
         fetched_at=snapshot.fetched_at,
-        warnings=[snapshot.warning] if snapshot.warning else [],
+        warnings=warnings,
     )
 
 
@@ -1467,10 +1498,16 @@ def _strength_trace(
     data_end = snapshot.last_minute
     if data_end is None and snapshot.data_coverage > 0:
         data_end = snapshot.data_time
+    status, warnings = _merge_trace_quality(
+        "degraded" if snapshot.degraded else "complete",
+        warnings,
+        CaptureDataset.INTRADAY_STRENGTH,
+        quality,
+    )
     return MarketTraceDataset(
         dataset="intraday_strength",
         reference_id=reference_id,
-        status="degraded" if snapshot.degraded else "complete",
+        status=status,
         source=snapshot.source,
         data_start=None if first_minute is None else first_minute.isoformat(),
         data_end=None if data_end is None else data_end.isoformat(),

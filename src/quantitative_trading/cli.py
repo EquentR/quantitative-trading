@@ -32,7 +32,10 @@ from quantitative_trading.cash.service import (
     ReadOnlyCashService,
 )
 from quantitative_trading.config import Settings, load_settings
-from quantitative_trading.decision.factory import build_decision_workflow
+from quantitative_trading.decision.factory import (
+    build_decision_workflow,
+    dispatch_workflow_failure_alert,
+)
 from quantitative_trading.decision.workflow import DecisionWorkflow
 from quantitative_trading.email.models import EmailDeliveryStatus
 from quantitative_trading.email.outbox import (
@@ -756,6 +759,15 @@ def market_backfill(
                 status=summary.status.value,
                 symbols=symbols,
             )
+            if summary.status is CaptureRunStatus.FAILED:
+                _dispatch_cli_failed_result_alert(
+                    settings,
+                    connection,
+                    workflow_type="backfill",
+                    run_id=summary.run_id,
+                    warnings=summary.warnings,
+                    now=datetime.now(UTC),
+                )
     except Exception as exc:
         _audit_cli_failure(
             workflow_type="backfill",
@@ -945,7 +957,8 @@ def _audit_cli_failure(
     manual_reason: str | None = None,
 ) -> None:
     try:
-        with _database_scope() as (_settings, connection):
+        failed_at = datetime.now(UTC)
+        with _database_scope() as (settings, connection):
             AuditService(AuditLogRepository(connection)).record_event(
                 event_type="workflow.manual_run_failed",
                 recommendation_id=None,
@@ -959,7 +972,39 @@ def _audit_cli_failure(
                     "manual_reason": manual_reason,
                     "error": error,
                 },
+                now=failed_at,
             )
+            dispatch_workflow_failure_alert(
+                connection,
+                settings,
+                workflow_type=workflow_type,
+                error=error,
+                source="cli",
+                now=failed_at,
+            )
+    except Exception:
+        return
+
+
+def _dispatch_cli_failed_result_alert(
+    settings: Settings,
+    connection: sqlite3.Connection,
+    *,
+    workflow_type: str,
+    run_id: str,
+    warnings: list[str] | tuple[str, ...],
+    now: datetime,
+) -> None:
+    try:
+        dispatch_workflow_failure_alert(
+            connection,
+            settings,
+            workflow_type=workflow_type,
+            error="; ".join(warnings) or "workflow returned failed status",
+            source="cli",
+            now=now,
+            run_id=run_id,
+        )
     except Exception:
         return
 
@@ -1003,6 +1048,15 @@ def run_intraday_workflow(
                 skip_calendar=False,
                 manual_reason=manual_reason,
             )
+            if result.status is CaptureRunStatus.FAILED:
+                _dispatch_cli_failed_result_alert(
+                    settings,
+                    connection,
+                    workflow_type="intraday",
+                    run_id=result.run_id,
+                    warnings=result.warnings,
+                    now=now,
+                )
     except Exception as exc:
         _audit_cli_failure(
             workflow_type="intraday",
@@ -1017,6 +1071,7 @@ def run_intraday_workflow(
 
     payload = {
         "run_id": result.run_id,
+        "status": result.status.value,
         "reused": result.reused,
         "market_input_snapshot_id": result.market_input_snapshot_id,
         "recommendation_ids": list(result.recommendation_ids),
@@ -1024,15 +1079,18 @@ def run_intraday_workflow(
     }
     if json_output:
         typer.echo(json.dumps(payload, ensure_ascii=False, default=str))
-        return
-    typer.echo(
-        f"run_id={result.run_id} workflow=intraday "
-        f"reused={str(result.reused).lower()} "
-        f"market_input_snapshot_id={result.market_input_snapshot_id} "
-        f"recommendations={len(result.recommendation_ids)}"
-    )
-    for warning in result.warnings:
-        typer.echo(f"warning={warning}")
+    else:
+        typer.echo(
+            f"run_id={result.run_id} workflow=intraday "
+            f"status={result.status.value} "
+            f"reused={str(result.reused).lower()} "
+            f"market_input_snapshot_id={result.market_input_snapshot_id} "
+            f"recommendations={len(result.recommendation_ids)}"
+        )
+        for warning in result.warnings:
+            typer.echo(f"warning={warning}")
+    if result.status is CaptureRunStatus.FAILED:
+        raise typer.Exit(code=1)
 
 
 @workflow_app.command("close")

@@ -20,6 +20,8 @@ RUNTIME_ENV_NAMES = (
     "QT_API_TOKEN_SECRET",
     "QT_API_TOKEN_TTL_SECONDS",
     "QT_SERVICE_RUN_ON_START_WHEN_SCHEDULER_ENABLED",
+    "QT_EMAIL_RETRY_DELAYS_MINUTES",
+    "QT_EMAIL_LEASE_SECONDS",
 )
 
 
@@ -192,6 +194,17 @@ def test_api_secret_settings_treat_empty_environment_as_unset(monkeypatch) -> No
 
     assert settings.api_access_password is None
     assert settings.api_token_secret is None
+
+
+def test_email_delivery_settings_are_configurable_from_environment(monkeypatch) -> None:
+    clear_runtime_environment(monkeypatch)
+    monkeypatch.setenv("QT_EMAIL_RETRY_DELAYS_MINUTES", "[2, 7, 20]")
+    monkeypatch.setenv("QT_EMAIL_LEASE_SECONDS", "90")
+
+    settings = Settings()
+
+    assert settings.email_retry_delays_minutes == (2, 7, 20)
+    assert settings.email_lease_seconds == 90
 
 
 @pytest.mark.parametrize("raw_port", ["0", "65536"])

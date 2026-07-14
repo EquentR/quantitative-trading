@@ -1338,6 +1338,20 @@ def test_intraday_workflow_consumes_plan_and_is_idempotent_per_three_minute_cycl
     assert len(recommendations) == 1
     assert recommendations[0].action is RecommendationAction.ADD
     assert recommendations[0].run_id == first.run_id
+    assert recommendations[0].fetched_at == market_input.fetched_at
+    quote_reference = recommendations[0].data_references["quote"]
+    assert quote_reference["source"] == "fake"
+    assert quote_reference["data_time"] == clock.value.isoformat()
+    history_reference = recommendations[0].data_references["history"]
+    assert history_reference["source"] == "daily_provider"
+    assert history_reference["data_start"]
+    assert history_reference["data_end"] == TRADE_DATE.isoformat()
+    assert recommendations[0].data_references["money_flow"]["source"] == (
+        "money_flow_provider"
+    )
+    assert datetime.fromisoformat(
+        recommendations[0].data_references["intraday"]["data_time"]
+    ) == clock.value
     assert strength is not None
     assert strength.label.value == "strong"
     assert strength.thresholds["stale_minutes"] == 6
