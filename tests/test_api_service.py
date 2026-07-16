@@ -933,7 +933,7 @@ def test_close_not_ready_becomes_failed_only_at_hard_deadline(
     monkeypatch.setattr(
         service_app,
         "_build_decision_workflow",
-        lambda connection, settings, task_now: NotReadyWorkflow(),
+        lambda connection, settings: NotReadyWorkflow(),
     )
     settings = Settings(
         database_path=tmp_path / "close-deadline.db",

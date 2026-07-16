@@ -20,6 +20,8 @@ class ApiContainer:
     scheduler: object | None = None
     email_sender: object | None = None
     smtp_connection_tester: object | None = None
+    miaoxiang_watchlist_adapter: object | None = None
+    instrument_directory_adapter: object | None = None
 
 
 def get_container() -> ApiContainer:

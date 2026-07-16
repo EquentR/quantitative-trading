@@ -248,7 +248,7 @@ warnings: list[str]
 职责：把已验证的证券类型和交易所产品类别转换为内部交易规则。
 
 - A 股固定映射为 `t1`。
-- ETF 只根据上交所 ETF 产品目录的 `ETF_TYPE` 和深交所 ETF 产品目录的“基金类别/投资类别”映射。
+- ETF 只根据上交所 `FUND_LIST.subClass` 详细产品分类和深交所 ETF 产品目录的“基金类别/投资类别”映射。
 - 规则映射必须版本化，并保存元数据来源和检查时间。
 - adapter 先通过精确字符串白名单把交易所原始类别归一化为 `cross_border`、`bond`、`gold`、`commodity`、`money_market`、`domestic_equity` 或 `domestic_index`；白名单不做名称包含匹配。
 - `cross_border`、`bond`、`gold`、`commodity`、`money_market` 映射为 `t0`。

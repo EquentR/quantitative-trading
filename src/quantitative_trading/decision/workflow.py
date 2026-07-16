@@ -77,6 +77,7 @@ from quantitative_trading.universe.models import (
 from quantitative_trading.universe.repository import UniverseSnapshotRepository
 from quantitative_trading.universe.service import build_universe
 from quantitative_trading.watchlist.repository import WatchPinnedRepository
+from quantitative_trading.instrument.models import InstrumentMetadata, InstrumentType
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,13 @@ class DecisionWorkflow:
         daily_provider: DailyBarProvider,
         money_flow_provider: MoneyFlowProvider,
         intraday_provider: IntradayProvider,
+        etf_quote_provider: MarketDataProvider | None = None,
+        etf_daily_provider: DailyBarProvider | None = None,
+        etf_intraday_provider: IntradayProvider | None = None,
+        instrument_metadata_loader: Callable[
+            [Sequence[str]], dict[str, InstrumentMetadata]
+        ]
+        | None = None,
         now: Callable[[], datetime],
         stale_trading_minutes: int = 6,
         strength_rules: IntradayStrengthRules | None = None,
@@ -156,6 +164,10 @@ class DecisionWorkflow:
         self.daily_provider = daily_provider
         self.money_flow_provider = money_flow_provider
         self.intraday_provider = intraday_provider
+        self.etf_quote_provider = etf_quote_provider
+        self.etf_daily_provider = etf_daily_provider
+        self.etf_intraday_provider = etf_intraday_provider
+        self.instrument_metadata_loader = instrument_metadata_loader
         self.now = now
         if stale_trading_minutes < 1:
             raise ValueError("stale trading minute threshold must be positive")
@@ -189,6 +201,7 @@ class DecisionWorkflow:
             self.connection,
             calendar=self.calendar,
             daily_provider=self.daily_provider,
+            etf_daily_provider=self.etf_daily_provider,
             money_flow_provider=self.money_flow_provider,
             now=self.now,
         )
@@ -362,9 +375,14 @@ class DecisionWorkflow:
 
         positions = PositionRepository(self.connection).list()
         watchlist = WatchPinnedRepository(self.connection).list()
+        metadata_by_symbol = self._load_instrument_metadata(
+            [position.symbol for position in positions]
+            + [item.symbol for item in watchlist]
+        )
         members = build_universe(
             positions=positions,
             watchlist=watchlist,
+            instrument_metadata=metadata_by_symbol,
             created_at=started_at,
         )
         decision_members = [member for member in members if member.plan_enabled]
@@ -380,15 +398,28 @@ class DecisionWorkflow:
 
         run = run.model_copy(update={"requested_symbols": len(symbols)})
         run_repository.update_claimed(run, claim_started_at=run.started_at)
-        quote_refs, quotes, warnings, provider_duration_ms = self._capture_quotes(
-            run_id, symbols, started_at
+        (
+            quote_refs,
+            quotes,
+            warnings,
+            provider_duration_ms,
+            quote_provider_calls,
+        ) = self._capture_quotes(
+            run_id,
+            symbols,
+            started_at,
+            instrument_metadata=metadata_by_symbol,
         )
 
         daily_repository = DailyBarRepository(self.connection)
         flow_repository = MoneyFlowRepository(self.connection)
         backfill = HeavyDataBackfillService(
             calendar=self.calendar,
-            daily_provider=self.daily_provider,
+            daily_provider=_RoutedDailyProvider(
+                metadata_by_symbol,
+                a_share_provider=self.daily_provider,
+                etf_provider=self.etf_daily_provider,
+            ),
             money_flow_provider=self.money_flow_provider,
             daily_repository=daily_repository,
             money_flow_repository=flow_repository,
@@ -408,18 +439,29 @@ class DecisionWorkflow:
         hard_ready = session_close is None or started_at >= session_close
         if symbols and not hard_ready:
             warnings.append("交易时段尚未收盘，不能发布次日计划")
-        provider_calls = 1 if symbols else 0
+        provider_calls = quote_provider_calls
         rows_received = len(quotes)
         rows_written = len(quote_refs)
 
         for symbol in symbols:
             quality: dict[CaptureDataset, DatasetQuality] = {}
             quote = quotes[symbol]
+            metadata = metadata_by_symbol.get(symbol)
+            daily_provider_configured = not (
+                metadata is not None
+                and metadata.instrument_type is InstrumentType.UNKNOWN
+            ) and not (
+                metadata is not None
+                and metadata.instrument_type is InstrumentType.ETF
+                and self.etf_daily_provider is None
+            )
             try:
                 provider_started = perf_counter()
                 history = backfill.backfill_daily(run_id, symbol, trade_date)
             except Exception as exc:
                 self._require_provider_capture_error(exc)
+                if daily_provider_configured:
+                    provider_calls += 1
                 warning = f"{symbol} 日 K 采集失败: {safe_error_summary(exc)}"
                 warnings.append(warning)
                 hard_ready = False
@@ -535,11 +577,67 @@ class DecisionWorkflow:
             if not quote_usable:
                 hard_ready = False
 
+            if (
+                metadata is not None
+                and metadata.instrument_type is InstrumentType.ETF
+            ):
+                quality[CaptureDataset.MONEY_FLOW] = DatasetQuality(
+                    status=CaptureResultStatus.NOT_APPLICABLE,
+                    expected_rows=0,
+                    actual_rows=0,
+                    source="instrument_policy",
+                )
+                result_repository.upsert(
+                    MarketCaptureResult(
+                        run_id=run_id,
+                        symbol=symbol,
+                        dataset=CaptureDataset.MONEY_FLOW,
+                        status=CaptureResultStatus.NOT_APPLICABLE,
+                        fetched_at=started_at,
+                        expected_rows=0,
+                        actual_rows=0,
+                        source="instrument_policy",
+                    )
+                )
+                dataset_quality[symbol] = quality
+                continue
+
+            if (
+                metadata is not None
+                and metadata.instrument_type is InstrumentType.UNKNOWN
+            ):
+                warning = f"{symbol} 证券类型未知，未调用资金流 provider"
+                warnings.append(warning)
+                quality[CaptureDataset.MONEY_FLOW] = DatasetQuality(
+                    status=CaptureResultStatus.FAILED,
+                    expected_rows=60,
+                    actual_rows=0,
+                    source="instrument_policy",
+                    warning=warning,
+                )
+                result_repository.upsert(
+                    MarketCaptureResult(
+                        run_id=run_id,
+                        symbol=symbol,
+                        dataset=CaptureDataset.MONEY_FLOW,
+                        status=CaptureResultStatus.FAILED,
+                        fetched_at=started_at,
+                        expected_rows=60,
+                        actual_rows=0,
+                        source="instrument_policy",
+                        warning=warning,
+                        error_summary=warning,
+                    )
+                )
+                dataset_quality[symbol] = quality
+                continue
+
             try:
                 provider_started = perf_counter()
                 flow = backfill.backfill_money_flow(run_id, symbol, trade_date)
             except Exception as exc:
                 self._require_provider_capture_error(exc)
+                provider_calls += 1
                 warning = f"{symbol} 资金流采集失败: {safe_error_summary(exc)}"
                 warnings.append(warning)
                 quality[CaptureDataset.MONEY_FLOW] = DatasetQuality(
@@ -603,6 +701,11 @@ class DecisionWorkflow:
             history_snapshot_refs=history_refs,
             money_flow_snapshot_refs=flow_refs,
             intraday_strength_snapshot_refs={},
+            instrument_metadata={
+                symbol: metadata_by_symbol[symbol]
+                for symbol in symbols
+                if symbol in metadata_by_symbol
+            },
             dataset_quality=dataset_quality,
             capture_run_id=run_id,
             thresholds={
@@ -745,7 +848,11 @@ class DecisionWorkflow:
         )
 
         has_degradation = any(
-            item.status is not CaptureResultStatus.COMPLETE
+            item.status
+            not in {
+                CaptureResultStatus.COMPLETE,
+                CaptureResultStatus.NOT_APPLICABLE,
+            }
             for quality in dataset_quality.values()
             for item in quality.values()
         )
@@ -785,9 +892,12 @@ class DecisionWorkflow:
             warnings=tuple(active_plan.warnings),
         )
 
-    def run_intraday(self) -> IntradayWorkflowResult:
+    def run_intraday(self, *, as_of: datetime | None = None) -> IntradayWorkflowResult:
         started_at = self._now()
-        local_now = started_at.astimezone(self.calendar.timezone)
+        logical_now = started_at if as_of is None else as_of
+        if logical_now.tzinfo is None or logical_now.utcoffset() is None:
+            raise ValueError("intraday as_of must be timezone-aware")
+        local_now = logical_now.astimezone(self.calendar.timezone)
         trade_date = local_now.date()
         if not self.calendar.is_trading_day(trade_date):
             raise ValueError("intraday workflow requires an XSHG trading day")
@@ -917,6 +1027,7 @@ class DecisionWorkflow:
 
         positions = PositionRepository(self.connection).list()
         positions_by_symbol = {position.symbol: position for position in positions}
+        watchlist = WatchPinnedRepository(self.connection).list()
         plan_repository = TradingPlanRepository(self.connection)
         plan = plan_repository.active_for_day(trade_date)
         if plan is not None and started_at > plan.valid_until:
@@ -929,31 +1040,51 @@ class DecisionWorkflow:
             )
             plan = None
         plan_symbols = set() if plan is None else set(plan.symbol_contexts)
-        symbols = sorted(set(positions_by_symbol) | plan_symbols)
+        decision_symbols = sorted(set(positions_by_symbol) | plan_symbols)
+        metadata_by_symbol = self._load_instrument_metadata(
+            sorted(
+                set(decision_symbols)
+                | {item.symbol for item in watchlist if item.plan_enabled}
+            )
+        )
 
         current_members = build_universe(
             positions=positions,
-            watchlist=WatchPinnedRepository(self.connection).list(),
+            watchlist=watchlist,
+            instrument_metadata=metadata_by_symbol,
             created_at=started_at,
         )
         member_by_symbol = {member.symbol: member for member in current_members}
+        capture_symbols = sorted(
+            set(decision_symbols)
+            | {member.symbol for member in current_members if member.plan_enabled}
+        )
         universe_snapshot_id = UniverseSnapshotRepository(self.connection).save(
             UniverseSnapshot(
                 created_at=started_at,
                 status=UniverseSnapshotStatus.OK,
-                warnings=[] if symbols else ["盘中决策集合为空"],
+                warnings=[] if capture_symbols else ["盘中采集集合为空"],
                 members=[
                     member_by_symbol[symbol]
-                    for symbol in symbols
+                    for symbol in capture_symbols
                     if symbol in member_by_symbol
                 ],
             )
         )
-        run = run.model_copy(update={"requested_symbols": len(symbols)})
+        run = run.model_copy(update={"requested_symbols": len(capture_symbols)})
         run_repository.update_claimed(run, claim_started_at=run.started_at)
 
-        quote_refs, quotes, warnings, provider_duration_ms = self._capture_quotes(
-            run_id, symbols, started_at
+        (
+            quote_refs,
+            quotes,
+            warnings,
+            provider_duration_ms,
+            quote_provider_calls,
+        ) = self._capture_quotes(
+            run_id,
+            capture_symbols,
+            started_at,
+            instrument_metadata=metadata_by_symbol,
         )
         result_repository = MarketCaptureResultRepository(self.connection)
         dataset_quality: dict[str, dict[CaptureDataset, DatasetQuality]] = {}
@@ -1009,7 +1140,7 @@ class DecisionWorkflow:
             else {
                 symbol: snapshot_id
                 for symbol, snapshot_id in close_input.history_snapshot_refs.items()
-                if symbol in symbols
+                if symbol in capture_symbols
             }
         )
         flow_refs = (
@@ -1018,11 +1149,11 @@ class DecisionWorkflow:
             else {
                 symbol: snapshot_id
                 for symbol, snapshot_id in close_input.money_flow_snapshot_refs.items()
-                if symbol in symbols
+                if symbol in capture_symbols
             }
         )
         if close_input is not None:
-            for symbol in symbols:
+            for symbol in capture_symbols:
                 for dataset in (CaptureDataset.DAILY_BAR, CaptureDataset.MONEY_FLOW):
                     quality = close_input.dataset_quality.get(symbol, {}).get(dataset)
                     if quality is not None:
@@ -1033,16 +1164,30 @@ class DecisionWorkflow:
         strength_repository = IntradayStrengthSnapshotRepository(self.connection)
         strength_refs: dict[str, int] = {}
         strength_by_symbol = {}
-        provider_calls = 1 if symbols else 0
+        provider_calls = quote_provider_calls
         rows_received = len(quotes)
         rows_written = len(quote_refs)
-        for symbol in symbols:
+        for symbol in capture_symbols:
             try:
-                provider_calls += 1
+                metadata = metadata_by_symbol.get(symbol)
+                provider_configured = not (
+                    metadata is not None
+                    and metadata.instrument_type is InstrumentType.UNKNOWN
+                ) and not (
+                    metadata is not None
+                    and metadata.instrument_type is InstrumentType.ETF
+                    and self.etf_intraday_provider is None
+                )
+                if provider_configured:
+                    provider_calls += 1
                 provider_started = perf_counter()
                 try:
                     fetched_minute_bars = list(
-                        self.intraday_provider.get_minute_bars(
+                        _RoutedIntradayProvider(
+                            metadata_by_symbol,
+                            a_share_provider=self.intraday_provider,
+                            etf_provider=self.etf_intraday_provider,
+                        ).get_minute_bars(
                             symbol, trade_date, "1m"
                         )
                     )
@@ -1225,6 +1370,11 @@ class DecisionWorkflow:
             history_snapshot_refs=history_refs,
             money_flow_snapshot_refs=flow_refs,
             intraday_strength_snapshot_refs=strength_refs,
+            instrument_metadata={
+                symbol: metadata_by_symbol[symbol]
+                for symbol in capture_symbols
+                if symbol in metadata_by_symbol
+            },
             dataset_quality=dataset_quality,
             capture_run_id=run_id,
             thresholds={
@@ -1237,6 +1387,54 @@ class DecisionWorkflow:
         market_input_id = MarketInputSnapshotRepository(self.connection).save(
             market_input
         )
+        if not decision_symbols:
+            degraded = any(
+                item.status
+                not in {
+                    CaptureResultStatus.COMPLETE,
+                    CaptureResultStatus.NOT_APPLICABLE,
+                }
+                for quality in dataset_quality.values()
+                for item in quality.values()
+            )
+            unusable_quotes = sum(
+                1
+                for symbol in capture_symbols
+                if dataset_quality[symbol][CaptureDataset.QUOTE].status
+                in {CaptureResultStatus.FAILED, CaptureResultStatus.STALE}
+            )
+            final_status = (
+                CaptureRunStatus.FAILED
+                if capture_symbols and unusable_quotes == len(capture_symbols)
+                else CaptureRunStatus.DEGRADED
+                if degraded
+                else CaptureRunStatus.SUCCEEDED
+            )
+            run_repository.update_claimed(
+                run.model_copy(
+                    update={
+                        "status": final_status,
+                        "finished_at": self._now(),
+                        "processed_symbols": len(capture_symbols),
+                        "provider_calls": provider_calls,
+                        "provider_duration_ms": provider_duration_ms,
+                        "rows_received": rows_received,
+                        "rows_written": rows_written,
+                        "warning_count": len(warnings),
+                        "failure_count": unusable_quotes,
+                    }
+                ),
+                claim_started_at=run.started_at,
+            )
+            return IntradayWorkflowResult(
+                run_id=run_id,
+                reused=False,
+                status=final_status,
+                market_input_snapshot_id=market_input_id,
+                recommendation_ids=(),
+                warnings=tuple(warnings),
+            )
+
         account_created = create_and_save_account_snapshot_with_connection(
             self.connection,
             market=_CapturedMarketProvider(quotes),
@@ -1256,8 +1454,10 @@ class DecisionWorkflow:
         reserved_new_buy_value = risk_state.daily_new_buy_value
         reserved_trade_count = risk_state.daily_trade_count
         recommendations = []
-        for symbol in symbols:
+        for symbol in decision_symbols:
             position = positions_by_symbol.get(symbol)
+            is_holding = position is not None
+            instrument = metadata_by_symbol.get(symbol)
             valuation = valuation_by_symbol.get(symbol)
             plan_context = None if plan is None else plan.symbol_contexts.get(symbol)
             strength = strength_by_symbol.get(symbol)
@@ -1273,11 +1473,31 @@ class DecisionWorkflow:
                 or (None if strength is None else strength.data_time)
                 or market_input.data_time
             )
+            data_time_source = "market"
+            decision_time_warning = ""
+            if (
+                decision_data_time is None
+                and is_holding
+                and instrument is not None
+                and instrument.instrument_type is InstrumentType.UNKNOWN
+            ):
+                decision_data_time = instrument.metadata_checked_at
+                data_time_source = "instrument_metadata"
+                decision_time_warning = (
+                    "无可用行情时间，data_time 使用证券元数据核验时间，"
+                    "不代表行情时间；持仓仅允许保守 hold 并需人工复核"
+                )
             if decision_data_time is None:
                 raise ValueError("decision requires verified market data time")
             current_flows = flow_repository.current(symbol, limit=1)
+            flow_quality = dataset_quality.get(symbol, {}).get(
+                CaptureDataset.MONEY_FLOW
+            )
             money_flow_confirmed = (
                 None
+                if flow_quality is not None
+                and flow_quality.status is CaptureResultStatus.NOT_APPLICABLE
+                else None
                 if not current_flows
                 else current_flows[-1].flow.main_net_amount > 0
             )
@@ -1293,7 +1513,6 @@ class DecisionWorkflow:
                 if plan_context is None
                 else evaluate_plan_conditions(plan_context.conditions, metrics)
             )
-            is_holding = position is not None
             allowed_entry_action = "add" if is_holding else "buy"
             plan_allows_entry = (
                 plan_context is not None
@@ -1323,7 +1542,10 @@ class DecisionWorkflow:
             elif (
                 quality_values.get(CaptureDataset.MONEY_FLOW) is None
                 or quality_values[CaptureDataset.MONEY_FLOW].status
-                is not CaptureResultStatus.COMPLETE
+                not in {
+                    CaptureResultStatus.COMPLETE,
+                    CaptureResultStatus.NOT_APPLICABLE,
+                }
             ):
                 overall_quality = "degraded"
             else:
@@ -1373,6 +1595,7 @@ class DecisionWorkflow:
                     if plan_context is not None
                     else symbol
                 ),
+                instrument=instrument,
                 is_holding=is_holding,
                 current_price=verified_price,
                 support_price=levels.get("support"),
@@ -1410,11 +1633,21 @@ class DecisionWorkflow:
                 price_context={
                     "current_price": verified_price,
                     "change_pct": quote.change_pct,
+                    "market_data_time": (
+                        None if quote.data_time is None else quote.data_time.isoformat()
+                    ),
                     "key_levels": levels,
                 },
                 data_references=data_references,
                 invalid_if=invalid_if,
-                warnings=_stable_unique([*warnings, *account_snapshot.warnings]),
+                warnings=_stable_unique(
+                    [
+                        *warnings,
+                        *account_snapshot.warnings,
+                        *([decision_time_warning] if decision_time_warning else []),
+                    ]
+                ),
+                data_time_source=data_time_source,
                 data_time=decision_data_time,
                 fetched_at=market_input.fetched_at,
                 valid_until=(
@@ -1575,19 +1808,23 @@ class DecisionWorkflow:
                     warnings.extend(getattr(dispatch, "warnings", ()))
 
         degraded = any(
-            item.status is not CaptureResultStatus.COMPLETE
+            item.status
+            not in {
+                CaptureResultStatus.COMPLETE,
+                CaptureResultStatus.NOT_APPLICABLE,
+            }
             for quality in dataset_quality.values()
             for item in quality.values()
         )
         unusable_quotes = sum(
             1
-            for symbol in symbols
+            for symbol in capture_symbols
             if dataset_quality[symbol][CaptureDataset.QUOTE].status
             in {CaptureResultStatus.FAILED, CaptureResultStatus.STALE}
         )
         final_status = (
             CaptureRunStatus.FAILED
-            if symbols and unusable_quotes == len(symbols)
+            if capture_symbols and unusable_quotes == len(capture_symbols)
             else CaptureRunStatus.DEGRADED
             if degraded
             else CaptureRunStatus.SUCCEEDED
@@ -1597,7 +1834,7 @@ class DecisionWorkflow:
                 update={
                     "status": final_status,
                     "finished_at": self._now(),
-                    "processed_symbols": len(symbols),
+                    "processed_symbols": len(capture_symbols),
                     "provider_calls": provider_calls,
                     "provider_duration_ms": provider_duration_ms,
                     "rows_received": rows_received,
@@ -1666,19 +1903,51 @@ class DecisionWorkflow:
         run_id: str,
         symbols: list[str],
         fetched_at: datetime,
-    ) -> tuple[dict[str, int], dict[str, QuoteSnapshot], list[str], float]:
+        *,
+        instrument_metadata: dict[str, InstrumentMetadata] | None = None,
+    ) -> tuple[dict[str, int], dict[str, QuoteSnapshot], list[str], float, int]:
         if not symbols:
-            return {}, {}, ["决策启用集合为空"], 0.0
-        provider_started = perf_counter()
-        try:
-            returned = self.quote_provider.get_quotes(symbols)
-        except MarketProviderError as exc:
-            summary = safe_error_summary(exc)
-            returned = {}
-            provider_warning = f"批量报价失败: {summary}"
-        else:
-            provider_warning = ""
-        provider_duration_ms = (perf_counter() - provider_started) * 1000
+            return {}, {}, ["决策启用集合为空"], 0.0, 0
+        metadata_by_symbol = instrument_metadata or {}
+        etf_symbols = [
+            symbol
+            for symbol in symbols
+            if metadata_by_symbol.get(symbol) is not None
+            and metadata_by_symbol[symbol].instrument_type is InstrumentType.ETF
+        ]
+        standard_symbols = [
+            symbol
+            for symbol in symbols
+            if symbol not in etf_symbols
+            and not (
+                metadata_by_symbol.get(symbol) is not None
+                and metadata_by_symbol[symbol].instrument_type is InstrumentType.UNKNOWN
+            )
+        ]
+        returned: dict[str, QuoteSnapshot] = {}
+        provider_warnings: list[str] = []
+        provider_duration_ms = 0.0
+        provider_calls = 0
+        for provider, group, label in (
+            (self.quote_provider, standard_symbols, "A股"),
+            (self.etf_quote_provider, etf_symbols, "ETF"),
+        ):
+            if not group:
+                continue
+            if provider is None:
+                provider_warnings.append(f"{label} 报价 provider 未配置")
+                continue
+            provider_calls += 1
+            provider_started = perf_counter()
+            try:
+                returned.update(provider.get_quotes(group))
+            except MarketProviderError as exc:
+                provider_warnings.append(
+                    f"{label} 批量报价失败: {safe_error_summary(exc)}"
+                )
+            finally:
+                provider_duration_ms += (perf_counter() - provider_started) * 1000
+        provider_warning = "; ".join(provider_warnings)
 
         repository = QuoteSnapshotRepository(self.connection)
         refs: dict[str, int] = {}
@@ -1743,7 +2012,7 @@ class DecisionWorkflow:
             refs[symbol] = repository.save(quote, commit=False)
             quotes[symbol] = quote
         self.connection.commit()
-        return refs, quotes, warnings, provider_duration_ms
+        return refs, quotes, warnings, provider_duration_ms, provider_calls
 
     def _dispatch_close_daily_summary(
         self,
@@ -1806,8 +2075,14 @@ class DecisionWorkflow:
                 name: asdict(getattr(features, name))
                 for name in features.__dataclass_fields__
             }
+            symbol_quality = dataset_quality.get(member.symbol, {})
             current_flows = flow_repository.current(member.symbol, limit=60)
             money_flow = (
+                {"status": "not_applicable"}
+                if symbol_quality.get(CaptureDataset.MONEY_FLOW) is not None
+                and symbol_quality[CaptureDataset.MONEY_FLOW].status
+                is CaptureResultStatus.NOT_APPLICABLE
+                else
                 {"status": "failed"}
                 if not current_flows
                 else {
@@ -1818,7 +2093,6 @@ class DecisionWorkflow:
                     ),
                 }
             )
-            symbol_quality = dataset_quality.get(member.symbol, {})
             relevant_quality = [
                 symbol_quality.get(CaptureDataset.QUOTE),
                 symbol_quality.get(CaptureDataset.DAILY_BAR),
@@ -1828,7 +2102,11 @@ class DecisionWorkflow:
                 "complete"
                 if all(
                     item is not None
-                    and item.status is CaptureResultStatus.COMPLETE
+                    and item.status
+                    in {
+                        CaptureResultStatus.COMPLETE,
+                        CaptureResultStatus.NOT_APPLICABLE,
+                    }
                     for item in relevant_quality
                 )
                 else "degraded"
@@ -1844,6 +2122,7 @@ class DecisionWorkflow:
                 MarketPlanSymbolInput(
                     symbol=member.symbol,
                     name=member.name,
+                    instrument=member.instrument,
                     sources=[source.value for source in member.sources],
                     is_holding=any(
                         source.value == "holding" for source in member.sources
@@ -2080,6 +2359,19 @@ class DecisionWorkflow:
                 return int(row["id"])
         raise KeyError(f"market input snapshot not found for run: {run_id}")
 
+    def _load_instrument_metadata(
+        self, symbols: Sequence[str]
+    ) -> dict[str, InstrumentMetadata]:
+        if self.instrument_metadata_loader is None:
+            return {}
+        requested = list(dict.fromkeys(symbols))
+        loaded = self.instrument_metadata_loader(requested)
+        return {
+            symbol: metadata
+            for symbol, metadata in loaded.items()
+            if symbol in requested and metadata.symbol == symbol
+        }
+
     def _now(self) -> datetime:
         value = self.now()
         if value.tzinfo is None or value.utcoffset() is None:
@@ -2095,6 +2387,58 @@ class _CapturedMarketProvider:
         return {
             symbol: self.quotes[symbol] for symbol in symbols if symbol in self.quotes
         }
+
+
+class _RoutedDailyProvider:
+    def __init__(
+        self,
+        metadata: dict[str, InstrumentMetadata],
+        *,
+        a_share_provider: DailyBarProvider,
+        etf_provider: DailyBarProvider | None,
+    ) -> None:
+        self.metadata = metadata
+        self.a_share_provider = a_share_provider
+        self.etf_provider = etf_provider
+
+    def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+        instrument = self.metadata.get(symbol)
+        if instrument is not None and instrument.instrument_type is InstrumentType.UNKNOWN:
+            raise MarketProviderError("instrument type is unknown")
+        provider = (
+            self.etf_provider
+            if instrument is not None and instrument.instrument_type is InstrumentType.ETF
+            else self.a_share_provider
+        )
+        if provider is None:
+            raise MarketProviderError("ETF daily provider is not configured")
+        return provider.get_daily_bars(symbol, start_date, end_date, adjustment)
+
+
+class _RoutedIntradayProvider:
+    def __init__(
+        self,
+        metadata: dict[str, InstrumentMetadata],
+        *,
+        a_share_provider: IntradayProvider,
+        etf_provider: IntradayProvider | None,
+    ) -> None:
+        self.metadata = metadata
+        self.a_share_provider = a_share_provider
+        self.etf_provider = etf_provider
+
+    def get_minute_bars(self, symbol, trade_date, interval):
+        instrument = self.metadata.get(symbol)
+        if instrument is not None and instrument.instrument_type is InstrumentType.UNKNOWN:
+            raise MarketProviderError("instrument type is unknown")
+        provider = (
+            self.etf_provider
+            if instrument is not None and instrument.instrument_type is InstrumentType.ETF
+            else self.a_share_provider
+        )
+        if provider is None:
+            raise MarketProviderError("ETF intraday provider is not configured")
+        return provider.get_minute_bars(symbol, trade_date, interval)
 
 
 def _stable_unique(values: list[str]) -> list[str]:
@@ -2139,8 +2483,11 @@ def _trading_minute_lag(
     if (
         local_data_time.date() != local_now.date()
         or not calendar.is_trading_day(local_now.date())
-        or local_data_time > local_now
     ):
+        return float("inf")
+    if local_data_time > local_now:
+        if local_data_time - local_now <= timedelta(minutes=1):
+            return 0
         return float("inf")
     return max(
         0,

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from quantitative_trading.watchlist.models import (
     WatchPinnedInput,
+    WatchPinnedImportResult,
     WatchPinnedItem,
     WatchPinnedSource,
 )
@@ -27,6 +28,9 @@ class ReadOnlyWatchPinnedService:
 
 
 class WatchPinnedService(ReadOnlyWatchPinnedService):
+    def parse_csv(self, path: Path) -> list[WatchPinnedInput]:
+        return self._repository.read_csv_items(path)
+
     def upsert_pinned(
         self,
         item: WatchPinnedInput,
@@ -48,6 +52,19 @@ class WatchPinnedService(ReadOnlyWatchPinnedService):
     ) -> list[WatchPinnedItem]:
         return self._repository.replace_all(items, source=source, now=now or current_time())
 
+    def replace_pinned_with_warnings(
+        self,
+        items: list[WatchPinnedInput],
+        *,
+        source: WatchPinnedSource,
+        now: datetime | None = None,
+    ) -> WatchPinnedImportResult:
+        return self._repository.replace_all_with_warnings(
+            items,
+            source=source,
+            now=now or current_time(),
+        )
+
     def import_csv(
         self,
         path: Path,
@@ -56,6 +73,19 @@ class WatchPinnedService(ReadOnlyWatchPinnedService):
         now: datetime | None = None,
     ) -> list[WatchPinnedItem]:
         return self._repository.import_csv(path, source=source, now=now or current_time())
+
+    def import_csv_with_warnings(
+        self,
+        path: Path,
+        *,
+        source: WatchPinnedSource,
+        now: datetime | None = None,
+    ) -> WatchPinnedImportResult:
+        return self._repository.import_csv_with_warnings(
+            path,
+            source=source,
+            now=now or current_time(),
+        )
 
     def merge_synced_pinned(
         self,

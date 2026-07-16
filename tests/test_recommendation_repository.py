@@ -5,9 +5,29 @@ from quantitative_trading.recommendation.identity import with_recommendation_ide
 from quantitative_trading.recommendation.models import Recommendation, RecommendationAction
 from quantitative_trading.recommendation.repository import RecommendationRepository
 from quantitative_trading.storage.sqlite import connect, migrate
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
 
 
 NOW = datetime(2026, 7, 13, 2, 30, tzinfo=UTC)
+
+
+def metadata(rule_version: str) -> InstrumentMetadata:
+    return InstrumentMetadata(
+        symbol="600000",
+        name="测试股票",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="exchange_catalog",
+        metadata_checked_at=NOW,
+        rule_version=rule_version,
+    )
 
 
 def recommendation(
@@ -169,3 +189,25 @@ def test_recommendation_identity_aligns_to_three_minute_cycle() -> None:
     )
 
     assert identified.decision_cycle == "2026-07-13T02:30:00+00:00"
+
+
+def test_recommendation_fingerprint_changes_with_instrument_rule_version() -> None:
+    first = recommendation(
+        "temporary-id-1", "600000", RecommendationAction.WATCH, data_time=NOW
+    ).model_copy(update={"instrument": metadata("instrument-rules-v1")})
+    second = first.model_copy(update={"instrument": metadata("instrument-rules-v2")})
+
+    first = with_recommendation_identity(
+        first,
+        trade_date=date(2026, 7, 13),
+        period_start=NOW,
+        plan_version=1,
+    )
+    second = with_recommendation_identity(
+        second,
+        trade_date=date(2026, 7, 13),
+        period_start=NOW,
+        plan_version=1,
+    )
+
+    assert first.condition_fingerprint != second.condition_fingerprint

@@ -23,6 +23,12 @@ from quantitative_trading.market.models import (
     StrengthLabel,
     TradingStatus,
 )
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
 
 
 FETCHED_AT = datetime(2026, 7, 13, 7, 1, tzinfo=UTC)
@@ -224,3 +230,45 @@ def test_market_input_snapshot_accepts_run_link_and_dataset_quality_defaults() -
             data_time=datetime(2026, 7, 13, 10, 0),
             fetched_at=FETCHED_AT,
         )
+
+
+def test_etf_money_flow_not_applicable_is_preserved_in_market_input() -> None:
+    from quantitative_trading.market.models import MarketInputSnapshot
+
+    metadata = InstrumentMetadata(
+        symbol="510300",
+        name="沪深300ETF",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.ETF,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="exchange_catalog",
+        metadata_checked_at=FETCHED_AT,
+        rule_version="instrument-rules-v1",
+    )
+    snapshot = MarketInputSnapshot(
+        universe_snapshot_id=1,
+        quote_snapshot_refs={},
+        history_snapshot_refs={},
+        money_flow_snapshot_refs={},
+        intraday_strength_snapshot_refs={},
+        instrument_metadata={"510300": metadata},
+        dataset_quality={
+            "510300": {
+                CaptureDataset.MONEY_FLOW: DatasetQuality(
+                    status=CaptureResultStatus.NOT_APPLICABLE,
+                    expected_rows=0,
+                    actual_rows=0,
+                    source="instrument_policy",
+                )
+            }
+        },
+        fetched_at=FETCHED_AT,
+        warnings=[],
+    )
+
+    assert snapshot.instrument_metadata["510300"] == metadata
+    assert (
+        snapshot.dataset_quality["510300"][CaptureDataset.MONEY_FLOW].status
+        is CaptureResultStatus.NOT_APPLICABLE
+    )

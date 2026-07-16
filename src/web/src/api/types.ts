@@ -118,6 +118,20 @@ export type WatchPinnedSource = 'manual' | 'synced' | 'manual_synced'
 export type UniverseSource = 'holding' | 'watch_pinned'
 export type DatasourceStatusCode = 'configured' | 'missing' | 'invalid'
 export type TradingPlanStatus = 'active' | 'expired' | 'stale'
+export type InstrumentExchange = 'SH' | 'SZ'
+export type InstrumentType = 'a_share' | 'etf' | 'unknown'
+export type SettlementCycle = 't0' | 't1' | 'unknown'
+export type InstrumentPreviewSource = 'eastmoney_watchlist' | 'instrument_search'
+
+export interface InstrumentMetadataFields {
+  exchange: InstrumentExchange | null
+  instrument_type: InstrumentType
+  settlement_cycle: SettlementCycle
+  price_limit_ratio: number | null
+  metadata_source: string
+  metadata_checked_at: string
+  rule_version: string
+}
 
 export interface WatchPinnedInput {
   symbol: string
@@ -130,6 +144,49 @@ export interface WatchPinnedInput {
 export interface WatchPinnedItem extends WatchPinnedInput {
   source: WatchPinnedSource
   updated_at: string
+  exchange: InstrumentExchange | null
+  instrument_type: InstrumentType
+  settlement_cycle: SettlementCycle
+  price_limit_ratio: number | null
+  metadata_source: string
+  metadata_checked_at: string | null
+  rule_version: string
+  warnings: string[]
+}
+
+export interface WatchPinnedImportResponse {
+  items: WatchPinnedItem[]
+  warnings: string[]
+}
+
+export interface InstrumentCandidate extends InstrumentMetadataFields {
+  symbol: string
+  name: string
+  source: InstrumentPreviewSource
+  source_rank: number | null
+  already_monitored: boolean
+  selectable: boolean
+  warnings: string[]
+}
+
+export interface InstrumentPreview {
+  preview_id: string
+  source: InstrumentPreviewSource
+  query: string | null
+  created_at: string
+  expires_at: string
+  items: InstrumentCandidate[]
+  warnings: string[]
+}
+
+export interface InstrumentSelectionRequest {
+  preview_id: string
+  symbols: string[]
+}
+
+export interface InstrumentSelectionResponse {
+  items: WatchPinnedItem[]
+  warnings: string[]
 }
 
 export interface UniverseMember {

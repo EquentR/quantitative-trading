@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from pydantic import ValidationError
@@ -17,6 +17,7 @@ from quantitative_trading.ledger.models import Position
 from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.ledger.service import ReadOnlyLedgerService
 from quantitative_trading.market.providers import (
+    AkShareEtfMarketProvider,
     AkShareMarketProvider,
     DisabledMarketProvider,
     MarketDataProvider,
@@ -48,6 +49,18 @@ def market_provider_from_settings(settings: Settings) -> MarketDataProvider:
         return DisabledMarketProvider()
     if settings.market_provider.strip().lower() == "akshare":
         return AkShareMarketProvider()
+    raise UnsupportedMarketProviderError(settings.market_provider)
+
+
+def etf_market_provider_from_settings(
+    settings: Settings,
+    *,
+    price_limit_ratios: Mapping[str, float] | None = None,
+) -> MarketDataProvider:
+    if not settings.enable_market_fetch:
+        return DisabledMarketProvider()
+    if settings.market_provider.strip().lower() == "akshare":
+        return AkShareEtfMarketProvider(price_limit_ratios=price_limit_ratios)
     raise UnsupportedMarketProviderError(settings.market_provider)
 
 

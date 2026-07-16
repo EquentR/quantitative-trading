@@ -15,6 +15,8 @@ from pydantic import (
     model_validator,
 )
 
+from quantitative_trading.instrument.models import InstrumentMetadata
+
 
 StrictPositiveId = Annotated[int, Field(strict=True, gt=0)]
 
@@ -65,6 +67,7 @@ class CaptureResultStatus(StrEnum):
     DEGRADED = "degraded"
     FAILED = "failed"
     STALE = "stale"
+    NOT_APPLICABLE = "not_applicable"
 
 
 class StrengthLabel(StrEnum):
@@ -439,6 +442,7 @@ class MarketInputSnapshot(BaseModel):
     history_snapshot_refs: dict[str, StrictPositiveId]
     money_flow_snapshot_refs: dict[str, StrictPositiveId]
     intraday_strength_snapshot_refs: dict[str, StrictPositiveId]
+    instrument_metadata: dict[str, InstrumentMetadata] = Field(default_factory=dict)
     dataset_quality: dict[str, dict[CaptureDataset, DatasetQuality]] = Field(
         default_factory=dict
     )
@@ -481,3 +485,9 @@ class MarketInputSnapshot(BaseModel):
         ):
             raise ValueError("dataset quality symbols must contain six ASCII digits")
         return value
+
+    @model_validator(mode="after")
+    def metadata_keys_must_match_symbols(self) -> "MarketInputSnapshot":
+        if any(symbol != metadata.symbol for symbol, metadata in self.instrument_metadata.items()):
+            raise ValueError("instrument metadata key must match metadata symbol")
+        return self

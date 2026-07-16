@@ -12,6 +12,18 @@
 {
   "symbol": "600000",
   "name": "示例股票",
+  "instrument": {
+    "symbol": "600000",
+    "name": "示例股票",
+    "exchange": "SH",
+    "instrument_type": "a_share",
+    "settlement_cycle": "t1",
+    "price_limit_ratio": 0.1,
+    "metadata_source": "akshare_a_share_directory",
+    "metadata_checked_at": "2026-07-07T08:00:00+08:00",
+    "rule_version": "instrument-rules-v1",
+    "warnings": []
+  },
   "action": "watch",
   "confidence": "medium",
   "position_context": {
@@ -73,9 +85,11 @@
 
 ## 3. 字段说明
 
-### `symbol` 和 `name`
+### 证券身份与交易制度
 
-股票代码和名称。股票代码应使用统一格式，并在实现阶段明确是否包含交易所前缀。
+顶层 `symbol` 使用 ASCII 六位代码，`name` 是建议展示名称；`instrument` 对象保存后端已验证的 `symbol`、`name`、`exchange`、`instrument_type`、`settlement_cycle`、`price_limit_ratio`、`metadata_source`、`metadata_checked_at`、规则版本和 warnings，并随建议保存。前端不得根据代码或名称补算证券类型、T+0/T+1 或涨跌停比例。
+
+`instrument_type` 为 `a_share/etf/unknown`，`settlement_cycle` 为 `t0/t1/unknown`。A 股固定 T+1；ETF 只根据交易所产品类别的明确规则映射。未知证券或未知交易制度不得产生 `buy/add/sell/reduce`；未知持仓降级为保守 `hold` 并要求人工复核。
 
 ### `action`
 
@@ -101,7 +115,7 @@
 
 ### `position_context`
 
-持仓上下文。持仓相关建议必须从手动持仓台账读取成本价、持仓数量、可用数量和台账更新时间。自选置顶但尚未持仓的股票可以显式标记为空仓。
+持仓上下文。持仓相关建议必须从手动持仓台账读取成本价、持仓数量、可用数量和台账更新时间。本地观察池中尚未持仓的证券可以显式标记为空仓。
 
 若成本价、持仓数量或可用数量缺失，持仓相关建议应降级为人工复核或暂停。
 
@@ -123,7 +137,7 @@
 
 ### `risk`
 
-风险信息，包括仓位上限、失效条件、止损条件、数据风险、T+1 限制等。
+风险信息，包括仓位上限、失效条件、止损条件、数据风险、实际 T+0/T+1 制度、手动可用数量和未知规则降级等。
 
 ### `valid_until`
 
@@ -133,15 +147,17 @@
 
 建议使用的数据时间戳。推送时间不能替代数据时间。
 
+正常建议的 `data_quality.data_time_source=market`，此时 `data_time` 是实际市场数据时间。若未知元数据持仓没有任何可用行情时间，为保证仍能输出保守 `hold`，允许以证券元数据核验时间作为唯一输入时间，并明确标记 `data_quality.data_time_source=instrument_metadata`、`price_context.market_data_time=null` 和人工复核警告；不得使用台账更新时间、获取时间或建议生成时间伪装成行情时间。
+
 ### `fetched_at`
 
 本轮固化市场输入的系统获取时间。它与 `data_time` 和建议 `created_at` 分别表示获取时间、市场数据时间和建议生成时间，三者不能互相替代。
 
 ### 工作流和数据引用
 
-`run_id`、`market_input_snapshot_id` 和 `plan_id` 将建议连接到实际执行轮次、固化的行情输入和活动计划。`data_references` 必须包含 `ledger`、`account`、`quote`、`history`、`money_flow`、`intraday` 和 `plan`；每项至少包含稳定 `status`，可用时附实际引用 ID、数据时间或覆盖区间、获取时间和来源，不可用时必须明确 `missing/failed/stale`，不能省略后让调用方猜测。
+`run_id`、`market_input_snapshot_id` 和 `plan_id` 将建议连接到实际执行轮次、固化的行情输入和活动计划。`data_references` 必须包含 `ledger`、`account`、`quote`、`history`、`money_flow`、`intraday` 和 `plan`；每项至少包含稳定 `status`，可用时附实际引用 ID、数据时间或覆盖区间、获取时间和来源，不可用时必须明确 `missing/failed/stale`，不能省略后让调用方猜测。ETF 的 `money_flow.status=not_applicable` 是额外的合法数据集状态，不表示失败、缺失或成功采集，也不能作为资金流确认。
 
-`data_quality` 保存总体质量、逐数据集状态、warnings 和实际生效的 stale/降级语义。`position_constraint` 保存建议仓位区间、建议数量以及经过现金、单票、总仓位、T+1 和流动性裁决后真正生效的上限。所有这些字段由后端生成，前端不得补算。
+`data_quality` 保存总体质量、逐数据集状态、warnings 和实际生效的 stale/降级语义。总体质量仍只使用 `complete/degraded/failed/stale`；ETF 合法的资金流不适用本身不降低总体质量。`position_constraint` 保存建议仓位区间、建议数量以及经过现金、单票、总仓位、证券交易制度、手动可用数量和流动性裁决后真正生效的上限。所有这些字段由后端生成，前端不得补算。
 
 ## 4. 首版实现约束
 
@@ -149,9 +165,11 @@
 
 `buy`、`add`、`hold`、`watch` 类型建议必须包含非空 `risk.invalid_if`。最终建议动作必须以风控结果为准；当风控将策略信号降级时，建议中的 `action` 使用降级后的动作，同时保留原始策略原因和风控说明用于复核。
 
-`buy/add` 必须以适用于当日的活动收盘计划为硬门禁：标的和动作在计划中被允许、命中机器条件、获得至少两个独立有效因子确认并通过硬性风控。资金流只能确认或过滤，不能独立触发动作。计划外机会和无活动计划的非持仓标的只能 `watch/avoid`。
+`buy/add` 必须以适用于当日的活动收盘计划为硬门禁：标的和动作在计划中被允许、命中机器条件、获得至少两个独立有效因子确认并通过硬性风控。A 股资金流只能确认或过滤，不能独立触发动作；ETF 资金流不适用，不提供确认也不作为失败惩罚，仍需日线结构和盘中强弱等两个独立有效因子。计划外机会和无活动计划的非持仓标的只能 `watch/avoid`。
 
-持仓风险管理不受买入侧计划门禁阻断。无活动计划或原计划条件失效时，持仓新出现的止损、回撤、跌破结构或仓位超限仍可生成 `sell/reduce/avoid`；建议必须保存原计划条件、覆盖原因和风控裁决。关键报价、成本、数量或可用数量缺失时不得猜测，必须降级为保守 `hold` 和人工复核。
+盘中展示采集可以为 `plan_enabled=true` 且元数据已验证的计划外观察标的保存报价、分钟线和分时强弱，但展示采集资格不等于建议资格。这类标的不进入策略、风控、建议或通知，不能仅因行情完整或分时强弱为 strong 生成 `watch/avoid`，更不能生成 `buy/add`。
+
+持仓风险管理不受买入侧计划门禁阻断。无活动计划或原计划条件失效时，持仓新出现的止损、回撤、跌破结构或仓位超限仍可生成 `sell/reduce/avoid`；建议必须保存原计划条件、覆盖原因和风控裁决。关键报价、成本、数量、可用数量或证券交易制度缺失时不得猜测，必须降级为保守 `hold` 和人工复核。手动 `available_quantity=0` 时，即使证券是 T+0 ETF 也禁止 `sell/reduce`。
 
 每轮盘中工作流重新读取手动台账和资金账户。计划中的数量和账户上下文只是历史引用，不能覆盖最新权威台账。
 

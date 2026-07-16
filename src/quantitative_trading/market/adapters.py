@@ -100,6 +100,11 @@ class _AkShareAdapter:
 
 
 class AkShareDailyBarProvider(_AkShareAdapter):
+    source = "akshare"
+
+    def _history_frame(self, **kwargs):
+        return self._module().stock_zh_a_hist(**kwargs)
+
     def get_daily_bars(
         self,
         symbol: str,
@@ -114,7 +119,7 @@ class AkShareDailyBarProvider(_AkShareAdapter):
             raise ValueError("start_date must not exceed end_date")
         fetched_at = self._fetched_at()
         try:
-            frame = self._module().stock_zh_a_hist(
+            frame = self._history_frame(
                 symbol=symbol,
                 period="daily",
                 start_date=start_date.strftime("%Y%m%d"),
@@ -140,11 +145,18 @@ class AkShareDailyBarProvider(_AkShareAdapter):
                     close=_finite_float(row, "收盘"),
                     volume=_finite_float(row, "成交量", nonnegative=True) * 100,
                     amount=_finite_float(row, "成交额", nonnegative=True),
-                    source="akshare",
+                    source=self.source,
                     fetched_at=fetched_at,
                 )
             )
         return sorted(bars, key=lambda bar: bar.trade_date)
+
+
+class AkShareEtfDailyBarProvider(AkShareDailyBarProvider):
+    source = "akshare_etf"
+
+    def _history_frame(self, **kwargs):
+        return self._module().fund_etf_hist_em(**kwargs)
 
 
 class AkShareMoneyFlowProvider(_AkShareAdapter):
@@ -199,6 +211,18 @@ class AkShareMoneyFlowProvider(_AkShareAdapter):
 
 
 class AkShareIntradayProvider(_AkShareAdapter):
+    source = "akshare"
+
+    def _minute_frame(self, **kwargs):
+        return self._module().stock_zh_a_hist_min_em(**kwargs)
+
+    def _sina_minute_frame(self, symbol: str):
+        return self._module().stock_zh_a_minute(
+            symbol=f"{_akshare_market(symbol)}{symbol}",
+            period="1",
+            adjust="",
+        )
+
     def get_minute_bars(
         self,
         symbol: str,
@@ -212,18 +236,45 @@ class AkShareIntradayProvider(_AkShareAdapter):
             raise ValueError("trade_date is not an XSHG trading day")
         fetched_at = self._fetched_at()
         try:
-            frame = self._module().stock_zh_a_hist_min_em(
+            frame = self._minute_frame(
                 symbol=symbol,
                 start_date=f"{trade_date.isoformat()} 09:30:00",
                 end_date=f"{trade_date.isoformat()} 15:00:00",
                 period="1",
                 adjust="",
             )
-        except Exception as exc:
-            raise MarketProviderError("intraday market provider request failed") from exc
+            fields = {
+                "minute": "时间",
+                "open": "开盘",
+                "high": "最高",
+                "low": "最低",
+                "close": "收盘",
+                "volume": "成交量",
+                "amount": "成交额",
+            }
+            volume_multiplier = 100.0
+            source = self.source
+        except Exception:
+            try:
+                frame = self._sina_minute_frame(symbol)
+            except Exception as exc:
+                raise MarketProviderError(
+                    "intraday market provider request failed"
+                ) from exc
+            fields = {
+                "minute": "day",
+                "open": "open",
+                "high": "high",
+                "low": "low",
+                "close": "close",
+                "volume": "volume",
+                "amount": "amount",
+            }
+            volume_multiplier = 1.0
+            source = "akshare_sina_minute"
         bars: list[MinuteBar] = []
         for _, row in frame.iterrows():
-            raw_minute = row["时间"]
+            raw_minute = row[fields["minute"]]
             if isinstance(raw_minute, datetime):
                 minute = raw_minute
             else:
@@ -239,17 +290,27 @@ class AkShareIntradayProvider(_AkShareAdapter):
                     symbol=symbol,
                     trade_date=trade_date,
                     minute=minute,
-                    open=_finite_float(row, "开盘"),
-                    high=_finite_float(row, "最高"),
-                    low=_finite_float(row, "最低"),
-                    close=_finite_float(row, "收盘"),
-                    volume=_finite_float(row, "成交量", nonnegative=True) * 100,
-                    amount=_finite_float(row, "成交额", nonnegative=True),
-                    source="akshare",
+                    open=_finite_float(row, fields["open"]),
+                    high=_finite_float(row, fields["high"]),
+                    low=_finite_float(row, fields["low"]),
+                    close=_finite_float(row, fields["close"]),
+                    volume=_finite_float(
+                        row, fields["volume"], nonnegative=True
+                    )
+                    * volume_multiplier,
+                    amount=_finite_float(row, fields["amount"], nonnegative=True),
+                    source=source,
                     fetched_at=fetched_at,
                 )
             )
         return sorted(bars, key=lambda bar: bar.minute)
+
+
+class AkShareEtfIntradayProvider(AkShareIntradayProvider):
+    source = "akshare_etf"
+
+    def _minute_frame(self, **kwargs):
+        return self._module().fund_etf_hist_min_em(**kwargs)
 
 
 def _akshare_market(symbol: str) -> str:

@@ -18,6 +18,7 @@ from quantitative_trading.api.routes import (
     email_deliveries,
     email_settings,
     feedback,
+    instruments,
     market,
     market_read,
     notifications,
@@ -47,6 +48,8 @@ def create_app(
     restore_scheduler: bool = False,
     email_sender: object | None = None,
     smtp_connection_tester: object | None = None,
+    miaoxiang_watchlist_adapter: object | None = None,
+    instrument_directory_adapter: object | None = None,
 ) -> FastAPI:
     # 进程启动时完成一次幂等迁移，避免每个 API 请求都产生 schema 写事务。
     with dependencies.connect(settings) as connection:
@@ -58,6 +61,8 @@ def create_app(
         scheduler=scheduler,
         email_sender=email_sender,
         smtp_connection_tester=smtp_connection_tester,
+        miaoxiang_watchlist_adapter=miaoxiang_watchlist_adapter,
+        instrument_directory_adapter=instrument_directory_adapter,
     )
     app.dependency_overrides[dependencies.get_container] = lambda: container
 
@@ -102,6 +107,7 @@ def create_app(
     app.include_router(email_settings.router, prefix="/api/v1")
     app.include_router(email_settings.connection_test_router, prefix="/api/v1")
     app.include_router(feedback.router, prefix="/api/v1")
+    app.include_router(instruments.router, prefix="/api/v1")
     app.include_router(market.router, prefix="/api/v1")
     app.include_router(market_read.router, prefix="/api/v1")
     app.include_router(notifications.router, prefix="/api/v1")

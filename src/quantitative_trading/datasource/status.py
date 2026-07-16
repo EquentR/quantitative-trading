@@ -146,11 +146,20 @@ class DatasourceCredentialsRepository:
             updated_at=now,
         )
 
-    def record_check(self, provider: str, *, now: datetime) -> DatasourceCredential:
+    def record_check(
+        self,
+        provider: str,
+        *,
+        now: datetime,
+        status: DatasourceCredentialStatus | None = None,
+        last_error: str | None = None,
+    ) -> DatasourceCredential:
         _ensure_timezone_aware(now)
         existing = self.get(provider)
         secret = "" if existing is None else existing.stored_secret
-        status = DatasourceCredentialStatus(redact_secret(secret))
+        effective_status = status or DatasourceCredentialStatus(redact_secret(secret))
+        if redact_secret(secret) == DatasourceCredentialStatus.MISSING.value:
+            effective_status = DatasourceCredentialStatus.MISSING
         self.connection.execute(
             # The column name is fixed by the P1 roadmap schema; Python code uses
             # stored_secret so only redacted status leaves this module.
@@ -167,7 +176,7 @@ class DatasourceCredentialsRepository:
               :stored_secret,
               :status,
               :last_checked_at,
-              NULL,
+              :last_error,
               :updated_at
             )
             ON CONFLICT(provider) DO UPDATE SET
@@ -180,8 +189,9 @@ class DatasourceCredentialsRepository:
             {
                 "provider": provider,
                 "stored_secret": secret,
-                "status": status.value,
+                "status": effective_status.value,
                 "last_checked_at": now.isoformat(),
+                "last_error": last_error,
                 "updated_at": now.isoformat(),
             },
         )
@@ -240,6 +250,21 @@ class DatasourceStatusService:
 
     def check(self, provider: str = EASTMONEY_PROVIDER) -> DatasourceStatus:
         credential = self._repository.record_check(provider, now=self._current_time())
+        return self._redacted_status(credential)
+
+    def record_remote_check(
+        self,
+        *,
+        status: DatasourceCredentialStatus,
+        last_error: str | None,
+        provider: str = EASTMONEY_PROVIDER,
+    ) -> DatasourceStatus:
+        credential = self._repository.record_check(
+            provider,
+            now=self._current_time(),
+            status=status,
+            last_error=last_error,
+        )
         return self._redacted_status(credential)
 
     def _redacted_status(self, credential: DatasourceCredential) -> DatasourceStatus:

@@ -437,6 +437,12 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
           </div>
           <p v-if="dailyQuery.isPending.value" class="text-sm text-muted-foreground">正在加载日 K 数据</p>
           <Alert v-else-if="dailyQuery.error.value" variant="danger">日 K 数据加载失败</Alert>
+          <p
+            v-else-if="dailyBars.length === 0 && dailyQuery.data.value?.status === 'unavailable'"
+            class="text-sm text-muted-foreground"
+          >
+            尚未完成首次日 K 回填
+          </p>
           <Alert
             v-else-if="dailyBars.length === 0 && dailyQuery.data.value?.status !== 'complete' && dailyQuery.data.value?.status !== 'ok'"
             :variant="dailyQuery.data.value?.status === 'failed' || dailyQuery.data.value?.status === 'unavailable' ? 'danger' : 'warning'"
@@ -469,6 +475,12 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
           </div>
           <p v-if="moneyQuery.isPending.value" class="text-sm text-muted-foreground">正在加载资金流数据</p>
           <Alert v-else-if="moneyQuery.error.value" variant="danger">资金流数据加载失败</Alert>
+          <p
+            v-else-if="moneyRows.length === 0 && moneyQuery.data.value?.status === 'unavailable'"
+            class="text-sm text-muted-foreground"
+          >
+            尚未完成首次资金流回填
+          </p>
           <Alert
             v-else-if="moneyRows.length === 0 && moneyQuery.data.value?.status !== 'complete' && moneyQuery.data.value?.status !== 'ok'"
             :variant="moneyQuery.data.value?.status === 'failed' || moneyQuery.data.value?.status === 'unavailable' ? 'danger' : 'warning'"

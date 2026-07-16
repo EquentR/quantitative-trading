@@ -15,6 +15,7 @@ def recommendation_condition_fingerprint(recommendation: Recommendation) -> str:
             "risk",
             "position_constraint",
             "condition_context",
+            "instrument",
         },
     )
     canonical = json.dumps(

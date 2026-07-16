@@ -6,6 +6,7 @@ from typing import Any
 from quantitative_trading.recommendation.models import Recommendation, RecommendationAction
 from quantitative_trading.risk.models import RiskDecision
 from quantitative_trading.strategy.models import StrategySignal
+from quantitative_trading.instrument.models import InstrumentMetadata
 
 
 DEFAULT_POSITION_LIMIT_TEXT = "single <= 30%, total <= 80%"
@@ -17,6 +18,7 @@ def build_recommendation(
     *,
     recommendation_id: str,
     name: str,
+    instrument: InstrumentMetadata | None = None,
     position_context: dict[str, Any],
     account_context: dict[str, Any],
     price_context: dict[str, Any],
@@ -38,6 +40,7 @@ def build_recommendation(
         recommendation_id=recommendation_id,
         symbol=signal.symbol,
         name=name,
+        instrument=instrument,
         action=final_action,
         confidence=signal.confidence,
         position_context=position_context,

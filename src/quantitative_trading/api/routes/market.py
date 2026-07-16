@@ -13,6 +13,8 @@ from quantitative_trading.api.dependencies import (
     require_token as require_auth,
 )
 from quantitative_trading.api.errors import ApiError
+from quantitative_trading.instrument.models import InstrumentType
+from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.market.models import MarketInputSnapshot
 from quantitative_trading.market.repository import MarketInputSnapshotRepository
 from quantitative_trading.market.snapshot_service import (
@@ -21,6 +23,7 @@ from quantitative_trading.market.snapshot_service import (
 )
 from quantitative_trading.runtime.account_snapshot_job import (
     UnsupportedMarketProviderError,
+    etf_market_provider_from_settings,
     market_provider_from_settings,
 )
 
@@ -86,7 +89,20 @@ def create_market_snapshot(
     try:
         with connection_scope(container.settings) as connection:
             provider = market_provider_from_settings(container.settings)
-            created = MarketSnapshotService(connection, provider).capture()
+            etf_provider = etf_market_provider_from_settings(
+                container.settings,
+                price_limit_ratios={
+                    item.symbol: item.price_limit_ratio
+                    for item in InstrumentRepository(connection).list_active()
+                    if item.instrument_type is InstrumentType.ETF
+                    and item.price_limit_ratio is not None
+                },
+            )
+            created = MarketSnapshotService(
+                connection,
+                provider,
+                etf_provider=etf_provider,
+            ).capture()
     except UnsupportedMarketProviderError as exc:
         raise _unsupported_market_provider(exc) from exc
     except (sqlite3.Error, PydanticValidationError, ValueError) as exc:

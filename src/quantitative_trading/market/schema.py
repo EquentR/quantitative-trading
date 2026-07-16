@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS market_capture_results (
   run_id TEXT NOT NULL,
   symbol TEXT NOT NULL CHECK (symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'),
   dataset TEXT NOT NULL CHECK (dataset IN ('quote','daily_bar','money_flow','minute_bar','intraday_strength')),
-  status TEXT NOT NULL CHECK (status IN ('complete','degraded','failed','stale')),
+  status TEXT NOT NULL CHECK (status IN ('complete','degraded','failed','stale','not_applicable')),
   data_start TEXT,
   data_end TEXT,
   data_time TEXT,

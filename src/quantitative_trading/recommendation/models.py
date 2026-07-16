@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from quantitative_trading.strategy.models import PROFIT_PROMISE_PHRASES
+from quantitative_trading.instrument.models import InstrumentMetadata
 
 
 Confidence = Literal["low", "medium", "high"]
@@ -71,6 +72,7 @@ class Recommendation(BaseModel):
     recommendation_id: str = Field(min_length=1)
     symbol: str = Field(pattern=r"^\d{6}$")
     name: str = Field(min_length=1)
+    instrument: InstrumentMetadata | None = None
     action: RecommendationAction
     confidence: Confidence
     position_context: dict[str, Any]
@@ -140,6 +142,12 @@ class Recommendation(BaseModel):
         if isinstance(value, str) and not value.strip():
             raise ValueError("plan_version cannot be blank")
         return value
+
+    @model_validator(mode="after")
+    def instrument_symbol_must_match(self) -> "Recommendation":
+        if self.instrument is not None and self.instrument.symbol != self.symbol:
+            raise ValueError("symbol must match instrument symbol")
+        return self
 
     @model_validator(mode="after")
     def constructive_outputs_must_have_invalidation(self) -> "Recommendation":

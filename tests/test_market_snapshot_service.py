@@ -7,7 +7,19 @@ import pytest
 from quantitative_trading.config import Settings
 from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import PositionRepository
-from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
+from quantitative_trading.instrument.repository import InstrumentRepository
+from quantitative_trading.market.models import (
+    CaptureDataset,
+    CaptureResultStatus,
+    QuoteSnapshot,
+    QuoteStatus,
+)
 from quantitative_trading.market.repository import QuoteSnapshotRepository
 from quantitative_trading.market.snapshot_service import MarketSnapshotService
 from quantitative_trading.storage.sqlite import connect, migrate
@@ -40,6 +52,21 @@ def connection(tmp_path) -> Iterator:
 
 @pytest.fixture
 def decision_universe(connection) -> None:
+    InstrumentRepository(connection).replace_catalog(
+        [
+            InstrumentMetadata(
+                symbol=symbol,
+                name=f"Name {symbol}",
+                exchange=Exchange.SZ,
+                instrument_type=InstrumentType.A_SHARE,
+                settlement_cycle=SettlementCycle.T1,
+                metadata_source="test-directory",
+                metadata_checked_at=FETCHED_AT,
+                rule_version="test-rules-v1",
+            )
+            for symbol in ("000001", "000002", "600000")
+        ]
+    )
     PositionRepository(connection).add(
         PositionInput(
             symbol="600000",
@@ -119,8 +146,100 @@ def test_capture_fetches_stable_sorted_decision_enabled_quotes_and_persists_refe
     assert created.snapshot_id > 0
     assert created.snapshot.universe_snapshot_id > 0
     assert set(created.snapshot.quote_snapshot_refs) == {"000001", "600000"}
+    assert set(created.snapshot.instrument_metadata) == {"000001", "600000"}
+    assert all(
+        created.snapshot.dataset_quality[symbol][CaptureDataset.QUOTE].status
+        is CaptureResultStatus.COMPLETE
+        for symbol in ("000001", "600000")
+    )
     assert created.snapshot.data_time == OLDER_DATA_TIME
     assert created.quotes["600000"].status is QuoteStatus.OK
+
+
+def test_capture_routes_a_share_and_etf_quotes_and_skips_unknown_provider_calls(
+    connection,
+) -> None:
+    InstrumentRepository(connection).replace_catalog(
+        [
+            InstrumentMetadata(
+                symbol="600000",
+                name="A share",
+                exchange=Exchange.SH,
+                instrument_type=InstrumentType.A_SHARE,
+                settlement_cycle=SettlementCycle.T1,
+                price_limit_ratio=0.1,
+                metadata_source="test-directory",
+                metadata_checked_at=FETCHED_AT,
+                rule_version="test-rules-v1",
+            ),
+            InstrumentMetadata(
+                symbol="510300",
+                name="ETF",
+                exchange=Exchange.SH,
+                instrument_type=InstrumentType.ETF,
+                settlement_cycle=SettlementCycle.T1,
+                price_limit_ratio=0.1,
+                metadata_source="test-directory",
+                metadata_checked_at=FETCHED_AT,
+                rule_version="test-rules-v1",
+            ),
+            InstrumentMetadata(
+                symbol="900001",
+                name="Unknown",
+                exchange=None,
+                instrument_type=InstrumentType.UNKNOWN,
+                settlement_cycle=SettlementCycle.UNKNOWN,
+                metadata_source="legacy-unverified",
+                metadata_checked_at=FETCHED_AT,
+                rule_version="test-rules-v1",
+            ),
+        ]
+    )
+    positions = PositionRepository(connection)
+    for symbol in ("600000", "900001"):
+        positions.add(
+            PositionInput(
+                symbol=symbol,
+                name=symbol,
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=date(2026, 7, 6),
+            ),
+            now=FETCHED_AT,
+        )
+    WatchPinnedRepository(connection).upsert(
+        WatchPinnedInput(
+            symbol="510300",
+            name="ETF",
+            rank=1,
+            plan_enabled=True,
+        ),
+        source=WatchPinnedSource.MANUAL,
+        now=FETCHED_AT,
+    )
+    a_share_provider = RecordingMarketDataProvider({"600000": ok_quote("600000")})
+    etf_provider = RecordingMarketDataProvider({"510300": ok_quote("510300")})
+
+    created = MarketSnapshotService(
+        connection,
+        a_share_provider,
+        etf_provider=etf_provider,
+        now=FETCHED_AT,
+    ).capture()
+
+    assert a_share_provider.calls == [["600000"]]
+    assert etf_provider.calls == [["510300"]]
+    assert created.quotes["900001"].status is QuoteStatus.FAILED
+    assert (
+        created.snapshot.dataset_quality["510300"][CaptureDataset.MONEY_FLOW].status
+        is CaptureResultStatus.NOT_APPLICABLE
+    )
+    assert (
+        created.snapshot.dataset_quality["900001"][CaptureDataset.QUOTE].status
+        is CaptureResultStatus.FAILED
+    )
+    assert any("900001" in warning and "证券类型未知" in warning for warning in created.snapshot.warnings)
 
 
 def test_capture_data_time_ignores_older_failed_quote(

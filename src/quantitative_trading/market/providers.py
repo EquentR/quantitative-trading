@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from math import isfinite
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -61,6 +62,21 @@ AKSHARE_HIGH_FIELD = "最高"
 AKSHARE_LOW_FIELD = "最低"
 AKSHARE_VOLUME_FIELD = "成交量"
 AKSHARE_AMOUNT_FIELD = "成交额"
+AKSHARE_ETF_OPEN_FIELD = "开盘价"
+AKSHARE_ETF_HIGH_FIELD = "最高价"
+AKSHARE_ETF_LOW_FIELD = "最低价"
+AKSHARE_ETF_UPDATE_TIME_FIELD = "更新时间"
+SSE_ETF_PHASE_URL = "https://yunhq.sse.com.cn:32042/v1/sh1/list/exchange/etf"
+SZSE_ETF_PHASE_URL = "https://www.szse.cn/api/market/ssjjhq/getTimeData"
+OFFICIAL_PHASE_TIMEOUT_SECONDS = 10.0
+OFFICIAL_PHASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://www.sse.com.cn/",
+}
+SZSE_PHASE_NORMAL = {"00", "02", "03", "05", "07", "11"}
+SZSE_PHASE_SUSPENDED = {"04", "06", "12"}
+SSE_PHASE_NORMAL_PREFIXES = {"S", "C", "T", "B", "E"}
+SSE_PHASE_SUSPENDED_PREFIXES = {"P"}
 EASTMONEY_SINGLE_QUOTE_URL = "https://82.push2.eastmoney.com/api/qt/stock/get"
 EASTMONEY_SINGLE_QUOTE_FIELDS = "f57,f58,f43,f170,f124"
 EASTMONEY_SINGLE_QUOTE_TIMEOUT_SECONDS = 10.0
@@ -75,6 +91,8 @@ TENCENT_QUOTE_PATTERN = re.compile(r'v_[^=]+="([^"]*)";')
 
 
 class AkShareMarketProvider:
+    source = "akshare"
+
     def __init__(
         self,
         *,
@@ -104,7 +122,7 @@ class AkShareMarketProvider:
                 import akshare as akshare_module  # type: ignore[import-not-found]
 
                 akshare = akshare_module
-            frame = akshare.stock_zh_a_spot_em()
+            frame = self._spot_frame(akshare)
         except Exception as exc:
             return self._fallback_single_quotes(
                 symbols,
@@ -112,12 +130,36 @@ class AkShareMarketProvider:
                 batch_error=exc,
             )
 
+        trading_statuses: dict[str, TradingStatus] = {}
+        phase_warning: str | None = None
+        try:
+            trading_statuses = self._trading_statuses(symbols)
+        except Exception as exc:
+            phase_warning = (
+                "official trading phase fetch failed; trading_status kept unknown: "
+                f"{safe_error_summary(exc)}"
+            )
+
         return {
-            symbol: self._quote_from_frame(frame=frame, symbol=symbol, fetched_at=fetched_at)
+            symbol: self._quote_from_frame(
+                frame=frame,
+                symbol=symbol,
+                fetched_at=fetched_at,
+                trading_status=trading_statuses.get(symbol, TradingStatus.UNKNOWN),
+                phase_warning=phase_warning,
+            )
             for symbol in symbols
         }
 
-    def _quote_from_frame(self, *, frame: Any, symbol: str, fetched_at: datetime) -> QuoteSnapshot:
+    def _quote_from_frame(
+        self,
+        *,
+        frame: Any,
+        symbol: str,
+        fetched_at: datetime,
+        trading_status: TradingStatus,
+        phase_warning: str | None,
+    ) -> QuoteSnapshot:
         try:
             rows = frame[frame[AKSHARE_SYMBOL_FIELD].astype(str) == symbol]
             if rows.empty:
@@ -143,11 +185,19 @@ class AkShareMarketProvider:
                 warning=f"akshare quote mapping failed: {safe_error_summary(exc)}",
             )
 
-        warnings: list[str] = [
-            "market source time unavailable; data_time kept unknown",
-            "trading_status unavailable; kept unknown",
-            "limit_status unavailable; kept unknown",
-        ]
+        warnings: list[str] = []
+        data_time: datetime | None = None
+        try:
+            data_time = self._data_time(row)
+        except Exception as exc:
+            warnings.append(
+                "market source time unavailable; data_time kept unknown: "
+                f"{safe_error_summary(exc)}"
+            )
+        if trading_status is TradingStatus.UNKNOWN:
+            warnings.append(
+                phase_warning or "trading_status unavailable; kept unknown"
+            )
         name = ""
         try:
             name = _required_text(row, AKSHARE_NAME_FIELD)
@@ -163,14 +213,7 @@ class AkShareMarketProvider:
             warnings.append(f"{AKSHARE_CHANGE_PCT_FIELD} unavailable: {safe_error_summary(exc)}")
 
         optional_values: dict[str, float | None] = {}
-        for model_field, source_field, positive, multiplier in (
-            ("previous_close", AKSHARE_PREVIOUS_CLOSE_FIELD, True, 1.0),
-            ("open_price", AKSHARE_OPEN_FIELD, True, 1.0),
-            ("high_price", AKSHARE_HIGH_FIELD, True, 1.0),
-            ("low_price", AKSHARE_LOW_FIELD, True, 1.0),
-            ("volume", AKSHARE_VOLUME_FIELD, False, 100.0),
-            ("amount", AKSHARE_AMOUNT_FIELD, False, 1.0),
-        ):
+        for model_field, source_field, positive, multiplier in self._optional_fields():
             try:
                 value = _required_float(row, source_field, positive=positive)
                 if not positive and value < 0:
@@ -180,17 +223,25 @@ class AkShareMarketProvider:
                 optional_values[model_field] = None
                 warnings.append(f"{source_field} unavailable: {safe_error_summary(exc)}")
 
+        limit_status, limit_warning = self._derive_limit_status(
+            symbol=symbol,
+            current_price=current_price,
+            previous_close=optional_values["previous_close"],
+        )
+        if limit_warning:
+            warnings.append(limit_warning)
+
         return QuoteSnapshot(
             symbol=symbol,
             name=name,
             current_price=current_price,
             change_pct=change_pct,
-            trading_status=TradingStatus.UNKNOWN,
-            limit_status=LimitStatus.UNKNOWN,
-            data_time=None,
+            trading_status=trading_status,
+            limit_status=limit_status,
+            data_time=data_time,
             fetched_at=fetched_at,
-            source="akshare",
-            status=QuoteStatus.PARTIAL,
+            source=self.source,
+            status=QuoteStatus.OK if not warnings else QuoteStatus.PARTIAL,
             warning="; ".join(warnings),
             **optional_values,
         )
@@ -199,7 +250,7 @@ class AkShareMarketProvider:
         return QuoteSnapshot(
             symbol=symbol,
             fetched_at=fetched_at,
-            source="akshare",
+            source=self.source,
             status=QuoteStatus.FAILED,
             warning=warning,
         )
@@ -250,6 +301,34 @@ class AkShareMarketProvider:
                             warning=f"{failed_warnings[symbol]}; tencent quote not found",
                         )
         return quotes
+
+    def _spot_frame(self, akshare: Any) -> Any:
+        return akshare.stock_zh_a_spot_em()
+
+    def _optional_fields(self) -> tuple[tuple[str, str, bool, float], ...]:
+        return (
+            ("previous_close", AKSHARE_PREVIOUS_CLOSE_FIELD, True, 1.0),
+            ("open_price", AKSHARE_OPEN_FIELD, True, 1.0),
+            ("high_price", AKSHARE_HIGH_FIELD, True, 1.0),
+            ("low_price", AKSHARE_LOW_FIELD, True, 1.0),
+            ("volume", AKSHARE_VOLUME_FIELD, False, 100.0),
+            ("amount", AKSHARE_AMOUNT_FIELD, False, 1.0),
+        )
+
+    def _data_time(self, row: Any) -> datetime:
+        raise ValueError("source time field is unavailable")
+
+    def _trading_statuses(self, symbols: Sequence[str]) -> dict[str, TradingStatus]:
+        return {}
+
+    def _derive_limit_status(
+        self,
+        *,
+        symbol: str,
+        current_price: float,
+        previous_close: float | None,
+    ) -> tuple[LimitStatus, str | None]:
+        return LimitStatus.UNKNOWN, "limit_status unavailable; kept unknown"
 
     def _eastmoney_single_quote(self, symbol: str, *, fetched_at: datetime) -> QuoteSnapshot:
         payload = self._eastmoney_single_quote_fetcher(
@@ -333,6 +412,118 @@ class AkShareMarketProvider:
         return quotes
 
 
+class AkShareEtfMarketProvider(AkShareMarketProvider):
+    source = "akshare_etf"
+    price_tick = Decimal("0.001")
+
+    def __init__(
+        self,
+        *,
+        price_limit_ratios: Mapping[str, float] | None = None,
+        trading_phase_fetcher: Callable[
+            [Sequence[str]], Mapping[str, TradingStatus | str]
+        ]
+        | None = None,
+        akshare_module: Any | None = None,
+        now: Callable[[], datetime] | None = None,
+        eastmoney_single_quote_fetcher: Callable[..., Any] | None = None,
+        tencent_quote_fetcher: Callable[..., Any] | None = None,
+    ) -> None:
+        super().__init__(
+            akshare_module=akshare_module,
+            now=now,
+            eastmoney_single_quote_fetcher=eastmoney_single_quote_fetcher,
+            tencent_quote_fetcher=tencent_quote_fetcher,
+        )
+        self._price_limit_ratios = dict(price_limit_ratios or {})
+        self._trading_phase_fetcher = (
+            trading_phase_fetcher or _fetch_official_etf_trading_statuses
+        )
+
+    def _spot_frame(self, akshare: Any) -> Any:
+        return akshare.fund_etf_spot_em()
+
+    def _optional_fields(self) -> tuple[tuple[str, str, bool, float], ...]:
+        return (
+            ("previous_close", AKSHARE_PREVIOUS_CLOSE_FIELD, True, 1.0),
+            ("open_price", AKSHARE_ETF_OPEN_FIELD, True, 1.0),
+            ("high_price", AKSHARE_ETF_HIGH_FIELD, True, 1.0),
+            ("low_price", AKSHARE_ETF_LOW_FIELD, True, 1.0),
+            ("volume", AKSHARE_VOLUME_FIELD, False, 100.0),
+            ("amount", AKSHARE_AMOUNT_FIELD, False, 1.0),
+        )
+
+    def _data_time(self, row: Any) -> datetime:
+        return _required_aware_datetime(row, AKSHARE_ETF_UPDATE_TIME_FIELD)
+
+    def _trading_statuses(self, symbols: Sequence[str]) -> dict[str, TradingStatus]:
+        raw_statuses = self._trading_phase_fetcher(symbols)
+        if not isinstance(raw_statuses, Mapping):
+            raise ValueError("official trading phase response must be a mapping")
+        statuses: dict[str, TradingStatus] = {}
+        requested = set(symbols)
+        for symbol, raw_status in raw_statuses.items():
+            if symbol not in requested:
+                continue
+            try:
+                statuses[symbol] = TradingStatus(raw_status)
+            except ValueError:
+                statuses[symbol] = TradingStatus.UNKNOWN
+        return statuses
+
+    def _derive_limit_status(
+        self,
+        *,
+        symbol: str,
+        current_price: float,
+        previous_close: float | None,
+    ) -> tuple[LimitStatus, str | None]:
+        ratio = self._price_limit_ratios.get(symbol)
+        if ratio is None:
+            return (
+                LimitStatus.UNKNOWN,
+                "price_limit_ratio unavailable; limit_status kept unknown",
+            )
+        if previous_close is None:
+            return (
+                LimitStatus.UNKNOWN,
+                "previous close unavailable; limit_status kept unknown",
+            )
+
+        try:
+            ratio_decimal = Decimal(str(ratio))
+            current = Decimal(str(current_price))
+            previous = Decimal(str(previous_close))
+        except InvalidOperation:
+            return LimitStatus.UNKNOWN, "invalid limit inputs; limit_status kept unknown"
+        if (
+            not ratio_decimal.is_finite()
+            or not Decimal("0") < ratio_decimal <= Decimal("1")
+        ):
+            return LimitStatus.UNKNOWN, "invalid price_limit_ratio; limit_status kept unknown"
+        if any(
+            price != price.quantize(self.price_tick, rounding=ROUND_HALF_UP)
+            for price in (current, previous)
+        ):
+            return LimitStatus.UNKNOWN, "invalid ETF price tick; limit_status kept unknown"
+
+        upper = (previous * (Decimal("1") + ratio_decimal)).quantize(
+            self.price_tick, rounding=ROUND_HALF_UP
+        )
+        lower = (previous * (Decimal("1") - ratio_decimal)).quantize(
+            self.price_tick, rounding=ROUND_HALF_UP
+        )
+        if current == upper:
+            return LimitStatus.UP, None
+        if current == lower:
+            return LimitStatus.DOWN, None
+        if lower < current < upper:
+            return LimitStatus.NONE, None
+        return (
+            LimitStatus.UNKNOWN,
+            "current price outside calculated price limits; limit_status kept unknown",
+        )
+
 def _required_text(row: Any, field: str) -> str:
     value = row[field]
     if value is None:
@@ -354,6 +545,92 @@ def _required_float(row: Any, field: str, *, positive: bool) -> float:
     if positive and number <= 0:
         raise ValueError(f"{field} must be greater than 0")
     return number
+
+
+def _required_aware_datetime(row: Any, field: str) -> datetime:
+    value = row[field]
+    if hasattr(value, "to_pydatetime"):
+        value = value.to_pydatetime()
+    if not isinstance(value, datetime):
+        try:
+            value = datetime.fromisoformat(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a datetime") from exc
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+    return value
+
+
+def _trading_status_from_sse_phase(value: Any) -> TradingStatus:
+    phase = str(value).strip().upper()
+    if not phase:
+        return TradingStatus.UNKNOWN
+    if phase[0] in SSE_PHASE_SUSPENDED_PREFIXES:
+        return TradingStatus.SUSPENDED
+    if phase[0] in SSE_PHASE_NORMAL_PREFIXES:
+        return TradingStatus.NORMAL
+    return TradingStatus.UNKNOWN
+
+
+def _trading_status_from_szse_phase(value: Any) -> TradingStatus:
+    phase = str(value).strip()
+    if phase in SZSE_PHASE_SUSPENDED:
+        return TradingStatus.SUSPENDED
+    if phase in SZSE_PHASE_NORMAL:
+        return TradingStatus.NORMAL
+    return TradingStatus.UNKNOWN
+
+
+def _fetch_official_etf_trading_statuses(
+    symbols: Sequence[str],
+) -> dict[str, TradingStatus]:
+    requested = set(symbols)
+    statuses: dict[str, TradingStatus] = {}
+    errors: list[str] = []
+    try:
+        response = requests.get(
+            SSE_ETF_PHASE_URL,
+            params={"select": "code,tradephase", "begin": 0, "end": 2000},
+            headers=OFFICIAL_PHASE_HEADERS,
+            timeout=OFFICIAL_PHASE_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows = payload.get("list") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("SSE trading phase response missing list")
+        for row in rows:
+            if not isinstance(row, list | tuple) or len(row) < 2:
+                continue
+            symbol = str(row[0]).strip()
+            if symbol in requested:
+                statuses[symbol] = _trading_status_from_sse_phase(row[1])
+    except Exception as exc:
+        errors.append(f"SSE: {safe_error_summary(exc)}")
+
+    szse_headers = {**OFFICIAL_PHASE_HEADERS, "Referer": "https://www.szse.cn/"}
+    for symbol in sorted(requested - statuses.keys()):
+        try:
+            response = requests.get(
+                SZSE_ETF_PHASE_URL,
+                params={"marketId": 1, "code": symbol},
+                headers=szse_headers,
+                timeout=OFFICIAL_PHASE_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, dict) or str(data.get("code", "")).strip() != symbol:
+                raise ValueError("SZSE trading phase response symbol mismatch")
+            statuses[symbol] = _trading_status_from_szse_phase(
+                data.get("tradingPhaseCode1")
+            )
+        except Exception as exc:
+            errors.append(f"SZSE {symbol}: {safe_error_summary(exc)}")
+
+    if not statuses and errors:
+        raise RuntimeError("; ".join(errors))
+    return statuses
 
 
 def _eastmoney_current_price(row: Any, field: str, *, symbol: str) -> float:

@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { Download, FileJson, FileUp, Pencil, Plus, Trash2 } from 'lucide-vue-next'
+import { Download, FileJson, FileUp, ListPlus, Pencil, Plus, Search, Trash2 } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
 import Alert from '@/components/ui/Alert.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
+import { ApiError } from '@/api/client'
+import InstrumentCandidatePanel from './InstrumentCandidatePanel.vue'
 import {
   useWatchlistPinnedQuery,
   useCreatePinnedItemMutation,
@@ -23,9 +25,11 @@ const importMutation = useImportPinnedItemsMutation()
 const importCsvMutation = useImportPinnedCsvMutation()
 
 const showForm = ref(false)
+const candidateMode = ref<'eastmoney' | 'search' | null>(null)
 const showJsonImport = ref(false)
 const jsonImportText = ref('')
 const importError = ref('')
+const importWarnings = ref<string[]>([])
 const csvInput = ref<HTMLInputElement | null>(null)
 const editingSymbol = ref<string | null>(null)
 const form = ref<WatchPinnedInput>({
@@ -39,6 +43,14 @@ const form = ref<WatchPinnedInput>({
 function resetForm() {
   editingSymbol.value = null
   form.value = { symbol: '', name: '', rank: 0, plan_enabled: false, note: '' }
+}
+
+function importErrorText(error: unknown) {
+  if (error instanceof ApiError && error.code === 'validation_error') {
+    return '导入失败：导入内容不符合要求，请检查代码、排序和字段格式'
+  }
+  if (error instanceof ApiError && error.message) return `导入失败：${error.message}`
+  return '导入失败，请稍后重试'
 }
 
 function onAdd() {
@@ -86,8 +98,9 @@ async function onDelete(item: WatchPinnedItem) {
   await deleteMutation.mutateAsync(item.symbol)
 }
 
-function onJsonImport() {
+async function onJsonImport() {
   importError.value = ''
+  importWarnings.value = []
 
   let parsed: unknown
   try {
@@ -111,17 +124,30 @@ function onJsonImport() {
     return
   }
 
-  importMutation.mutateAsync(items).then(() => {
+  try {
+    const result = await importMutation.mutateAsync(items)
+    importWarnings.value = result.warnings ?? []
     jsonImportText.value = ''
     showJsonImport.value = false
-  })
+  } catch (error) {
+    importError.value = importErrorText(error)
+  }
 }
 
 async function onCsvSelected(event: Event) {
-  const file = (event.target as HTMLInputElement).files?.[0]
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
   if (!file) return
-  await importCsvMutation.mutateAsync(file)
-  if (csvInput.value) csvInput.value.value = ''
+  importError.value = ''
+  importWarnings.value = []
+  try {
+    const result = await importCsvMutation.mutateAsync(file)
+    importWarnings.value = result.warnings ?? []
+  } catch (error) {
+    importError.value = importErrorText(error)
+  } finally {
+    input.value = ''
+  }
 }
 
 async function onExportCsv() {
@@ -148,6 +174,14 @@ async function onExportCsv() {
     <p class="text-xs text-muted-foreground">删除自选记录仅删除本地观察记录，不代表真实持仓或交易</p>
 
     <div class="flex flex-wrap gap-2">
+      <Button variant="secondary" @click="candidateMode = 'eastmoney'">
+        <ListPlus class="size-4" />
+        从东方财富选择
+      </Button>
+      <Button variant="secondary" @click="candidateMode = 'search'">
+        <Search class="size-4" />
+        按名称或代码搜索
+      </Button>
       <Button variant="secondary" @click="showJsonImport = !showJsonImport">
         <FileJson class="size-4" />
         导入自选观察项
@@ -163,10 +197,24 @@ async function onExportCsv() {
       <input ref="csvInput" class="sr-only" type="file" accept=".csv,text/csv" aria-label="CSV 文件输入" @change="onCsvSelected" />
     </div>
 
+    <p class="text-xs font-medium text-amber-700">JSON/CSV 导入会全量替换当前观察池</p>
+
+    <Alert v-if="importError" variant="danger">
+      {{ importError }}
+    </Alert>
+
+    <Alert v-if="importWarnings.length" variant="warning">
+      <span v-for="warning in importWarnings" :key="warning" class="block">{{ warning }}</span>
+    </Alert>
+
+    <InstrumentCandidatePanel
+      v-if="candidateMode"
+      :key="candidateMode"
+      :load-eastmoney-on-mount="candidateMode === 'eastmoney'"
+      @close="candidateMode = null"
+    />
+
     <form v-if="showJsonImport" class="space-y-2 rounded-md border border-border p-3" @submit.prevent="onJsonImport">
-      <Alert v-if="importError" variant="danger">
-        {{ importError }}
-      </Alert>
       <label class="block">
         <span class="text-xs font-medium">自选 JSON 内容</span>
         <textarea

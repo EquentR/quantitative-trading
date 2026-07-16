@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime, time
 from pathlib import Path
 from typing import Annotated, Any
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import typer
@@ -50,6 +51,34 @@ from quantitative_trading.email.service import (
     SmtpSettingsService,
     sanitized_email_error,
 )
+from quantitative_trading.datasource.eastmoney import (
+    DatasourceNotConfiguredError,
+    fetch_eastmoney_watchlist,
+)
+from quantitative_trading.datasource.miaoxiang import (
+    DatasourceError,
+    MiaoxiangWatchlistAdapter,
+    RemoteWatchlistResult,
+)
+from quantitative_trading.datasource.status import DatasourceCredentialsRepository
+from quantitative_trading.instrument.adapters import AkShareInstrumentDirectoryAdapter
+from quantitative_trading.instrument.models import InstrumentType
+from quantitative_trading.instrument.directory import (
+    InstrumentDirectoryService,
+    InstrumentDirectoryUnavailableError,
+    directory_summary_warnings,
+    latest_completed_directory_trade_date,
+)
+from quantitative_trading.instrument.repository import (
+    InstrumentCatalogStateRepository,
+    InstrumentPreviewExpiredError,
+    InstrumentPreviewNotFoundError,
+    InstrumentRepository,
+)
+from quantitative_trading.instrument.service import (
+    InstrumentCandidateService,
+    InstrumentSelectionInvalidError,
+)
 from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import (
     DuplicatePositionError,
@@ -58,12 +87,15 @@ from quantitative_trading.ledger.repository import (
 )
 from quantitative_trading.ledger.service import LedgerService, ReadOnlyLedgerService
 from quantitative_trading.market.providers import (
+    AkShareEtfMarketProvider,
     AkShareMarketProvider,
     DisabledMarketProvider,
     MarketDataProvider,
 )
 from quantitative_trading.market.adapters import (
     AkShareDailyBarProvider,
+    AkShareEtfDailyBarProvider,
+    AkShareEtfIntradayProvider,
     AkShareIntradayProvider,
     AkShareMoneyFlowProvider,
 )
@@ -223,6 +255,25 @@ def _watchlist_service_scope() -> Iterator[
         connection_cm.__exit__(None, None, None)
 
 
+@contextmanager
+def _instrument_cli_scope() -> Iterator[
+    tuple[sqlite3.Connection, InstrumentCandidateService, InstrumentDirectoryService]
+]:
+    settings = load_settings()
+    with connect(settings) as connection:
+        migrate(connection)
+        yield (
+            connection,
+            InstrumentCandidateService(connection),
+            InstrumentDirectoryService(
+                InstrumentRepository(connection),
+                InstrumentCatalogStateRepository(connection),
+                AkShareInstrumentDirectoryAdapter(),
+                timezone=ZoneInfo(settings.timezone),
+            ),
+        )
+
+
 def _position_input(
     *,
     symbol: str,
@@ -288,6 +339,27 @@ def _market_provider(settings: Settings) -> MarketDataProvider:
     provider_name = settings.market_provider.strip().lower()
     if provider_name == "akshare":
         return AkShareMarketProvider()
+
+    raise typer.BadParameter(f"unsupported market provider: {settings.market_provider}")
+
+
+def _etf_market_provider(
+    settings: Settings,
+    connection: sqlite3.Connection,
+) -> MarketDataProvider:
+    if not settings.enable_market_fetch:
+        return DisabledMarketProvider()
+
+    provider_name = settings.market_provider.strip().lower()
+    if provider_name == "akshare":
+        return AkShareEtfMarketProvider(
+            price_limit_ratios={
+                item.symbol: item.price_limit_ratio
+                for item in InstrumentRepository(connection).list_active()
+                if item.instrument_type is InstrumentType.ETF
+                and item.price_limit_ratio is not None
+            }
+        )
 
     raise typer.BadParameter(f"unsupported market provider: {settings.market_provider}")
 
@@ -511,12 +583,32 @@ def list_watch_pinned() -> None:
 
 @watchlist_app.command("import")
 def import_watch_pinned(path: Annotated[Path, typer.Argument()]) -> None:
-    with _watchlist_service_scope() as (service, _):
+    with _instrument_cli_scope() as (connection, _, directory):
+        service = WatchPinnedService(WatchPinnedRepository(connection))
         try:
-            imported = service.import_csv(path, source=WatchPinnedSource.MANUAL)
+            items = service.parse_csv(path)
         except (OSError, ValueError) as exc:
             raise typer.BadParameter(f"导入观察失败 {path.name}: {exc}") from exc
-        typer.echo(f"已导入 {len(imported)} 条观察")
+        directory_warnings: list[str] = []
+        try:
+            snapshot = directory.ensure_current(
+                latest_completed_directory_trade_date(
+                    datetime.now(ZoneInfo(load_settings().timezone)),
+                    XSHGTradingCalendar(),
+                )
+            )
+            directory_warnings.extend(directory_summary_warnings(snapshot.warnings))
+        except InstrumentDirectoryUnavailableError:
+            directory_warnings.append(
+                "证券目录不可用，未验证导入项已强制关闭计划"
+            )
+        result = service.replace_pinned_with_warnings(
+            items,
+            source=WatchPinnedSource.MANUAL,
+        )
+        typer.echo(f"已导入 {len(result.items)} 条观察")
+        for warning in dict.fromkeys([*directory_warnings, *result.warnings]):
+            typer.echo(f"warning: {warning}")
 
 
 @watchlist_app.command("export")
@@ -541,10 +633,126 @@ def export_watch_pinned() -> None:
 
 
 @watchlist_app.command("sync")
-def sync_watch_pinned() -> None:
-    with _watchlist_service_scope() as (_, read_only):
-        count = len(read_only.list_pinned())
-    typer.echo(f"未配置外部自选置顶同步源，未修改观察池；当前观察股数量: {count}")
+def sync_watch_pinned(
+    symbols: Annotated[str | None, typer.Option("--symbols")] = None,
+) -> None:
+    with _instrument_cli_scope() as (connection, service, directory):
+        try:
+            remote = fetch_eastmoney_watchlist(
+                DatasourceCredentialsRepository(connection),
+                MiaoxiangWatchlistAdapter(),
+            )
+        except (DatasourceNotConfiguredError, DatasourceError) as exc:
+            raise typer.BadParameter(safe_error_summary(exc)) from exc
+        directory_warnings: list[str] = []
+        directory_available = True
+        try:
+            snapshot = directory.ensure_current(
+                latest_completed_directory_trade_date(
+                    datetime.now(ZoneInfo(load_settings().timezone)),
+                    XSHGTradingCalendar(),
+                )
+            )
+            directory_warnings.extend(directory_summary_warnings(snapshot.warnings))
+        except InstrumentDirectoryUnavailableError:
+            directory_available = False
+            directory_warnings.append(
+                "证券目录不可用，未验证候选不可选择"
+            )
+        preview = service.preview_eastmoney(
+            RemoteWatchlistResult(
+                items=remote.items,
+                warnings=[*remote.warnings, *directory_warnings],
+            ),
+            directory_available=directory_available,
+        )
+        _print_preview_summary(preview)
+        if symbols is None:
+            return
+        selected_symbols = _parse_symbol_csv(symbols)
+        try:
+            result = service.select(preview.preview_id, selected_symbols)
+        except InstrumentSelectionInvalidError as exc:
+            raise typer.BadParameter("选择包含不在预览中或不可选择的证券") from exc
+        typer.echo(f"已加入监控 {len(result.items)} 条")
+        for warning in result.warnings:
+            typer.echo(f"warning: {warning}")
+
+
+@watchlist_app.command("search")
+def search_watch_pinned(query: Annotated[str, typer.Argument()]) -> None:
+    with _instrument_cli_scope() as (_, service, directory):
+        normalized = query.strip()
+        if not normalized:
+            raise typer.BadParameter("instrument search query must not be blank")
+        try:
+            snapshot = directory.ensure_current(
+                latest_completed_directory_trade_date(
+                    datetime.now(ZoneInfo(load_settings().timezone)),
+                    XSHGTradingCalendar(),
+                )
+            )
+        except InstrumentDirectoryUnavailableError as exc:
+            raise typer.BadParameter("证券目录当前不可用") from exc
+        try:
+            preview = service.search(
+                normalized,
+                warnings=directory_summary_warnings(snapshot.warnings),
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        _print_preview_summary(preview)
+        for item in preview.items:
+            typer.echo(
+                f"{item.symbol} {item.name} {item.instrument_type.value} "
+                f"{item.exchange.value if item.exchange else '-'} "
+                f"{item.settlement_cycle.value}"
+            )
+
+
+@watchlist_app.command("select")
+def select_watch_pinned(
+    preview_id: Annotated[str, typer.Argument()],
+    symbols: Annotated[str, typer.Option("--symbols")],
+) -> None:
+    try:
+        parsed_preview_id = UUID(preview_id)
+        selected_symbols = _parse_symbol_csv(symbols)
+    except ValueError as exc:
+        raise typer.BadParameter("preview id 或证券代码格式无效") from exc
+    with _instrument_cli_scope() as (_, service, _directory):
+        try:
+            result = service.select(parsed_preview_id, selected_symbols)
+        except InstrumentPreviewNotFoundError as exc:
+            raise typer.BadParameter("候选预览不存在") from exc
+        except InstrumentPreviewExpiredError as exc:
+            raise typer.BadParameter("候选预览已过期，请重新获取") from exc
+        except InstrumentSelectionInvalidError as exc:
+            raise typer.BadParameter("选择包含不在预览中或不可选择的证券") from exc
+        typer.echo(f"已加入监控 {len(result.items)} 条")
+        for warning in result.warnings:
+            typer.echo(f"warning: {warning}")
+
+
+def _parse_symbol_csv(value: str) -> list[str]:
+    symbols = [part.strip() for part in value.split(",") if part.strip()]
+    if not symbols or any(
+        len(symbol) != 6 or not symbol.isascii() or not symbol.isdigit()
+        for symbol in symbols
+    ):
+        raise ValueError("symbols must be comma-separated six-digit codes")
+    return symbols
+
+
+def _print_preview_summary(preview) -> None:  # noqa: ANN001
+    selectable = sum(item.selectable for item in preview.items)
+    monitored = sum(item.already_monitored for item in preview.items)
+    typer.echo(f"preview_id={preview.preview_id}")
+    typer.echo(
+        f"候选={len(preview.items)} 可选择={selectable} 已监控={monitored}"
+    )
+    for warning in preview.warnings:
+        typer.echo(f"warning: {warning}")
 
 
 @cash_app.command("init")
@@ -672,6 +880,7 @@ def market_snapshot() -> None:
             created = MarketSnapshotService(
                 connection,
                 _market_provider(settings),
+                etf_provider=_etf_market_provider(settings, connection),
             ).capture()
     except (sqlite3.Error, ValidationError, ValueError):
         raise typer.BadParameter("market snapshot storage failed") from None
@@ -694,6 +903,7 @@ def _market_cli_service(connection: sqlite3.Connection) -> MarketCliService:
         connection,
         calendar=calendar,
         daily_provider=AkShareDailyBarProvider(calendar=calendar),
+        etf_daily_provider=AkShareEtfDailyBarProvider(calendar=calendar),
         money_flow_provider=AkShareMoneyFlowProvider(calendar=calendar),
     )
 
@@ -707,6 +917,9 @@ def _market_maintenance_workflow(
         calendar=calendar,
         quote_provider=DisabledMarketProvider(),
         daily_provider=AkShareDailyBarProvider(calendar=calendar),
+        etf_quote_provider=DisabledMarketProvider(),
+        etf_daily_provider=AkShareEtfDailyBarProvider(calendar=calendar),
+        etf_intraday_provider=AkShareEtfIntradayProvider(calendar=calendar),
         money_flow_provider=AkShareMoneyFlowProvider(calendar=calendar),
         intraday_provider=AkShareIntradayProvider(calendar=calendar),
         now=lambda: datetime.now(UTC),

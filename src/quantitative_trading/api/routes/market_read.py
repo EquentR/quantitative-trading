@@ -16,6 +16,8 @@ from quantitative_trading.api.dependencies import (
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.ledger.models import Position
 from quantitative_trading.ledger.repository import PositionRepository
+from quantitative_trading.instrument.models import InstrumentMetadata
+from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.market.features import (
     calculate_daily_features,
     select_market_structure,
@@ -55,6 +57,8 @@ from quantitative_trading.recommendation.models import Recommendation
 from quantitative_trading.recommendation.repository import RecommendationRepository
 from quantitative_trading.universe.models import UniverseMember
 from quantitative_trading.universe.repository import UniverseSnapshotRepository
+from quantitative_trading.universe.service import build_universe
+from quantitative_trading.watchlist.repository import WatchPinnedRepository
 
 
 router = APIRouter(
@@ -73,6 +77,7 @@ QualityStatus = Literal[
     "stale",
     "failed",
     "unavailable",
+    "not_applicable",
 ]
 StrengthLabel = Literal["strong", "neutral", "weak", "unavailable"]
 RecommendationActionValue = Literal[
@@ -265,6 +270,7 @@ class DatasetStatusCounts(BaseModel):
     degraded: int = 0
     failed: int = 0
     stale: int = 0
+    not_applicable: int = 0
 
 
 class MarketRunSummary(MarketCaptureRun):
@@ -296,6 +302,7 @@ class MarketTraceDataset(BaseModel):
 
 class MarketSnapshotTrace(BaseModel):
     symbol: str
+    instrument: InstrumentMetadata | None
     run_id: str | None
     snapshot_id: int
     plan_id: str | None
@@ -495,7 +502,10 @@ def _merge_persisted_quality(
     for dataset, quality in sorted(
         quality_by_dataset.items(), key=lambda item: item[0].value
     ):
-        if quality.status is CaptureResultStatus.COMPLETE:
+        if quality.status in {
+            CaptureResultStatus.COMPLETE,
+            CaptureResultStatus.NOT_APPLICABLE,
+        }:
             continue
         merged_warnings.extend(
             [
@@ -583,13 +593,17 @@ def list_market_symbols(
     container: ApiContainer = Depends(get_container),
 ) -> PaginatedMarketSymbols:
     with connection_scope(container.settings) as connection:
-        universe = UniverseSnapshotRepository(connection).latest()
-        if universe is None:
-            return PaginatedMarketSymbols(
-                items=[], total=0, page=page, page_size=page_size
-            )
+        metadata = {
+            item.symbol: item for item in InstrumentRepository(connection).list_active()
+        }
+        current_members = build_universe(
+            positions=PositionRepository(connection).list(),
+            watchlist=WatchPinnedRepository(connection).list(),
+            instrument_metadata=metadata,
+            created_at=_now(),
+        )
         decision_members = [
-            member for member in universe.members if member.plan_enabled
+            member for member in current_members if member.plan_enabled
         ]
         total = len(decision_members)
         start = (page - 1) * page_size
@@ -913,6 +927,9 @@ def _empty_dataset_quality(
     if quality is None:
         return "unavailable", [unavailable_warning]
 
+    if quality.status is CaptureResultStatus.NOT_APPLICABLE:
+        return "not_applicable", []
+
     warnings = _deduplicate(
         [
             unavailable_warning,
@@ -1006,8 +1023,13 @@ def get_money_flow(
     container: ApiContainer = Depends(get_container),
 ) -> MoneyFlowResponse:
     with connection_scope(container.settings) as connection:
-        stored = MoneyFlowRepository(connection).current(symbol, limit=limit)
         quality = _latest_dataset_quality(connection, symbol, CaptureDataset.MONEY_FLOW)
+        stored = (
+            []
+            if quality is not None
+            and quality.status is CaptureResultStatus.NOT_APPLICABLE
+            else MoneyFlowRepository(connection).current(symbol, limit=limit)
+        )
     if not stored:
         status, warnings = _empty_dataset_quality(
             quality,
@@ -1352,7 +1374,9 @@ def _quality_dataset(
         data_time=quality.data_time,
         fetched_at=None,
         warnings=(
-            [quality.warning]
+            []
+            if quality.status is CaptureResultStatus.NOT_APPLICABLE
+            else [quality.warning]
             if quality.warning
             else [f"{dataset} reference unavailable"]
         ),
@@ -1520,7 +1544,8 @@ def _strength_trace(
 def _trace_status(datasets: list[MarketTraceDataset]) -> QualityStatus:
     statuses = [dataset.status for dataset in datasets]
     if all(
-        dataset.status == "complete" and dataset.reference_id is not None
+        (dataset.status == "complete" and dataset.reference_id is not None)
+        or dataset.status == "not_applicable"
         for dataset in datasets
     ):
         return "complete"
@@ -1579,6 +1604,7 @@ def get_market_snapshot_trace(
     dataset_warnings = [warning for dataset in datasets for warning in dataset.warnings]
     return MarketSnapshotTrace(
         symbol=symbol,
+        instrument=snapshot.instrument_metadata.get(symbol),
         run_id=snapshot.capture_run_id,
         snapshot_id=snapshot_id,
         plan_id=None if plan is None else plan.plan_id,

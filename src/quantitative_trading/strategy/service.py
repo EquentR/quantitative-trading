@@ -110,6 +110,7 @@ def planned_entry_signal(
     daily_structure_confirmed: bool,
     intraday_strength: Literal["strong", "neutral", "weak"],
     money_flow_confirmed: bool | None,
+    money_flow_applicable: bool = True,
     data_quality: Literal["complete", "degraded", "failed", "stale"],
     invalid_if: list[str],
 ) -> StrategySignal:
@@ -159,6 +160,9 @@ def planned_entry_signal(
     if money_flow_confirmed is True:
         machine_reason.append("money_flow_confirmed")
         human_reason.append("资金流提供额外确认")
+    elif not money_flow_applicable:
+        machine_reason.append("money_flow_not_applicable")
+        human_reason.append("该证券资金流数据不适用，未计入确认")
     else:
         machine_reason.append("money_flow_unavailable")
         human_reason.append("资金流不可用，未计入确认")

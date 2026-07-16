@@ -11,6 +11,7 @@ from quantitative_trading.planning.models import (
     TradingPlanStatus,
 )
 from quantitative_trading.planning.service import plan_valid_until
+from quantitative_trading.instrument.models import InstrumentType, SettlementCycle
 
 
 def build_market_trading_plan(
@@ -46,7 +47,13 @@ def build_market_trading_plan(
             if item.is_holding
             else ["watch", "avoid", "buy"]
         )
-        if item.data_quality in {"failed", "stale"}:
+        instrument_unknown = item.instrument is not None and (
+            item.instrument.instrument_type is InstrumentType.UNKNOWN
+            or item.instrument.settlement_cycle is SettlementCycle.UNKNOWN
+        )
+        if instrument_unknown:
+            allowed_actions = ["hold"] if item.is_holding else ["watch"]
+        elif item.data_quality in {"failed", "stale"}:
             allowed_actions = (
                 ["hold", "reduce", "sell"] if item.is_holding else ["watch", "avoid"]
             )
@@ -61,6 +68,7 @@ def build_market_trading_plan(
         context = PlanSymbolContext(
             symbol=item.symbol,
             name=item.name,
+            instrument=item.instrument,
             sources=item.sources,
             is_holding=item.is_holding,
             trend=dict(item.daily_features),
@@ -172,16 +180,17 @@ def _entry_conditions(
             rationale="分时强弱达到 strong",
         )
     )
-    conditions.append(
-        PlanCondition(
-            condition_id="money-flow-confirmation",
-            metric="money_flow_positive",
-            operator="eq",
-            threshold=1,
-            required=False,
-            rationale="资金流只提供额外确认或过滤",
+    if item.money_flow.get("status") != "not_applicable":
+        conditions.append(
+            PlanCondition(
+                condition_id="money-flow-confirmation",
+                metric="money_flow_positive",
+                operator="eq",
+                threshold=1,
+                required=False,
+                rationale="资金流只提供额外确认或过滤",
+            )
         )
-    )
     return conditions
 
 

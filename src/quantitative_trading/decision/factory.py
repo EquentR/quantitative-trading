@@ -18,6 +18,8 @@ from quantitative_trading.email.repository import SmtpSettingsRepository
 from quantitative_trading.email.service import SmtplibEmailSender, SmtpSettingsService
 from quantitative_trading.market.adapters import (
     AkShareDailyBarProvider,
+    AkShareEtfDailyBarProvider,
+    AkShareEtfIntradayProvider,
     AkShareIntradayProvider,
     AkShareMoneyFlowProvider,
 )
@@ -25,6 +27,7 @@ from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import DailyBar, DailyMoneyFlow, MinuteBar
 from quantitative_trading.market.features import IntradayStrengthRules
 from quantitative_trading.market.providers import (
+    AkShareEtfMarketProvider,
     AkShareMarketProvider,
     DisabledMarketProvider,
 )
@@ -34,6 +37,12 @@ from quantitative_trading.notification.local_alert import LocalAlertDispatcher
 from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.notification.service import NotificationService
 from quantitative_trading.sanitization import safe_error_summary
+from quantitative_trading.instrument.models import (
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
+from quantitative_trading.instrument.repository import InstrumentRepository
 
 
 class DisabledHeavyMarketProvider:
@@ -73,6 +82,7 @@ def build_decision_workflow(
 ) -> DecisionWorkflow:
     clock = now or (lambda: datetime.now(UTC))
     calendar = XSHGTradingCalendar()
+    instrument_repository = InstrumentRepository(connection)
     provider_name = settings.market_provider.strip().lower()
     if provider_name != "akshare":
         raise ValueError(f"unsupported market provider: {settings.market_provider}")
@@ -82,12 +92,43 @@ def build_decision_workflow(
         daily_provider = AkShareDailyBarProvider(calendar=calendar, now=clock)
         money_flow_provider = AkShareMoneyFlowProvider(calendar=calendar, now=clock)
         intraday_provider = AkShareIntradayProvider(calendar=calendar, now=clock)
+        etf_quote_provider = AkShareEtfMarketProvider(
+            now=clock,
+            price_limit_ratios={
+                item.symbol: item.price_limit_ratio
+                for item in instrument_repository.list_active()
+                if item.instrument_type is InstrumentType.ETF
+                and item.price_limit_ratio is not None
+            },
+        )
+        etf_daily_provider = AkShareEtfDailyBarProvider(calendar=calendar, now=clock)
+        etf_intraday_provider = AkShareEtfIntradayProvider(calendar=calendar, now=clock)
     else:
         quote_provider = DisabledMarketProvider(now=clock)
         disabled = DisabledHeavyMarketProvider()
         daily_provider = disabled
         money_flow_provider = disabled
         intraday_provider = disabled
+        etf_quote_provider = quote_provider
+        etf_daily_provider = disabled
+        etf_intraday_provider = disabled
+
+    def load_instrument_metadata(symbols: Sequence[str]):
+        loaded: dict[str, InstrumentMetadata] = {}
+        for symbol in symbols:
+            metadata = instrument_repository.get(symbol)
+            loaded[symbol] = metadata or InstrumentMetadata(
+                symbol=symbol,
+                name=symbol,
+                exchange=None,
+                instrument_type=InstrumentType.UNKNOWN,
+                settlement_cycle=SettlementCycle.UNKNOWN,
+                metadata_source="legacy_unverified",
+                metadata_checked_at=clock(),
+                rule_version="unverified-v1",
+                warnings=["instrument metadata requires manual verification"],
+            )
+        return loaded
 
     return DecisionWorkflow(
         connection,
@@ -96,6 +137,10 @@ def build_decision_workflow(
         daily_provider=daily_provider,
         money_flow_provider=money_flow_provider,
         intraday_provider=intraday_provider,
+        etf_quote_provider=etf_quote_provider,
+        etf_daily_provider=etf_daily_provider,
+        etf_intraday_provider=etf_intraday_provider,
+        instrument_metadata_loader=load_instrument_metadata,
         now=clock,
         stale_trading_minutes=settings.market_stale_trading_minutes,
         strength_rules=IntradayStrengthRules(

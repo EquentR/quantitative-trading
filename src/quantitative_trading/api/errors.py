@@ -106,7 +106,7 @@ def _sanitize_details(value: Any, *, current_key: str | None = None) -> Any:
         return [_sanitize_details(item, current_key=current_key) for item in value]
     if (
         isinstance(value, str)
-        and current_key == "replacement"
+        and current_key in {"replacement", "preview", "selection"}
         and value.startswith("/api/v1/")
     ):
         return value

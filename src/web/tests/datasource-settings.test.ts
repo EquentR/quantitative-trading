@@ -108,6 +108,42 @@ test('检查连接调用 POST 检查接口', async () => {
   await waitFor(() => expect(checked).toBe(true))
 })
 
+test('无效数据源状态显示需要重新配置的提示', async () => {
+  server.use(
+    http.get('/api/v1/datasource/eastmoney/status', () =>
+      HttpResponse.json({
+        provider: 'eastmoney', status: 'invalid', last_checked_at: now,
+        last_error: 'credential rejected', updated_at: now,
+      }),
+    ),
+  )
+
+  renderPreparation()
+
+  await waitFor(() => expect(screen.getByText('东方财富 API Key 无效，请重新配置。')).toBeInTheDocument())
+})
+
+test('检查连接失败显示安全错误且不影响 Key 输入', async () => {
+  const user = userEvent.setup()
+  server.use(
+    http.post('/api/v1/datasource/eastmoney/check', () =>
+      HttpResponse.json(
+        { error: { code: 'datasource_quota_exceeded', message: 'quota exceeded', details: {} } },
+        { status: 429 },
+      ),
+    ),
+  )
+
+  renderPreparation()
+  const input = await screen.findByLabelText('API Key')
+  await user.type(input, 'retry-key-value')
+  await user.click(screen.getByRole('button', { name: '检查连接' }))
+
+  await waitFor(() => expect(screen.getByText('检查失败：调用额度已耗尽，请稍后再试')).toBeInTheDocument())
+  expect(input).toHaveValue('retry-key-value')
+  expect(JSON.stringify(Array.from(Object.entries(localStorage)))).not.toContain('retry-key-value')
+})
+
 test('提交 API Key 失败后展示错误提示并保留输入内容，且不泄露到 localStorage', async () => {
   const user = userEvent.setup()
   server.use(

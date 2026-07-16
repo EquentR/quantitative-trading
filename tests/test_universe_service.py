@@ -4,6 +4,12 @@ import pytest
 from pydantic import ValidationError
 
 from quantitative_trading.ledger.models import Position
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
 from quantitative_trading.universe.models import UniverseSource
 from quantitative_trading.universe.service import build_universe
 from quantitative_trading.watchlist.models import WatchPinnedItem, WatchPinnedSource
@@ -12,6 +18,20 @@ from quantitative_trading.watchlist.models import WatchPinnedItem, WatchPinnedSo
 CREATED_AT = datetime(2026, 7, 8, 1, 30, tzinfo=UTC)
 LEDGER_UPDATED_AT = datetime(2026, 7, 8, 1, 0, tzinfo=UTC)
 WATCH_UPDATED_AT = datetime(2026, 7, 8, 1, 15, tzinfo=UTC)
+
+
+def etf_metadata(symbol: str = "510300", name: str = "沪深300ETF") -> InstrumentMetadata:
+    return InstrumentMetadata(
+        symbol=symbol,
+        name=name,
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.ETF,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="exchange_catalog",
+        metadata_checked_at=CREATED_AT,
+        rule_version="instrument-rules-v1",
+    )
 
 
 def position(symbol: str = "600000", name: str = "持仓名称") -> Position:
@@ -117,3 +137,16 @@ def test_universe_rejects_naive_created_at() -> None:
             watchlist=[],
             created_at=datetime(2026, 7, 8, 1, 30),
         )
+
+
+def test_universe_member_copies_instrument_metadata() -> None:
+    metadata = etf_metadata()
+
+    members = build_universe(
+        positions=[],
+        watchlist=[watch_item("510300", name="沪深300ETF", plan_enabled=True)],
+        instrument_metadata={metadata.symbol: metadata},
+        created_at=CREATED_AT,
+    )
+
+    assert members[0].instrument == metadata

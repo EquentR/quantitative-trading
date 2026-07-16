@@ -14,6 +14,7 @@ from quantitative_trading.api.dependencies import (
 )
 from quantitative_trading.api.errors import ApiError
 from quantitative_trading.ledger.repository import PositionRepository
+from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.universe.models import (
     UniverseMember,
     UniverseSnapshot,
@@ -60,9 +61,13 @@ def _current_universe(container: ApiContainer, *, created_at: datetime) -> list[
     with connection_scope(container.settings) as connection:
         positions = PositionRepository(connection).list()
         watchlist = WatchPinnedRepository(connection).list()
+        metadata = {
+            item.symbol: item for item in InstrumentRepository(connection).list_active()
+        }
     return build_universe(
         positions=positions,
         watchlist=watchlist,
+        instrument_metadata=metadata,
         created_at=created_at,
     )
 

@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from quantitative_trading.instrument.models import InstrumentMetadata
 
 
 class DecisionSymbolInput(BaseModel):
@@ -11,6 +13,7 @@ class DecisionSymbolInput(BaseModel):
 
     symbol: str = Field(pattern=r"^\d{6}$")
     name: str = Field(min_length=1)
+    instrument: InstrumentMetadata | None = None
     is_holding: bool
     current_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     support_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
@@ -32,6 +35,7 @@ class DecisionSymbolInput(BaseModel):
     data_references: dict[str, dict[str, Any]]
     invalid_if: list[str] = Field(min_length=1)
     warnings: list[str] = Field(default_factory=list)
+    data_time_source: Literal["market", "instrument_metadata"] = "market"
     data_time: datetime
     fetched_at: datetime
     valid_until: datetime
@@ -67,3 +71,9 @@ class DecisionSymbolInput(BaseModel):
         if any(not item.strip() for item in value):
             raise ValueError("decision text lists cannot contain blank values")
         return value
+
+    @model_validator(mode="after")
+    def instrument_symbol_must_match(self) -> "DecisionSymbolInput":
+        if self.instrument is not None and self.instrument.symbol != self.symbol:
+            raise ValueError("symbol must match instrument symbol")
+        return self

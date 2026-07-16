@@ -10,6 +10,7 @@ from quantitative_trading.risk.models import RiskConfig, RiskContext, RiskDecisi
 from quantitative_trading.risk.service import apply_risk, calculate_buy_constraint
 from quantitative_trading.strategy.models import StrategyAction, StrategySignal
 from quantitative_trading.strategy.service import holding_risk_signals, planned_entry_signal
+from quantitative_trading.instrument.models import InstrumentType, SettlementCycle
 
 
 def decide_symbol(
@@ -22,12 +23,15 @@ def decide_symbol(
     created_at: datetime,
 ) -> Recommendation:
     signal = _strategy_signal(decision_input)
+    effective_risk_context = risk_context.model_copy(
+        update={"instrument": decision_input.instrument or risk_context.instrument}
+    )
     risk_decision = apply_risk(
         signal,
         account_snapshot,
         decision_input.position_context if decision_input.is_holding else None,
         risk_config,
-        context=risk_context,
+        context=effective_risk_context,
     )
     if decision_input.is_holding and (
         account_snapshot is None
@@ -70,6 +74,7 @@ def decide_symbol(
         risk_decision,
         recommendation_id=recommendation_id,
         name=decision_input.name,
+        instrument=decision_input.instrument,
         position_context=decision_input.position_context,
         account_context=decision_input.account_context,
         price_context=decision_input.price_context,
@@ -84,12 +89,24 @@ def decide_symbol(
         data_quality={
             "overall": decision_input.data_quality,
             "warnings": decision_input.warnings,
+            "data_time_source": decision_input.data_time_source,
         },
         position_constraint=position_constraint,
     )
 
 
 def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
+    if decision_input.instrument is not None and (
+        decision_input.instrument.instrument_type is InstrumentType.UNKNOWN
+        or decision_input.instrument.settlement_cycle is SettlementCycle.UNKNOWN
+    ):
+        return _conservative_signal(
+            decision_input,
+            action=StrategyAction.HOLD if decision_input.is_holding else StrategyAction.WATCH,
+            machine_reason="instrument_metadata_unknown",
+            human_reason="证券类型或交易制度未经验证，当前只允许人工复核",
+        )
+
     if decision_input.trading_status == "suspended":
         return _conservative_signal(
             decision_input,
@@ -115,6 +132,10 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
             daily_structure_confirmed=decision_input.daily_structure_confirmed,
             intraday_strength=decision_input.intraday_strength,
             money_flow_confirmed=decision_input.money_flow_confirmed,
+            money_flow_applicable=not (
+                decision_input.instrument is not None
+                and decision_input.instrument.instrument_type is InstrumentType.ETF
+            ),
             data_quality="failed",
             invalid_if=decision_input.invalid_if,
         )
@@ -180,6 +201,10 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
                 daily_structure_confirmed=True,
                 intraday_strength=decision_input.intraday_strength,
                 money_flow_confirmed=decision_input.money_flow_confirmed,
+                money_flow_applicable=not (
+                    decision_input.instrument is not None
+                    and decision_input.instrument.instrument_type is InstrumentType.ETF
+                ),
                 data_quality=decision_input.data_quality,
                 invalid_if=decision_input.invalid_if,
             )
@@ -219,6 +244,10 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
         daily_structure_confirmed=decision_input.daily_structure_confirmed,
         intraday_strength=decision_input.intraday_strength,
         money_flow_confirmed=decision_input.money_flow_confirmed,
+        money_flow_applicable=not (
+            decision_input.instrument is not None
+            and decision_input.instrument.instrument_type is InstrumentType.ETF
+        ),
         data_quality=decision_input.data_quality,
         invalid_if=decision_input.invalid_if,
     )

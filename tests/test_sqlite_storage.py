@@ -473,6 +473,197 @@ def test_migrate_creates_datasource_credentials_table(tmp_path) -> None:
     assert row is not None
 
 
+def test_migrate_creates_instrument_directory_tables(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "app.db")
+    expected_columns = {
+        "instruments": [
+            "symbol",
+            "name",
+            "exchange",
+            "instrument_type",
+            "settlement_cycle",
+            "price_limit_ratio",
+            "metadata_source",
+            "metadata_checked_at",
+            "rule_version",
+            "is_active",
+            "warnings_json",
+        ],
+        "instrument_catalog_state": [
+            "source",
+            "last_attempt_at",
+            "last_success_at",
+            "data_trade_date",
+            "status",
+            "last_error",
+            "warnings_json",
+            "updated_at",
+        ],
+        "instrument_previews": [
+            "preview_id",
+            "source",
+            "query",
+            "items_json",
+            "warnings_json",
+            "created_at",
+            "expires_at",
+        ],
+    }
+
+    with connect(settings) as connection:
+        migrate(connection)
+        actual = {
+            table: [
+                row["name"]
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            ]
+            for table in expected_columns
+        }
+
+    assert actual == expected_columns
+
+
+def test_migrate_rebuilds_legacy_capture_result_status_constraint(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "legacy-capture.db")
+    with connect(settings) as connection:
+        connection.execute(
+            """
+            CREATE TABLE market_capture_results (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT NOT NULL,
+              symbol TEXT NOT NULL,
+              dataset TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (status IN ('complete','degraded','failed','stale')),
+              data_start TEXT,
+              data_end TEXT,
+              data_time TEXT,
+              fetched_at TEXT NOT NULL,
+              expected_rows INTEGER NOT NULL DEFAULT 0,
+              actual_rows INTEGER NOT NULL DEFAULT 0,
+              source TEXT NOT NULL,
+              warning TEXT NOT NULL DEFAULT '',
+              error_summary TEXT NOT NULL DEFAULT '',
+              UNIQUE (run_id, symbol, dataset)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO market_capture_results (
+              run_id, symbol, dataset, status, fetched_at, source
+            ) VALUES ('legacy-run', '600000', 'quote', 'complete',
+                      '2026-07-15T02:00:00+00:00', 'legacy')
+            """
+        )
+
+        migrate(connection)
+        connection.execute(
+            """
+            INSERT INTO market_capture_results (
+              run_id, symbol, dataset, status, fetched_at, source
+            ) VALUES ('etf-run', '510300', 'money_flow', 'not_applicable',
+                      '2026-07-15T02:00:00+00:00', 'instrument_policy')
+            """
+        )
+        rows = connection.execute(
+            "SELECT run_id, status FROM market_capture_results ORDER BY id"
+        ).fetchall()
+
+    assert [tuple(row) for row in rows] == [
+        ("legacy-run", "complete"),
+        ("etf-run", "not_applicable"),
+    ]
+
+
+def test_migrate_disables_unverified_legacy_watch_item_without_changing_position(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "legacy.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        connection.execute(
+            """
+            INSERT INTO watch_pinned
+              (symbol, name, rank, plan_enabled, source, note, updated_at)
+            VALUES
+              ('600000', 'legacy watch', 1, 1, 'manual', 'keep note',
+               '2026-07-15T01:00:00+00:00')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO positions
+              (symbol, name, quantity, available_quantity, cost_price,
+               opened_at, updated_at, note)
+            VALUES
+              ('600000', 'legacy holding', 300, 200, 9.5, '2026-07-01',
+               '2026-07-15T01:00:00+00:00', 'authoritative')
+            """
+        )
+        connection.commit()
+
+        migrate(connection)
+        watch = connection.execute(
+            "SELECT plan_enabled, note FROM watch_pinned WHERE symbol='600000'"
+        ).fetchone()
+        position = connection.execute(
+            """SELECT quantity, available_quantity, cost_price, note
+               FROM positions WHERE symbol='600000'"""
+        ).fetchone()
+
+    assert dict(watch) == {"plan_enabled": 0, "note": "keep note"}
+    assert dict(position) == {
+        "quantity": 300,
+        "available_quantity": 200,
+        "cost_price": 9.5,
+        "note": "authoritative",
+    }
+
+
+def test_migrate_keeps_verified_legacy_watch_item_enabled(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "legacy-verified.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        connection.execute(
+            """
+            INSERT INTO instruments (
+              symbol, name, exchange, instrument_type, settlement_cycle,
+              price_limit_ratio, metadata_source, metadata_checked_at,
+              rule_version, is_active, warnings_json
+            ) VALUES (
+              '600000', '浦发银行', 'SH', 'a_share', 't1', NULL,
+              'test-directory', '2026-07-15T01:00:00+00:00',
+              'test-rules-v1', 1, '[]'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO watch_pinned
+              (symbol, name, rank, plan_enabled, source, note, updated_at)
+            VALUES
+              ('600000', 'legacy watch', 1, 1, 'manual', 'keep note',
+               '2026-07-15T01:00:00+00:00')
+            """
+        )
+        connection.commit()
+
+        migrate(connection)
+        watch = connection.execute(
+            """SELECT w.plan_enabled, w.note, i.instrument_type, i.settlement_cycle
+               FROM watch_pinned w
+               JOIN instruments i ON i.symbol = w.symbol
+               WHERE w.symbol='600000'"""
+        ).fetchone()
+
+    assert dict(watch) == {
+        "plan_enabled": 1,
+        "note": "keep note",
+        "instrument_type": "a_share",
+        "settlement_cycle": "t1",
+    }
+
+
 def test_migrate_creates_universe_snapshots_table(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "app.db")
     with connect(settings) as connection:

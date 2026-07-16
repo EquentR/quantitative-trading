@@ -12,9 +12,29 @@ from quantitative_trading.account.models import (
 from quantitative_trading.risk.models import RiskConfig, RiskContext
 from quantitative_trading.risk.service import apply_risk, calculate_buy_constraint
 from quantitative_trading.strategy.models import StrategyAction, StrategySignal
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
 
 
 NOW = datetime(2026, 7, 9, 2, 30, tzinfo=UTC)
+
+
+def a_share_metadata() -> InstrumentMetadata:
+    return InstrumentMetadata(
+        symbol="600000",
+        name="浦发银行",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="exchange_catalog",
+        metadata_checked_at=NOW,
+        rule_version="instrument-rules-v1",
+    )
 
 
 def signal(action: StrategyAction) -> StrategySignal:
@@ -146,6 +166,7 @@ def test_available_quantity_zero_blocks_sell_and_downgrades_to_hold() -> None:
         snapshot(),
         position=valuation(available_quantity=0),
         config=RiskConfig(),
+        context=RiskContext(instrument=a_share_metadata()),
     )
 
     assert decision.allowed is False

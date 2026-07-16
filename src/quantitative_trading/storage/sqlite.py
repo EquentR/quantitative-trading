@@ -82,6 +82,60 @@ CREATE TABLE IF NOT EXISTS watch_pinned (
 """
 
 
+INSTRUMENTS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS instruments (
+  symbol TEXT PRIMARY KEY NOT NULL,
+  name TEXT NOT NULL,
+  exchange TEXT CHECK (exchange IS NULL OR exchange IN ('SH', 'SZ')),
+  instrument_type TEXT NOT NULL CHECK (instrument_type IN ('a_share', 'etf', 'unknown')),
+  settlement_cycle TEXT NOT NULL CHECK (settlement_cycle IN ('t0', 't1', 'unknown')),
+  price_limit_ratio REAL CHECK (
+    price_limit_ratio IS NULL OR (price_limit_ratio > 0 AND price_limit_ratio <= 1)
+  ),
+  metadata_source TEXT NOT NULL,
+  metadata_checked_at TEXT NOT NULL,
+  rule_version TEXT NOT NULL,
+  is_active INTEGER NOT NULL CHECK (is_active IN (0, 1)),
+  warnings_json TEXT NOT NULL,
+  CHECK (symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'),
+  CHECK (instrument_type = 'unknown' OR exchange IS NOT NULL),
+  CHECK (instrument_type != 'a_share' OR settlement_cycle = 't1'),
+  CHECK (instrument_type != 'unknown' OR settlement_cycle = 'unknown')
+);
+CREATE INDEX IF NOT EXISTS idx_instruments_active_symbol
+ON instruments(is_active, symbol);
+"""
+
+
+INSTRUMENT_CATALOG_STATE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS instrument_catalog_state (
+  source TEXT PRIMARY KEY NOT NULL,
+  last_attempt_at TEXT NOT NULL,
+  last_success_at TEXT,
+  data_trade_date TEXT,
+  status TEXT NOT NULL CHECK (status IN ('complete', 'stale', 'failed')),
+  last_error TEXT NOT NULL DEFAULT '',
+  warnings_json TEXT NOT NULL DEFAULT '[]',
+  updated_at TEXT NOT NULL
+);
+"""
+
+
+INSTRUMENT_PREVIEWS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS instrument_previews (
+  preview_id TEXT PRIMARY KEY NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('eastmoney_watchlist', 'instrument_search')),
+  query TEXT,
+  items_json TEXT NOT NULL,
+  warnings_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_instrument_previews_expires_at
+ON instrument_previews(expires_at);
+"""
+
+
 DATASOURCE_CREDENTIALS_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS datasource_credentials (
   provider TEXT PRIMARY KEY NOT NULL,
@@ -283,6 +337,9 @@ SCHEMA_STATEMENTS = [
     CASH_TRANSACTIONS_SCHEMA_SQL,
     ACCOUNT_SNAPSHOTS_SCHEMA_SQL,
     WATCH_PINNED_SCHEMA_SQL,
+    INSTRUMENTS_SCHEMA_SQL,
+    INSTRUMENT_CATALOG_STATE_SCHEMA_SQL,
+    INSTRUMENT_PREVIEWS_SCHEMA_SQL,
     DATASOURCE_CREDENTIALS_SCHEMA_SQL,
     UNIVERSE_SNAPSHOTS_SCHEMA_SQL,
     QUOTE_SNAPSHOTS_SCHEMA_SQL,
@@ -320,8 +377,11 @@ def connect(settings: Settings) -> Iterator[sqlite3.Connection]:
 
 def migrate(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA_SQL)
+    _disable_unverified_watch_items(connection)
+    _ensure_market_capture_result_status_constraint(connection)
     _ensure_trading_plan_status_constraint(connection)
     _ensure_scheduler_state_columns(connection)
+    _ensure_instrument_catalog_state_columns(connection)
     _ensure_notification_columns(connection)
     _ensure_recommendation_columns(connection)
     _ensure_market_capture_run_columns(connection)
@@ -356,6 +416,71 @@ def migrate(connection: sqlite3.Connection) -> None:
         """
     )
     connection.commit()
+
+
+def _disable_unverified_watch_items(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        UPDATE watch_pinned
+        SET plan_enabled = 0
+        WHERE plan_enabled = 1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM instruments
+            WHERE instruments.symbol = watch_pinned.symbol
+              AND instruments.is_active = 1
+              AND instruments.instrument_type IN ('a_share', 'etf')
+              AND instruments.settlement_cycle IN ('t0', 't1')
+          )
+        """
+    )
+
+
+def _ensure_market_capture_result_status_constraint(
+    connection: sqlite3.Connection,
+) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='market_capture_results'"
+    ).fetchone()
+    if row is None or "not_applicable" in str(row[0]):
+        return
+    connection.execute(
+        "ALTER TABLE market_capture_results RENAME TO market_capture_results_legacy"
+    )
+    connection.execute(
+        """
+        CREATE TABLE market_capture_results (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL,
+          symbol TEXT NOT NULL CHECK (symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]'),
+          dataset TEXT NOT NULL CHECK (dataset IN ('quote','daily_bar','money_flow','minute_bar','intraday_strength')),
+          status TEXT NOT NULL CHECK (status IN ('complete','degraded','failed','stale','not_applicable')),
+          data_start TEXT,
+          data_end TEXT,
+          data_time TEXT,
+          fetched_at TEXT NOT NULL,
+          expected_rows INTEGER NOT NULL DEFAULT 0 CHECK (expected_rows >= 0),
+          actual_rows INTEGER NOT NULL DEFAULT 0 CHECK (actual_rows >= 0),
+          source TEXT NOT NULL,
+          warning TEXT NOT NULL DEFAULT '',
+          error_summary TEXT NOT NULL DEFAULT '',
+          UNIQUE (run_id, symbol, dataset)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO market_capture_results (
+          id, run_id, symbol, dataset, status, data_start, data_end, data_time,
+          fetched_at, expected_rows, actual_rows, source, warning, error_summary
+        )
+        SELECT
+          id, run_id, symbol, dataset, status, data_start, data_end, data_time,
+          fetched_at, expected_rows, actual_rows, source, warning, error_summary
+        FROM market_capture_results_legacy
+        """
+    )
+    connection.execute("DROP TABLE market_capture_results_legacy")
 
 
 def _fail_duplicate_running_workflows(connection: sqlite3.Connection) -> None:
@@ -417,6 +542,20 @@ def _ensure_scheduler_state_columns(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE scheduler_state ADD COLUMN {name} {column_type}"
             )
+
+
+def _ensure_instrument_catalog_state_columns(connection: sqlite3.Connection) -> None:
+    existing = {
+        row[1]
+        for row in connection.execute(
+            "PRAGMA table_info(instrument_catalog_state)"
+        ).fetchall()
+    }
+    if "warnings_json" not in existing:
+        connection.execute(
+            "ALTER TABLE instrument_catalog_state "
+            "ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'"
+        )
 
 
 def _ensure_notification_columns(connection: sqlite3.Connection) -> None:

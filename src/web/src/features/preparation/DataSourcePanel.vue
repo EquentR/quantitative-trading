@@ -20,6 +20,7 @@ const checkMutation = useCheckDatasourceMutation()
 // API key lives only in this local ref; never persisted to Pinia or localStorage.
 const apiKey = ref('')
 const submitError = ref('')
+const operationError = ref('')
 
 const badge = computed(() => {
   const status = statusQuery.data.value?.status
@@ -29,6 +30,19 @@ const badge = computed(() => {
 })
 
 const isMissing = computed(() => statusQuery.data.value?.status === 'missing')
+const isInvalid = computed(() => statusQuery.data.value?.status === 'invalid')
+
+function operationErrorText(error: unknown, action: string) {
+  if (!(error instanceof ApiError)) return `${action}失败，请稍后重试`
+  const messages: Record<string, string> = {
+    datasource_not_configured: '数据源尚未配置',
+    datasource_invalid: 'API Key 无效，请重新配置',
+    datasource_quota_exceeded: '调用额度已耗尽，请稍后再试',
+    datasource_unavailable: '网络连接不可用，请稍后重试',
+    datasource_contract_error: '供应商响应格式异常',
+  }
+  return `${action}失败：${messages[error.code] ?? error.message}`
+}
 
 async function onSubmitKey() {
   if (!apiKey.value) return
@@ -49,11 +63,21 @@ async function onSubmitKey() {
 
 async function onResetKey() {
   if (!window.confirm('重置仅清除本地行情数据源凭证，不影响账户持仓。确认继续？')) return
-  await deleteMutation.mutateAsync()
+  operationError.value = ''
+  try {
+    await deleteMutation.mutateAsync()
+  } catch (error) {
+    operationError.value = operationErrorText(error, '重置')
+  }
 }
 
 async function onCheck() {
-  await checkMutation.mutateAsync()
+  operationError.value = ''
+  try {
+    await checkMutation.mutateAsync()
+  } catch (error) {
+    operationError.value = operationErrorText(error, '检查')
+  }
 }
 </script>
 
@@ -66,8 +90,16 @@ async function onCheck() {
       行情数据源尚未配置，请提交 API Key。
     </Alert>
 
+    <Alert v-if="isInvalid" variant="danger">
+      东方财富 API Key 无效，请重新配置。
+    </Alert>
+
     <Alert v-if="submitError" variant="danger">
       {{ submitError }}
+    </Alert>
+
+    <Alert v-if="operationError" variant="danger">
+      {{ operationError }}
     </Alert>
 
     <div class="space-y-1 text-sm">

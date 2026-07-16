@@ -18,6 +18,19 @@ from quantitative_trading.email.outbox import (
 )
 from quantitative_trading.email.repository import SmtpSettingsRepository
 from quantitative_trading.email.service import SmtpSettingsService
+from quantitative_trading.datasource.miaoxiang import (
+    RemoteWatchlistItem,
+    RemoteWatchlistResult,
+)
+from quantitative_trading.datasource.status import DatasourceCredentialsRepository
+from quantitative_trading.instrument.adapters import InstrumentDirectorySnapshot
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
+from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.market.adapters import MarketProviderError
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
@@ -62,6 +75,26 @@ def run_cli(
     if env is not None:
         cli_env.update(env)
     return runner.invoke(app, [*args], env=cli_env, input=input)
+
+
+def seed_cli_verified_a_shares(tmp_path: Path, *symbols: str) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = InstrumentRepository(connection)
+        existing = {item.symbol: item for item in repository.list_active()}
+        for symbol in symbols:
+            existing[symbol] = InstrumentMetadata(
+                symbol=symbol,
+                name=symbol,
+                exchange=Exchange.SH,
+                instrument_type=InstrumentType.A_SHARE,
+                settlement_cycle=SettlementCycle.T1,
+                metadata_source="test-directory",
+                metadata_checked_at=datetime(2026, 7, 15, 2, 0, tzinfo=UTC),
+                rule_version="test-rules-v1",
+            )
+        repository.replace_catalog(list(existing.values()))
 
 
 def test_ledger_add_and_list(tmp_path) -> None:
@@ -191,6 +224,7 @@ def test_ledger_import_reports_missing_file_error(tmp_path) -> None:
 
 
 def test_watchlist_add_list_update_and_remove(tmp_path) -> None:
+    seed_cli_verified_a_shares(tmp_path, "600000")
     add_result = run_cli(
         tmp_path,
         "watchlist",
@@ -237,7 +271,13 @@ def test_watchlist_add_list_update_and_remove(tmp_path) -> None:
     assert "暂无观察股" in empty_result.output
 
 
-def test_watchlist_import_and_export(tmp_path) -> None:
+def test_watchlist_import_and_export(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli.AkShareInstrumentDirectoryAdapter,
+        "fetch",
+        lambda self, trade_date: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    seed_cli_verified_a_shares(tmp_path, "600000")
     csv_path = tmp_path / "watchlist.csv"
     csv_path.write_text(
         "symbol,name,rank,plan_enabled,note\n600000,浦发银行,1,true,观察\n",
@@ -252,6 +292,26 @@ def test_watchlist_import_and_export(tmp_path) -> None:
     assert export_result.exit_code == 0
     assert "symbol,name,rank,plan_enabled,note" in export_result.output
     assert "600000,浦发银行,1,true,观察" in export_result.output
+
+
+def test_watchlist_import_prints_metadata_warning(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli.AkShareInstrumentDirectoryAdapter,
+        "fetch",
+        lambda self, trade_date: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+    csv_path = tmp_path / "watchlist-unknown.csv"
+    csv_path.write_text(
+        "symbol,name,rank,plan_enabled,note\n123456,未知证券,1,true,观察\n",
+        encoding="utf-8",
+    )
+
+    result = run_cli(tmp_path, "watchlist", "import", str(csv_path))
+
+    assert result.exit_code == 0
+    assert "已导入 1 条观察" in result.output
+    assert "warning: 证券目录不可用" in result.output
+    assert "warning: 123456 instrument metadata is unavailable or unverified" in result.output
 
 
 def test_watchlist_import_reports_missing_file_error(tmp_path) -> None:
@@ -278,6 +338,119 @@ def test_watchlist_import_reports_invalid_header_error(tmp_path) -> None:
     assert "导入观察失败" in result.output
     assert "CSV header must exactly match" in result.output
     assert "Traceback" not in result.output
+
+
+def test_watchlist_blank_search_fails_before_directory_refresh(tmp_path, monkeypatch) -> None:
+    called = False
+
+    def unexpected_fetch(self, trade_date):  # noqa: ANN001, ARG001
+        nonlocal called
+        called = True
+        raise AssertionError("directory fetch must not run")
+
+    monkeypatch.setattr(cli.AkShareInstrumentDirectoryAdapter, "fetch", unexpected_fetch)
+
+    result = run_cli(tmp_path, "watchlist", "search", "   ")
+
+    assert result.exit_code != 0
+    assert "must not be blank" in result.output
+    assert called is False
+
+
+def _configure_cli_eastmoney_key(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "ledger.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        DatasourceCredentialsRepository(connection).save_secret(
+            "eastmoney",
+            "synthetic-key",
+            now=datetime(2026, 7, 15, 2, 0, tzinfo=UTC),
+        )
+
+
+def _patch_cli_instrument_adapters(monkeypatch) -> None:
+    class FakeWatchlistAdapter:
+        def fetch(self, api_key: str) -> RemoteWatchlistResult:
+            assert api_key == "synthetic-key"
+            return RemoteWatchlistResult(
+                items=[RemoteWatchlistItem("510300", "供应商名称", 1)],
+                warnings=[],
+            )
+
+    class FakeDirectoryAdapter:
+        sources = ("test-directory",)
+
+        def fetch(self, trade_date: date) -> InstrumentDirectorySnapshot:
+            return InstrumentDirectorySnapshot(
+                items=[
+                    InstrumentMetadata(
+                        symbol="510300",
+                        name="沪深300ETF",
+                        exchange=Exchange.SH,
+                        instrument_type=InstrumentType.ETF,
+                        settlement_cycle=SettlementCycle.T1,
+                        metadata_source="test-directory",
+                        metadata_checked_at=datetime(2026, 7, 15, 2, 0, tzinfo=UTC),
+                        rule_version="test-rules-v1",
+                    )
+                ],
+                source_trade_dates={"test-directory": trade_date},
+                warnings=[],
+            )
+
+    monkeypatch.setattr(cli, "MiaoxiangWatchlistAdapter", FakeWatchlistAdapter)
+    monkeypatch.setattr(cli, "AkShareInstrumentDirectoryAdapter", FakeDirectoryAdapter)
+
+
+def test_watchlist_sync_only_previews_until_symbols_are_explicit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _configure_cli_eastmoney_key(tmp_path)
+    _patch_cli_instrument_adapters(monkeypatch)
+
+    preview = run_cli(tmp_path, "watchlist", "sync")
+    before = run_cli(tmp_path, "watchlist", "list")
+    selected = run_cli(
+        tmp_path,
+        "watchlist",
+        "sync",
+        "--symbols",
+        "510300",
+    )
+    after = run_cli(tmp_path, "watchlist", "list")
+
+    assert preview.exit_code == 0, preview.output
+    assert "preview_id=" in preview.output
+    assert "候选=1 可选择=1 已监控=0" in preview.output
+    assert "暂无观察股" in before.output
+    assert selected.exit_code == 0, selected.output
+    assert "已加入监控 1 条" in selected.output
+    assert "510300" in after.output
+    assert "计划=true" in after.output
+
+
+def test_watchlist_search_then_select_reuses_persisted_preview(tmp_path, monkeypatch) -> None:
+    _patch_cli_instrument_adapters(monkeypatch)
+
+    search = run_cli(tmp_path, "watchlist", "search", "沪深")
+    preview_line = next(
+        line for line in search.output.splitlines() if line.startswith("preview_id=")
+    )
+    preview_id = preview_line.partition("=")[2]
+    selected = run_cli(
+        tmp_path,
+        "watchlist",
+        "select",
+        preview_id,
+        "--symbols",
+        "510300",
+    )
+
+    assert search.exit_code == 0, search.output
+    assert "510300 沪深300ETF etf SH t1" in search.output
+    assert selected.exit_code == 0, selected.output
+    assert "已加入监控 1 条" in selected.output
 
 
 def test_service_check_reads_ledger(tmp_path) -> None:
@@ -711,6 +884,7 @@ def test_market_snapshot_captures_decision_enabled_symbols(
     monkeypatch,
     tmp_path,
 ) -> None:
+    seed_cli_verified_a_shares(tmp_path, "000001", "600000")
     class FakeAkShareMarketProvider:
         calls: list[list[str]] = []
 
@@ -1085,6 +1259,7 @@ def test_market_backfill_defaults_to_decision_enabled_universe_and_json(
     monkeypatch,
     tmp_path,
 ) -> None:
+    seed_cli_verified_a_shares(tmp_path, "000001", "600000")
     install_cli_heavy_providers(monkeypatch)
     run_cli(
         tmp_path,
@@ -1165,6 +1340,7 @@ def test_market_backfill_explicit_symbols_filter_enabled_universe_and_reuse_run(
     monkeypatch,
     tmp_path,
 ) -> None:
+    seed_cli_verified_a_shares(tmp_path, "600000", "000001")
     install_cli_heavy_providers(monkeypatch)
     for symbol in ("600000", "000001"):
         run_cli(
@@ -1330,6 +1506,7 @@ def test_market_runs_lists_latest_run_with_limit_and_json(tmp_path) -> None:
             "degraded": 1,
             "failed": 0,
             "stale": 0,
+            "not_applicable": 0,
         }
     }
 
@@ -1382,6 +1559,7 @@ def test_market_backfill_sparse_usable_data_is_degraded_not_failed(
     monkeypatch,
     tmp_path,
 ) -> None:
+    seed_cli_verified_a_shares(tmp_path, "600000")
     class SparseDailyProvider(CliDailyProvider):
         def get_daily_bars(self, symbol, start_date, end_date, adjustment):
             return super().get_daily_bars(symbol, end_date, end_date, adjustment)
@@ -1427,6 +1605,7 @@ def test_market_backfill_provider_failures_persist_failed_run_and_safe_errors(
     monkeypatch,
     tmp_path,
 ) -> None:
+    seed_cli_verified_a_shares(tmp_path, "600000")
     class RaisingDailyProvider:
         def __init__(self, *args, **kwargs) -> None:
             pass

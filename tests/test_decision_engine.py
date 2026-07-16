@@ -12,10 +12,34 @@ from quantitative_trading.decision.models import DecisionSymbolInput
 from quantitative_trading.decision.service import decide_symbol
 from quantitative_trading.recommendation.models import RecommendationAction
 from quantitative_trading.risk.models import RiskConfig, RiskContext
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
 
 
 NOW = datetime(2026, 7, 9, 2, 30, tzinfo=UTC)
 VALID_UNTIL = datetime(2026, 7, 9, 7, 0, tzinfo=UTC)
+
+
+def instrument_metadata(
+    *,
+    instrument_type: InstrumentType = InstrumentType.A_SHARE,
+    settlement: SettlementCycle = SettlementCycle.T1,
+) -> InstrumentMetadata:
+    return InstrumentMetadata(
+        symbol="600000",
+        name="浦发银行",
+        exchange=Exchange.SH if instrument_type is not InstrumentType.UNKNOWN else None,
+        instrument_type=instrument_type,
+        settlement_cycle=settlement,
+        price_limit_ratio=0.10 if instrument_type is not InstrumentType.UNKNOWN else None,
+        metadata_source="exchange_catalog",
+        metadata_checked_at=NOW,
+        rule_version="instrument-rules-v1",
+    )
 
 
 def account_snapshot() -> AccountSnapshot:
@@ -59,6 +83,7 @@ def decision_input(**overrides: object) -> DecisionSymbolInput:
     data: dict[str, object] = {
         "symbol": "600000",
         "name": "浦发银行",
+        "instrument": instrument_metadata(),
         "is_holding": False,
         "current_price": 10.5,
         "support_price": 9.7,
@@ -314,3 +339,68 @@ def test_holding_risk_action_at_price_limit_warns_execution_may_fail() -> None:
 
     assert recommendation.action is RecommendationAction.SELL
     assert any("可能无法成交" in reason for reason in recommendation.reason)
+
+
+def test_unknown_instrument_gate_runs_before_holding_stop_loss() -> None:
+    recommendation = decide_symbol(
+        decision_input(
+            instrument=instrument_metadata(
+                instrument_type=InstrumentType.UNKNOWN,
+                settlement=SettlementCycle.UNKNOWN,
+            ),
+            is_holding=True,
+            current_price=9.2,
+            position_context={
+                "source": "manual_ledger",
+                "quantity": 1000,
+                "available_quantity": 1000,
+                "market_value": 9200,
+            },
+        ),
+        account_snapshot=account_snapshot(),
+        risk_config=RiskConfig(),
+        risk_context=RiskContext(),
+        recommendation_id="rec-unknown-hold",
+        created_at=NOW,
+    )
+
+    assert recommendation.action is RecommendationAction.HOLD
+    assert "instrument_metadata_unknown" in recommendation.risk["machine_reason"]
+
+
+def test_t0_available_quantity_gate_does_not_claim_t1() -> None:
+    metadata = InstrumentMetadata(
+        symbol="510300",
+        name="沪深300ETF",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.ETF,
+        settlement_cycle=SettlementCycle.T0,
+        price_limit_ratio=0.10,
+        metadata_source="exchange_catalog",
+        metadata_checked_at=NOW,
+        rule_version="instrument-rules-v1",
+    )
+    recommendation = decide_symbol(
+        decision_input(
+            symbol="510300",
+            name="沪深300ETF",
+            instrument=metadata,
+            is_holding=True,
+            current_price=9.2,
+            position_context={
+                "source": "manual_ledger",
+                "quantity": 1000,
+                "available_quantity": 0,
+                "market_value": 9200,
+            },
+        ),
+        account_snapshot=account_snapshot(),
+        risk_config=RiskConfig(),
+        risk_context=RiskContext(instrument=metadata),
+        recommendation_id="rec-etf-t0-hold",
+        created_at=NOW,
+    )
+
+    assert recommendation.action is RecommendationAction.HOLD
+    assert all("T+1" not in note for note in recommendation.risk["notes"])
+    assert recommendation.instrument == metadata

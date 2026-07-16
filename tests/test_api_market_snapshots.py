@@ -7,7 +7,15 @@ from fastapi.testclient import TestClient
 from quantitative_trading.api.app import create_app
 from quantitative_trading.api.routes import market as market_routes
 from quantitative_trading.config import Settings
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
+from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.market.models import QuoteSnapshot, QuoteStatus
+from quantitative_trading.storage.sqlite import connect
 
 
 FETCHED_AT = datetime(2026, 7, 13, 2, 30, 3, tzinfo=UTC)
@@ -45,6 +53,7 @@ def authenticated_client(
     monkeypatch,
     *,
     provider=None,
+    etf_provider=None,
     settings_overrides: dict[str, object] | None = None,
     raise_server_exceptions: bool = True,
 ) -> tuple[TestClient, dict[str, str]]:
@@ -53,6 +62,12 @@ def authenticated_client(
             market_routes,
             "market_provider_from_settings",
             lambda settings: provider,
+        )
+    if etf_provider is not None:
+        monkeypatch.setattr(
+            market_routes,
+            "etf_market_provider_from_settings",
+            lambda settings, **kwargs: etf_provider,
         )
 
     settings = Settings(
@@ -69,7 +84,23 @@ def authenticated_client(
     return client, {"Authorization": f"Bearer {login.json()['access_token']}"}
 
 
-def seed_decision_universe(client: TestClient, headers: dict[str, str]) -> None:
+def seed_decision_universe(client: TestClient, headers: dict[str, str], tmp_path) -> None:
+    with connect(Settings(database_path=tmp_path / "api.db")) as connection:
+        InstrumentRepository(connection).replace_catalog(
+            [
+                InstrumentMetadata(
+                    symbol=symbol,
+                    name=f"Name {symbol}",
+                    exchange=Exchange.SZ,
+                    instrument_type=InstrumentType.A_SHARE,
+                    settlement_cycle=SettlementCycle.T1,
+                    metadata_source="test-directory",
+                    metadata_checked_at=FETCHED_AT,
+                    rule_version="test-rules-v1",
+                )
+                for symbol in ("000001", "000002", "600000")
+            ]
+        )
     client.post(
         "/api/v1/positions",
         json={
@@ -122,7 +153,7 @@ def assert_storage_error_is_sanitized(response) -> None:
 def test_create_market_snapshot_and_read_latest_and_detail(tmp_path, monkeypatch) -> None:
     provider = RecordingMarketProvider()
     client, headers = authenticated_client(tmp_path, monkeypatch, provider=provider)
-    seed_decision_universe(client, headers)
+    seed_decision_universe(client, headers, tmp_path)
 
     created = client.post("/api/v1/market/snapshots", headers=headers)
 
@@ -149,6 +180,74 @@ def test_create_market_snapshot_and_read_latest_and_detail(tmp_path, monkeypatch
     assert detail.status_code == 200
     assert detail.json() == snapshot
     assert provider.calls == [["000001", "600000"]]
+
+
+def test_create_market_snapshot_routes_etf_to_etf_provider(tmp_path, monkeypatch) -> None:
+    a_share_provider = RecordingMarketProvider()
+    etf_provider = RecordingMarketProvider()
+    client, headers = authenticated_client(
+        tmp_path,
+        monkeypatch,
+        provider=a_share_provider,
+        etf_provider=etf_provider,
+    )
+    with connect(Settings(database_path=tmp_path / "api.db")) as connection:
+        InstrumentRepository(connection).replace_catalog(
+            [
+                InstrumentMetadata(
+                    symbol="600000",
+                    name="A share",
+                    exchange=Exchange.SH,
+                    instrument_type=InstrumentType.A_SHARE,
+                    settlement_cycle=SettlementCycle.T1,
+                    price_limit_ratio=0.1,
+                    metadata_source="test-directory",
+                    metadata_checked_at=FETCHED_AT,
+                    rule_version="test-rules-v1",
+                ),
+                InstrumentMetadata(
+                    symbol="510300",
+                    name="ETF",
+                    exchange=Exchange.SH,
+                    instrument_type=InstrumentType.ETF,
+                    settlement_cycle=SettlementCycle.T1,
+                    price_limit_ratio=0.1,
+                    metadata_source="test-directory",
+                    metadata_checked_at=FETCHED_AT,
+                    rule_version="test-rules-v1",
+                ),
+            ]
+        )
+    client.post(
+        "/api/v1/positions",
+        json={
+            "symbol": "600000",
+            "name": "A share",
+            "quantity": 100,
+            "available_quantity": 100,
+            "cost_price": 10,
+            "opened_at": "2026-07-06",
+            "note": "",
+        },
+        headers=headers,
+    )
+    client.post(
+        "/api/v1/watchlist/pinned",
+        json={
+            "symbol": "510300",
+            "name": "ETF",
+            "rank": 1,
+            "plan_enabled": True,
+            "note": "",
+        },
+        headers=headers,
+    )
+
+    response = client.post("/api/v1/market/snapshots", headers=headers)
+
+    assert response.status_code == 201
+    assert a_share_provider.calls == [["600000"]]
+    assert etf_provider.calls == [["510300"]]
 
 
 def test_market_snapshot_routes_require_authentication(tmp_path, monkeypatch) -> None:
@@ -315,7 +414,7 @@ def test_provider_exception_still_creates_traceable_market_snapshot(
         monkeypatch,
         provider=RaisingMarketProvider(),
     )
-    seed_decision_universe(client, headers)
+    seed_decision_universe(client, headers, tmp_path)
 
     response = client.post("/api/v1/market/snapshots", headers=headers)
 
@@ -327,7 +426,7 @@ def test_provider_exception_still_creates_traceable_market_snapshot(
 
 def test_create_market_snapshot_storage_error_is_sanitized(tmp_path, monkeypatch) -> None:
     class BrokenMarketSnapshotService:
-        def __init__(self, connection, provider) -> None:
+        def __init__(self, connection, provider, *, etf_provider=None) -> None:
             pass
 
         def capture(self):
@@ -354,7 +453,7 @@ def test_create_market_snapshot_storage_error_is_sanitized(tmp_path, monkeypatch
 
 def test_create_market_snapshot_value_error_is_sanitized(tmp_path, monkeypatch) -> None:
     class BrokenMarketSnapshotService:
-        def __init__(self, connection, provider) -> None:
+        def __init__(self, connection, provider, *, etf_provider=None) -> None:
             pass
 
         def capture(self):

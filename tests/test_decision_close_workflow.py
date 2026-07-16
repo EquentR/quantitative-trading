@@ -23,6 +23,7 @@ from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.market.adapters import MarketProviderError
 from quantitative_trading.market.backfill import HeavyDataBackfillService
 from quantitative_trading.market.calendar import XSHGTradingCalendar
+from quantitative_trading.market.cli_service import MarketCliService
 from quantitative_trading.market.models import (
     CaptureDataset,
     CaptureResultStatus,
@@ -52,6 +53,15 @@ from quantitative_trading.planning.repository import TradingPlanRepository
 from quantitative_trading.recommendation.models import RecommendationAction
 from quantitative_trading.recommendation.repository import RecommendationRepository
 from quantitative_trading.storage.sqlite import connect, migrate
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
+from quantitative_trading.instrument.repository import InstrumentRepository
+from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
+from quantitative_trading.watchlist.repository import WatchPinnedRepository
 
 
 TRADE_DATE = date(2026, 7, 13)
@@ -225,6 +235,11 @@ class FailingFlowProvider:
         raise MarketProviderError("synthetic flow outage")
 
 
+class UnexpectedProvider:
+    def __getattr__(self, name):
+        raise AssertionError(f"unexpected provider access: {name}")
+
+
 class FailingRecommendationDispatcher:
     def dispatch_recommendation(self, recommendation, *, plan_version, now):
         del recommendation, plan_version, now
@@ -311,6 +326,82 @@ def test_close_workflow_builds_traceable_next_day_plan_and_is_idempotent(
         )
 
 
+def test_close_workflow_routes_etf_and_skips_money_flow_provider(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "close-etf-workflow.db")
+    calendar = XSHGTradingCalendar()
+    metadata = InstrumentMetadata(
+        symbol="510300",
+        name="沪深300ETF",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.ETF,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="exchange_catalog",
+        metadata_checked_at=NOW,
+        rule_version="instrument-rules-v1",
+    )
+    etf_quote_provider = RecordingQuoteProvider()
+    etf_daily_provider = CalendarDailyProvider(calendar)
+    flow_provider = CalendarFlowProvider(calendar)
+
+    with connect(settings) as connection:
+        migrate(connection)
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="510300",
+                name="沪深300ETF",
+                quantity=1000,
+                available_quantity=1000,
+                cost_price=7.0,
+                opened_at=date(2026, 7, 1),
+            ),
+            now=datetime(2026, 7, 12, 8, 0, tzinfo=UTC),
+        )
+        CashAccountRepository(connection).initialize(50_000, now=NOW, note="initial")
+        workflow = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=UnexpectedProvider(),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=flow_provider,
+            intraday_provider=NoopIntradayProvider(),
+            etf_quote_provider=etf_quote_provider,
+            etf_daily_provider=etf_daily_provider,
+            etf_intraday_provider=NoopIntradayProvider(),
+            instrument_metadata_loader=lambda symbols: {
+                symbol: metadata for symbol in symbols if symbol == metadata.symbol
+            },
+            now=lambda: NOW,
+        )
+
+        result = workflow.run_close(TRADE_DATE)
+        plan = TradingPlanRepository(connection).get(result.plan_id)
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        capture_run = MarketCaptureRunRepository(connection).get(result.run_id)
+        capture_results = MarketCaptureResultRepository(connection).list_for_run(
+            result.run_id
+        )
+
+    flow_result = next(
+        item for item in capture_results if item.dataset is CaptureDataset.MONEY_FLOW
+    )
+    assert flow_provider.calls == []
+    assert etf_quote_provider.calls == [["510300"]]
+    assert {call[0] for call in etf_daily_provider.calls} == {"510300"}
+    assert flow_result.status is CaptureResultStatus.NOT_APPLICABLE
+    assert market_input is not None
+    assert market_input.instrument_metadata["510300"] == metadata
+    assert market_input.money_flow_snapshot_refs == {}
+    assert plan is not None
+    assert plan.data_quality == "complete"
+    assert plan.symbol_contexts["510300"].instrument == metadata
+    assert capture_run is not None
+    assert capture_run.status is CaptureRunStatus.SUCCEEDED
+    assert capture_run.provider_calls == 2
+
+
 def test_close_workflow_empty_universe_saves_warning_without_publishing_plan(
     tmp_path,
 ) -> None:
@@ -356,6 +447,120 @@ def test_close_workflow_empty_universe_saves_warning_without_publishing_plan(
     assert snapshot.money_flow_snapshot_refs == {}
     assert snapshot.warnings == ["决策启用集合为空"]
     assert first.warnings == ("决策启用集合为空",)
+
+
+def test_close_workflow_unknown_holding_calls_no_market_provider(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "close-unknown.db")
+    calendar = XSHGTradingCalendar()
+    metadata = InstrumentMetadata(
+        symbol="900001",
+        name="Unknown",
+        exchange=None,
+        instrument_type=InstrumentType.UNKNOWN,
+        settlement_cycle=SettlementCycle.UNKNOWN,
+        metadata_source="legacy-unverified",
+        metadata_checked_at=NOW,
+        rule_version="unverified-v1",
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="900001",
+                name="Unknown",
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=date(2026, 7, 1),
+            ),
+            now=NOW,
+        )
+        CashAccountRepository(connection).initialize(50_000, now=NOW, note="initial")
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=UnexpectedProvider(),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=UnexpectedProvider(),
+            intraday_provider=UnexpectedProvider(),
+            instrument_metadata_loader=lambda symbols: {
+                symbol: metadata for symbol in symbols
+            },
+            now=lambda: NOW,
+        ).run_close(TRADE_DATE)
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+        capture_results = MarketCaptureResultRepository(connection).list_for_run(
+            result.run_id
+        )
+
+    assert result.ready is False
+    assert run is not None
+    assert run.provider_calls == 0
+    assert {
+        item.dataset: item.status for item in capture_results
+    } == {
+        CaptureDataset.QUOTE: CaptureResultStatus.FAILED,
+        CaptureDataset.DAILY_BAR: CaptureResultStatus.FAILED,
+        CaptureDataset.MONEY_FLOW: CaptureResultStatus.FAILED,
+    }
+
+
+def test_intraday_unknown_holding_emits_conservative_hold_without_fake_market_time(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-unknown-holding.db")
+    calendar = XSHGTradingCalendar()
+    started_at = datetime(2026, 7, 13, 6, 0, tzinfo=UTC)
+    metadata_checked_at = datetime(2026, 7, 12, 6, 0, tzinfo=UTC)
+    metadata = InstrumentMetadata(
+        symbol="900001",
+        name="Unknown",
+        exchange=None,
+        instrument_type=InstrumentType.UNKNOWN,
+        settlement_cycle=SettlementCycle.UNKNOWN,
+        metadata_source="legacy-unverified",
+        metadata_checked_at=metadata_checked_at,
+        rule_version="unverified-v1",
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="900001",
+                name="Unknown",
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=date(2026, 7, 1),
+            ),
+            now=metadata_checked_at,
+        )
+        CashAccountRepository(connection).initialize(
+            50_000, now=metadata_checked_at, note="initial"
+        )
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=UnexpectedProvider(),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=UnexpectedProvider(),
+            intraday_provider=UnexpectedProvider(),
+            instrument_metadata_loader=lambda symbols: {
+                symbol: metadata for symbol in symbols
+            },
+            now=lambda: started_at,
+        ).run_intraday()
+        recommendations = RecommendationRepository(connection).list(limit=10)
+
+    assert result.status is CaptureRunStatus.FAILED
+    assert len(recommendations) == 1
+    recommendation = recommendations[0]
+    assert recommendation.action is RecommendationAction.HOLD
+    assert recommendation.data_time == metadata_checked_at
+    assert recommendation.data_quality["data_time_source"] == "instrument_metadata"
+    assert recommendation.price_context["market_data_time"] is None
+    assert "instrument_metadata_unknown" in recommendation.risk["machine_reason"]
+    assert any("不代表行情时间" in warning for warning in recommendation.data_quality["warnings"])
 
 
 def test_close_workflow_rejects_concurrent_active_run_without_calling_provider(
@@ -1083,6 +1288,88 @@ def test_decision_workflow_exposes_idempotent_backfill_and_cleanup(tmp_path) -> 
     assert cleanup_again.reused is True
 
 
+def test_backfill_routes_etf_daily_marks_flow_not_applicable_and_skips_unknown(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "mixed-backfill.db")
+    calendar = XSHGTradingCalendar()
+    a_share_daily = CalendarDailyProvider(calendar)
+    etf_daily = CalendarDailyProvider(calendar)
+    flow = CalendarFlowProvider(calendar)
+    with connect(settings) as connection:
+        migrate(connection)
+        InstrumentRepository(connection).replace_catalog(
+            [
+                InstrumentMetadata(
+                    symbol="600000",
+                    name="A share",
+                    exchange=Exchange.SH,
+                    instrument_type=InstrumentType.A_SHARE,
+                    settlement_cycle=SettlementCycle.T1,
+                    price_limit_ratio=0.1,
+                    metadata_source="test-directory",
+                    metadata_checked_at=NOW,
+                    rule_version="test-rules-v1",
+                ),
+                InstrumentMetadata(
+                    symbol="510300",
+                    name="ETF",
+                    exchange=Exchange.SH,
+                    instrument_type=InstrumentType.ETF,
+                    settlement_cycle=SettlementCycle.T1,
+                    price_limit_ratio=0.1,
+                    metadata_source="test-directory",
+                    metadata_checked_at=NOW,
+                    rule_version="test-rules-v1",
+                ),
+                InstrumentMetadata(
+                    symbol="900001",
+                    name="Unknown",
+                    exchange=None,
+                    instrument_type=InstrumentType.UNKNOWN,
+                    settlement_cycle=SettlementCycle.UNKNOWN,
+                    metadata_source="legacy-unverified",
+                    metadata_checked_at=NOW,
+                    rule_version="test-rules-v1",
+                ),
+            ]
+        )
+        for symbol in ("600000", "510300", "900001"):
+            PositionRepository(connection).add(
+                PositionInput(
+                    symbol=symbol,
+                    name=symbol,
+                    quantity=100,
+                    available_quantity=100,
+                    cost_price=10,
+                    opened_at=date(2026, 7, 1),
+                ),
+                now=NOW,
+            )
+        summary = MarketCliService(
+            connection,
+            calendar=calendar,
+            daily_provider=a_share_daily,
+            etf_daily_provider=etf_daily,
+            money_flow_provider=flow,
+            now=lambda: NOW,
+        ).backfill(TRADE_DATE)
+
+    assert [call[0] for call in a_share_daily.calls] == ["600000"]
+    assert [call[0] for call in etf_daily.calls] == ["510300"]
+    assert [call[0] for call in flow.calls] == ["600000"]
+    assert summary.provider_calls == 3
+    by_symbol_dataset = {
+        (result.symbol, result.dataset): result for result in summary.results
+    }
+    assert (
+        by_symbol_dataset[("510300", CaptureDataset.MONEY_FLOW)].status
+        is CaptureResultStatus.NOT_APPLICABLE
+    )
+    assert by_symbol_dataset[("900001", CaptureDataset.DAILY_BAR)].status is CaptureResultStatus.FAILED
+    assert by_symbol_dataset[("900001", CaptureDataset.MONEY_FLOW)].status is CaptureResultStatus.FAILED
+
+
 def test_maintenance_workflows_reject_concurrent_active_runs(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "maintenance-concurrent.db")
     calendar = XSHGTradingCalendar()
@@ -1368,6 +1655,150 @@ def test_intraday_workflow_consumes_plan_and_is_idempotent_per_three_minute_cycl
     assert run.recommendation_count == 1
     assert run.notification_count == 1
     assert run.email_outbox_count == 1
+
+
+def test_intraday_captures_enabled_watch_without_creating_decision_outputs(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-display-only.db")
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    metadata = InstrumentMetadata(
+        symbol="000001",
+        name="平安银行",
+        exchange=Exchange.SZ,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="test-directory",
+        metadata_checked_at=clock.value,
+        rule_version="test-rules-v1",
+    )
+    quote_provider = ClockQuoteProvider(clock)
+    minute_provider = RisingIntradayProvider(calendar, clock)
+
+    with connect(settings) as connection:
+        migrate(connection)
+        InstrumentRepository(connection).replace_catalog([metadata])
+        WatchPinnedRepository(connection).upsert(
+            WatchPinnedInput(
+                symbol=metadata.symbol,
+                name=metadata.name,
+                rank=1,
+                plan_enabled=True,
+            ),
+            source=WatchPinnedSource.MANUAL,
+            now=clock.value,
+        )
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=quote_provider,
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=UnexpectedProvider(),
+            intraday_provider=minute_provider,
+            instrument_metadata_loader=lambda symbols: {
+                symbol: metadata for symbol in symbols
+            },
+            now=clock.now,
+        ).run_intraday()
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        account_snapshot_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM account_snapshots"
+        ).fetchone()["count"]
+
+    assert quote_provider.calls == [[metadata.symbol]]
+    assert minute_provider.calls == [(metadata.symbol, clock.value.date(), "1m")]
+    assert market_input is not None
+    assert market_input.quote_snapshot_refs[metadata.symbol] > 0
+    assert market_input.intraday_strength_snapshot_refs[metadata.symbol] > 0
+    assert result.recommendation_ids == ()
+    assert account_snapshot_count == 0
+    assert run is not None
+    assert run.requested_symbols == 1
+    assert run.processed_symbols == 1
+    assert run.provider_calls == 2
+    assert run.recommendation_count == 0
+    assert run.notification_count == 0
+
+
+def test_intraday_workflow_routes_etf_metadata_into_recommendation(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-etf-workflow.db")
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(NOW)
+    metadata = InstrumentMetadata(
+        symbol="510300",
+        name="沪深300ETF",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.ETF,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="exchange_catalog",
+        metadata_checked_at=NOW,
+        rule_version="instrument-rules-v1",
+    )
+    loader = lambda symbols: {symbol: metadata for symbol in symbols}
+    daily_provider = CalendarDailyProvider(calendar)
+    flow_provider = CalendarFlowProvider(calendar)
+
+    with connect(settings) as connection:
+        migrate(connection)
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="510300",
+                name="沪深300ETF",
+                quantity=1000,
+                available_quantity=1000,
+                cost_price=7.0,
+                opened_at=date(2026, 7, 1),
+            ),
+            now=datetime(2026, 7, 12, 8, 0, tzinfo=UTC),
+        )
+        CashAccountRepository(connection).initialize(50_000, now=NOW, note="initial")
+        DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=UnexpectedProvider(),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=flow_provider,
+            intraday_provider=NoopIntradayProvider(),
+            etf_quote_provider=ClockQuoteProvider(clock),
+            etf_daily_provider=daily_provider,
+            etf_intraday_provider=NoopIntradayProvider(),
+            instrument_metadata_loader=loader,
+            now=clock.now,
+        ).run_close(TRADE_DATE)
+
+        clock.value = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
+        minute_provider = RisingIntradayProvider(calendar, clock)
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=UnexpectedProvider(),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=flow_provider,
+            intraday_provider=NoopIntradayProvider(),
+            etf_quote_provider=ClockQuoteProvider(clock),
+            etf_daily_provider=daily_provider,
+            etf_intraday_provider=minute_provider,
+            instrument_metadata_loader=loader,
+            now=clock.now,
+        ).run_intraday()
+        recommendation = RecommendationRepository(connection).list(limit=1)[0]
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+
+    assert minute_provider.calls == [("510300", date(2026, 7, 14), "1m")]
+    assert flow_provider.calls == []
+    assert recommendation.instrument == metadata
+    assert recommendation.data_references["money_flow"]["status"] == "not_applicable"
+    assert recommendation.data_quality["overall"] == "complete"
+    assert market_input is not None
+    assert market_input.instrument_metadata["510300"] == metadata
 
 
 def test_intraday_reuse_repairs_failed_notification_projections_idempotently(
@@ -1786,6 +2217,36 @@ def test_cross_day_market_time_is_stale_for_every_supported_threshold(
         datetime(2026, 7, 13, 7, 0, tzinfo=UTC),
         datetime(2026, 7, 14, 2, 0, tzinfo=UTC),
     ) > threshold
+
+
+@pytest.mark.parametrize(
+    ("data_time", "observed_at"),
+    [
+        (
+            datetime(2026, 7, 16, 6, 6, 54, tzinfo=UTC),
+            datetime(2026, 7, 16, 6, 6, 52, tzinfo=UTC),
+        ),
+        (
+            datetime(2026, 7, 16, 6, 8, 0, tzinfo=UTC),
+            datetime(2026, 7, 16, 6, 7, 22, tzinfo=UTC),
+        ),
+    ],
+)
+def test_subminute_provider_clock_skew_is_not_stale(
+    data_time: datetime,
+    observed_at: datetime,
+) -> None:
+    assert _trading_minute_lag(
+        XSHGTradingCalendar(), data_time, observed_at
+    ) == 0
+
+
+def test_material_future_market_time_is_stale() -> None:
+    assert _trading_minute_lag(
+        XSHGTradingCalendar(),
+        datetime(2026, 7, 16, 6, 8, 1, tzinfo=UTC),
+        datetime(2026, 7, 16, 6, 7, 0, tzinfo=UTC),
+    ) == float("inf")
 
 
 def test_intraday_failure_persists_minute_and_strength_results(tmp_path) -> None:

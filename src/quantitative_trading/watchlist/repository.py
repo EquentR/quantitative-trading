@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from pydantic import ValidationError
 
 from quantitative_trading.watchlist.models import (
     WatchPinnedInput,
+    WatchPinnedImportResult,
     WatchPinnedItem,
     WatchPinnedSource,
 )
@@ -38,15 +40,25 @@ class WatchPinnedRepository:
         rows = self.connection.execute(
             """
             SELECT
-              symbol,
-              name,
-              rank,
-              plan_enabled,
-              source,
-              note,
-              updated_at
-            FROM watch_pinned
-            ORDER BY rank, symbol
+              w.symbol,
+              w.name,
+              w.rank,
+              w.plan_enabled,
+              w.source,
+              w.note,
+              w.updated_at,
+              i.exchange,
+              COALESCE(i.instrument_type, 'unknown') AS instrument_type,
+              COALESCE(i.settlement_cycle, 'unknown') AS settlement_cycle,
+              i.price_limit_ratio,
+              COALESCE(i.metadata_source, 'legacy_unverified') AS metadata_source,
+              i.metadata_checked_at,
+              COALESCE(i.rule_version, 'unverified-v1') AS rule_version,
+              COALESCE(i.warnings_json, '[]') AS warnings_json
+            FROM watch_pinned AS w
+            LEFT JOIN instruments AS i
+              ON i.symbol = w.symbol AND i.is_active = 1
+            ORDER BY w.rank, w.symbol
             """
         ).fetchall()
         return [self._from_row(row) for row in rows]
@@ -55,15 +67,25 @@ class WatchPinnedRepository:
         row = self.connection.execute(
             """
             SELECT
-              symbol,
-              name,
-              rank,
-              plan_enabled,
-              source,
-              note,
-              updated_at
-            FROM watch_pinned
-            WHERE symbol = ?
+              w.symbol,
+              w.name,
+              w.rank,
+              w.plan_enabled,
+              w.source,
+              w.note,
+              w.updated_at,
+              i.exchange,
+              COALESCE(i.instrument_type, 'unknown') AS instrument_type,
+              COALESCE(i.settlement_cycle, 'unknown') AS settlement_cycle,
+              i.price_limit_ratio,
+              COALESCE(i.metadata_source, 'legacy_unverified') AS metadata_source,
+              i.metadata_checked_at,
+              COALESCE(i.rule_version, 'unverified-v1') AS rule_version,
+              COALESCE(i.warnings_json, '[]') AS warnings_json
+            FROM watch_pinned AS w
+            LEFT JOIN instruments AS i
+              ON i.symbol = w.symbol AND i.is_active = 1
+            WHERE w.symbol = ?
             """,
             (symbol,),
         ).fetchone()
@@ -110,7 +132,10 @@ class WatchPinnedRepository:
             self._to_row(persisted),
         )
         self.connection.commit()
-        return persisted
+        saved = self.get(item.symbol)
+        if saved is None:
+            raise RuntimeError("watchlist item was not saved")
+        return saved
 
     def remove(self, symbol: str) -> None:
         self.connection.execute(
@@ -126,7 +151,23 @@ class WatchPinnedRepository:
         source: WatchPinnedSource,
         now: datetime,
     ) -> list[WatchPinnedItem]:
+        return self.replace_all_with_warnings(
+            items,
+            source=source,
+            now=now,
+        ).items
+
+    def replace_all_with_warnings(
+        self,
+        items: list[WatchPinnedInput],
+        *,
+        source: WatchPinnedSource,
+        now: datetime,
+    ) -> WatchPinnedImportResult:
         validated = self._validate_unique(items)
+        ineligible_symbols = [
+            item.symbol for item in validated if not self._is_plan_eligible(item.symbol)
+        ]
         persisted = [
             self._with_metadata(item, source=source, now=now) for item in validated
         ]
@@ -156,7 +197,14 @@ class WatchPinnedRepository:
                 [self._to_row(item) for item in persisted],
             )
 
-        return self.list()
+        return WatchPinnedImportResult(
+            items=self.list(),
+            warnings=[
+                f"{symbol} instrument metadata is unavailable or unverified; "
+                "plan remains disabled"
+                for symbol in ineligible_symbols
+            ],
+        )
 
     def import_csv(
         self,
@@ -165,8 +213,24 @@ class WatchPinnedRepository:
         source: WatchPinnedSource,
         now: datetime,
     ) -> list[WatchPinnedItem]:
+        return self.import_csv_with_warnings(
+            path,
+            source=source,
+            now=now,
+        ).items
+
+    def import_csv_with_warnings(
+        self,
+        path: Path,
+        *,
+        source: WatchPinnedSource,
+        now: datetime,
+    ) -> WatchPinnedImportResult:
         items = self._read_csv_items(path)
-        return self.replace_all(items, source=source, now=now)
+        return self.replace_all_with_warnings(items, source=source, now=now)
+
+    def read_csv_items(self, path: Path) -> list[WatchPinnedInput]:
+        return self._read_csv_items(path)
 
     def merge_synced(
         self,
@@ -325,9 +389,25 @@ class WatchPinnedRepository:
         now: datetime,
     ) -> WatchPinnedItem:
         data = item.model_dump()
+        if item.plan_enabled and not self._is_plan_eligible(item.symbol):
+            data["plan_enabled"] = False
         data["source"] = source
         data["updated_at"] = now
         return WatchPinnedItem.model_validate(data)
+
+    def _is_plan_eligible(self, symbol: str) -> bool:
+        row = self.connection.execute(
+            """
+            SELECT 1
+            FROM instruments
+            WHERE symbol = ?
+              AND is_active = 1
+              AND instrument_type IN ('a_share', 'etf')
+              AND settlement_cycle IN ('t0', 't1')
+            """,
+            (symbol,),
+        ).fetchone()
+        return row is not None
 
     def _to_row(self, item: WatchPinnedItem) -> dict[str, object]:
         data = item.model_dump()
@@ -339,4 +419,5 @@ class WatchPinnedRepository:
     def _from_row(self, row: sqlite3.Row) -> WatchPinnedItem:
         data = dict(row)
         data["plan_enabled"] = bool(data["plan_enabled"])
+        data["warnings"] = json.loads(data.pop("warnings_json", "[]"))
         return WatchPinnedItem.model_validate(data)

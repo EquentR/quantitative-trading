@@ -8,6 +8,8 @@ from time import perf_counter
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from quantitative_trading.instrument.models import InstrumentMetadata, InstrumentType
+from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.market.adapters import (
     DailyBarProvider,
@@ -85,12 +87,14 @@ class MarketCliService:
         *,
         calendar: XSHGTradingCalendar,
         daily_provider: DailyBarProvider,
+        etf_daily_provider: DailyBarProvider | None = None,
         money_flow_provider: MoneyFlowProvider,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.connection = connection
         self.calendar = calendar
         self.daily_provider = daily_provider
+        self.etf_daily_provider = etf_daily_provider
         self.money_flow_provider = money_flow_provider
         self.now = now or (lambda: datetime.now(UTC))
 
@@ -178,9 +182,18 @@ class MarketCliService:
         result_repository: MarketCaptureResultRepository,
         reused: bool,
     ) -> MarketBackfillSummary:
+        metadata_by_symbol = {
+            symbol: metadata
+            for symbol in requested
+            if (metadata := InstrumentRepository(self.connection).get(symbol)) is not None
+        }
         backfill = HeavyDataBackfillService(
             calendar=self.calendar,
-            daily_provider=self.daily_provider,
+            daily_provider=_RoutedDailyProvider(
+                metadata_by_symbol,
+                a_share_provider=self.daily_provider,
+                etf_provider=self.etf_daily_provider,
+            ),
             money_flow_provider=self.money_flow_provider,
             daily_repository=DailyBarRepository(self.connection),
             money_flow_repository=MoneyFlowRepository(self.connection),
@@ -194,41 +207,92 @@ class MarketCliService:
         rows_received = 0
         rows_written = 0
         for symbol in requested:
-            provider_started = perf_counter()
-            result, calls, received, written = self._capture_dataset(
-                run.run_id,
-                symbol,
-                trade_date,
-                CaptureDataset.DAILY_BAR,
-                250,
-                lambda: backfill.backfill_daily(run.run_id, symbol, trade_date),
-            )
+            metadata = metadata_by_symbol.get(symbol)
+            if metadata is None or metadata.instrument_type is InstrumentType.UNKNOWN:
+                result = self._policy_result(
+                    run.run_id,
+                    symbol,
+                    CaptureDataset.DAILY_BAR,
+                    status=CaptureResultStatus.FAILED,
+                    expected_rows=250,
+                    warning="instrument type is unknown; provider was not called",
+                )
+                calls = received = written = 0
+            elif (
+                metadata.instrument_type is InstrumentType.ETF
+                and self.etf_daily_provider is None
+            ):
+                result = self._policy_result(
+                    run.run_id,
+                    symbol,
+                    CaptureDataset.DAILY_BAR,
+                    status=CaptureResultStatus.FAILED,
+                    expected_rows=250,
+                    warning="ETF daily provider is not configured",
+                )
+                calls = received = written = 0
+            else:
+                provider_started = perf_counter()
+                result, calls, received, written = self._capture_dataset(
+                    run.run_id,
+                    symbol,
+                    trade_date,
+                    CaptureDataset.DAILY_BAR,
+                    250,
+                    lambda: backfill.backfill_daily(run.run_id, symbol, trade_date),
+                )
+                provider_duration_ms += (perf_counter() - provider_started) * 1000
             results.append(result)
             provider_calls += calls
             rows_received += received
             rows_written += written
-            provider_duration_ms += (perf_counter() - provider_started) * 1000
-            provider_started = perf_counter()
-            result, calls, received, written = self._capture_dataset(
-                run.run_id,
-                symbol,
-                trade_date,
-                CaptureDataset.MONEY_FLOW,
-                60,
-                lambda: backfill.backfill_money_flow(
-                    run.run_id, symbol, trade_date
-                ),
-            )
+            if metadata is not None and metadata.instrument_type is InstrumentType.ETF:
+                result = self._policy_result(
+                    run.run_id,
+                    symbol,
+                    CaptureDataset.MONEY_FLOW,
+                    status=CaptureResultStatus.NOT_APPLICABLE,
+                    expected_rows=0,
+                )
+                calls = received = written = 0
+            elif metadata is None or metadata.instrument_type is InstrumentType.UNKNOWN:
+                result = self._policy_result(
+                    run.run_id,
+                    symbol,
+                    CaptureDataset.MONEY_FLOW,
+                    status=CaptureResultStatus.FAILED,
+                    expected_rows=60,
+                    warning="instrument type is unknown; provider was not called",
+                )
+                calls = received = written = 0
+            else:
+                provider_started = perf_counter()
+                result, calls, received, written = self._capture_dataset(
+                    run.run_id,
+                    symbol,
+                    trade_date,
+                    CaptureDataset.MONEY_FLOW,
+                    60,
+                    lambda: backfill.backfill_money_flow(
+                        run.run_id, symbol, trade_date
+                    ),
+                )
+                provider_duration_ms += (perf_counter() - provider_started) * 1000
             results.append(result)
             provider_calls += calls
             rows_received += received
             rows_written += written
-            provider_duration_ms += (perf_counter() - provider_started) * 1000
         for result in results:
             result_repository.upsert(result)
 
+        applicable_results = [
+            result
+            for result in results
+            if result.status is not CaptureResultStatus.NOT_APPLICABLE
+        ]
         complete_count = sum(
-            result.status is CaptureResultStatus.COMPLETE for result in results
+            result.status is CaptureResultStatus.COMPLETE
+            for result in applicable_results
         )
         usable_count = sum(
             result.actual_rows > 0
@@ -244,9 +308,14 @@ class MarketCliService:
             result.status is CaptureResultStatus.FAILED for result in results
         )
         warning_count = sum(
-            result.status is not CaptureResultStatus.COMPLETE for result in results
+            result.status
+            not in {
+                CaptureResultStatus.COMPLETE,
+                CaptureResultStatus.NOT_APPLICABLE,
+            }
+            for result in results
         )
-        if not requested or complete_count == len(results):
+        if not requested or complete_count == len(applicable_results):
             status = CaptureRunStatus.SUCCEEDED
         elif usable_count > 0:
             status = CaptureRunStatus.DEGRADED
@@ -440,6 +509,7 @@ class MarketCliService:
                 created.rows_received,
                 created.rows_written,
             )
+
         except Exception as exc:
             if not isinstance(exc, MarketProviderError):
                 raise
@@ -461,6 +531,29 @@ class MarketCliService:
                 0,
                 0,
             )
+
+    def _policy_result(
+        self,
+        run_id: str,
+        symbol: str,
+        dataset: CaptureDataset,
+        *,
+        status: CaptureResultStatus,
+        expected_rows: int,
+        warning: str = "",
+    ) -> MarketCaptureResult:
+        return MarketCaptureResult(
+            run_id=run_id,
+            symbol=symbol,
+            dataset=dataset,
+            status=status,
+            fetched_at=self._now(),
+            expected_rows=expected_rows,
+            actual_rows=0,
+            source="instrument_policy",
+            warning=warning,
+            error_summary=(warning if status is CaptureResultStatus.FAILED else ""),
+        )
 
     def _backfill_summary(
         self,
@@ -507,3 +600,29 @@ class MarketCliService:
             return self._now()
         except Exception:
             return fallback
+
+
+class _RoutedDailyProvider:
+    def __init__(
+        self,
+        metadata: dict[str, InstrumentMetadata],
+        *,
+        a_share_provider: DailyBarProvider,
+        etf_provider: DailyBarProvider | None,
+    ) -> None:
+        self.metadata = metadata
+        self.a_share_provider = a_share_provider
+        self.etf_provider = etf_provider
+
+    def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+        instrument = self.metadata.get(symbol)
+        if instrument is None or instrument.instrument_type is InstrumentType.UNKNOWN:
+            raise MarketProviderError("instrument type is unknown")
+        provider = (
+            self.etf_provider
+            if instrument.instrument_type is InstrumentType.ETF
+            else self.a_share_provider
+        )
+        if provider is None:
+            raise MarketProviderError("ETF daily provider is not configured")
+        return provider.get_daily_bars(symbol, start_date, end_date, adjustment)

@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from quantitative_trading.instrument.models import InstrumentMetadata
+
 
 class TradingPlanStatus(StrEnum):
     DRAFT = "draft"
@@ -47,6 +49,7 @@ class PlanSymbolContext(BaseModel):
 
     symbol: str
     name: str = Field(min_length=1)
+    instrument: InstrumentMetadata | None = None
     sources: list[str] = Field(min_length=1)
     is_holding: bool
     trend: dict[str, Any] = Field(default_factory=dict)
@@ -76,12 +79,19 @@ class PlanSymbolContext(BaseModel):
             raise ValueError("text lists cannot contain blank values")
         return value
 
+    @model_validator(mode="after")
+    def instrument_symbol_must_match(self) -> "PlanSymbolContext":
+        if self.instrument is not None and self.instrument.symbol != self.symbol:
+            raise ValueError("symbol must match instrument symbol")
+        return self
+
 
 class MarketPlanSymbolInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     symbol: str
     name: str = Field(min_length=1)
+    instrument: InstrumentMetadata | None = None
     sources: list[str] = Field(min_length=1)
     is_holding: bool
     current_price: float = Field(gt=0, allow_inf_nan=False)
@@ -105,6 +115,12 @@ class MarketPlanSymbolInput(BaseModel):
         if any(not item.strip() for item in value):
             raise ValueError("market plan text lists cannot contain blanks")
         return value
+
+    @model_validator(mode="after")
+    def instrument_symbol_must_match(self) -> "MarketPlanSymbolInput":
+        if self.instrument is not None and self.instrument.symbol != self.symbol:
+            raise ValueError("symbol must match instrument symbol")
+        return self
 
 
 def _require_timezone_aware(value: datetime | None, field_name: str) -> datetime | None:

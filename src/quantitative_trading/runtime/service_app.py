@@ -179,8 +179,8 @@ def _run_scheduler_task(
             )
         with connect(settings) as connection:
             migrate(connection)
-            workflow = _build_decision_workflow(connection, settings, task_now)
-            result = workflow.run_intraday()
+            workflow = _build_decision_workflow(connection, settings)
+            result = workflow.run_intraday(as_of=task_now)
         return SchedulerJobResult(
             task_type="intraday",
             reason="intraday_reused" if result.reused else "intraday_completed",
@@ -213,7 +213,7 @@ def _run_scheduler_task(
             )
         with connect(settings) as connection:
             migrate(connection)
-            workflow = _build_decision_workflow(connection, settings, task_now)
+            workflow = _build_decision_workflow(connection, settings)
             result = workflow.run_close(trade_date)
         deadline_not_ready = not result.ready and local_minute >= time(16, 30)
         return SchedulerJobResult(
@@ -256,9 +256,9 @@ def _run_scheduler_task(
             )
         with connect(settings) as connection:
             migrate(connection)
-            result = _build_decision_workflow(
-                connection, settings, task_now
-            ).run_cleanup(trade_date)
+            result = _build_decision_workflow(connection, settings).run_cleanup(
+                trade_date
+            )
         return SchedulerJobResult(
             task_type="cleanup",
             reason="minute_cleanup_completed",
@@ -284,9 +284,8 @@ def _run_scheduler_task(
 def _build_decision_workflow(
     connection,
     settings: Settings,
-    now: datetime,
 ):
-    return build_decision_workflow(connection, settings, now=lambda: now)
+    return build_decision_workflow(connection, settings)
 
 
 def _email_delivery_service(connection, settings: Settings) -> EmailDeliveryService:

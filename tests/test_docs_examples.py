@@ -90,6 +90,17 @@ def test_api_docs_document_auth_and_error_contract() -> None:
     ) not in text
 
 
+def test_api_docs_do_not_advertise_nonexistent_datasource_cli_commands() -> None:
+    text = Path("docs/api.md").read_text(encoding="utf-8")
+    section = _markdown_section(text, "CLI 关系")
+
+    assert "qt datasource status/check" not in text
+    assert "CLI 不提供 `qt datasource` 命令" in section
+    assert "`qt watchlist sync`" in section
+    assert "`GET /api/v1/datasource/eastmoney/status`" in section
+    assert "`POST /api/v1/datasource/eastmoney/check`" in section
+
+
 def test_project_docs_define_http_api_and_local_frontend_scope() -> None:
     text = Path("docs/project-spec.md").read_text(encoding="utf-8")
 
@@ -154,7 +165,9 @@ def test_data_source_docs_define_traceable_market_snapshot_semantics() -> None:
         "8. 行情决策数据与可追溯快照",
     )
 
-    assert "重数据和决策只覆盖手动持仓" in section
+    assert "盘中展示采集范围为当前持仓、当日活动计划标的" in section
+    assert "盘中决策范围仍只包含当前持仓和当日活动计划标的" in section
+    assert "不得进入账户估值、策略、风控、建议或通知" in section
     assert "`plan_enabled=true` 的非持仓自选标的" in section
     assert "provider 返回的额外股票必须忽略并告警，不能借外部响应扩大股票池" in section
     assert "最近 250 个 `XSHG` 交易日" in section
@@ -163,5 +176,6 @@ def test_data_source_docs_define_traceable_market_snapshot_semantics() -> None:
     assert "`history_snapshot_refs`" in section
     assert "`money_flow_snapshot_refs`" in section
     assert "`intraday_strength_snapshot_refs`" in section
+    assert "降级到 AkShare 新浪分钟接口" in section
     assert "计划、策略、风控、建议、通知和审计只能引用本轮已经固化的输入" in section
     assert "不读取或修改真实券商账户" in section

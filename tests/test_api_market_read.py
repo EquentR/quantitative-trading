@@ -11,6 +11,13 @@ from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.config import Settings
 from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import PositionRepository
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
+from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.market.models import (
     CaptureDataset,
     CaptureResultStatus,
@@ -64,6 +71,8 @@ from quantitative_trading.universe.models import (
     UniverseSource,
 )
 from quantitative_trading.universe.repository import UniverseSnapshotRepository
+from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
+from quantitative_trading.watchlist.repository import WatchPinnedRepository
 
 
 SHANGHAI = timezone(timedelta(hours=8))
@@ -102,6 +111,30 @@ def _universe_member(
 
 def seed_market_data(settings: Settings) -> int:
     with connect(settings) as connection:
+        InstrumentRepository(connection).replace_catalog(
+            [
+                InstrumentMetadata(
+                    symbol="000001",
+                    name="Ping An Bank",
+                    exchange=Exchange.SZ,
+                    instrument_type=InstrumentType.A_SHARE,
+                    settlement_cycle=SettlementCycle.T1,
+                    metadata_source="test-directory",
+                    metadata_checked_at=FETCHED_AT,
+                    rule_version="test-rules-v1",
+                )
+            ]
+        )
+        WatchPinnedRepository(connection).upsert(
+            WatchPinnedInput(
+                symbol="000001",
+                name="Ping An Bank",
+                rank=1,
+                plan_enabled=True,
+            ),
+            source=WatchPinnedSource.MANUAL,
+            now=FETCHED_AT,
+        )
         universe_id = UniverseSnapshotRepository(connection).save(
             UniverseSnapshot(
                 created_at=FETCHED_AT,
@@ -852,6 +885,7 @@ def test_market_run_list_detail_results_and_missing_error(tmp_path) -> None:
         "degraded": 0,
         "failed": 0,
         "stale": 0,
+        "not_applicable": 0,
     }
     assert detail.status_code == 200
     assert detail.json()["run_id"] == "run-close-20260713"
@@ -865,6 +899,98 @@ def test_market_run_list_detail_results_and_missing_error(tmp_path) -> None:
     assert detail.json()["results"][0]["dataset"] == "daily_bar"
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "market_run_not_found"
+
+
+def test_market_run_counts_money_flow_not_applicable(tmp_path) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    seed_market_data(settings)
+    with connect(settings) as connection:
+        MarketCaptureResultRepository(connection).upsert(
+            MarketCaptureResult(
+                run_id="run-close-20260713",
+                symbol="000001",
+                dataset=CaptureDataset.MONEY_FLOW,
+                status=CaptureResultStatus.NOT_APPLICABLE,
+                fetched_at=FETCHED_AT,
+                source="instrument_policy",
+            )
+        )
+
+    listed = client.get("/api/v1/market/runs?page=1&page_size=10", headers=headers)
+    detail = client.get("/api/v1/market/runs/run-close-20260713", headers=headers)
+
+    assert listed.status_code == 200
+    assert detail.status_code == 200
+    assert (
+        listed.json()["items"][0]["dataset_counts"]["money_flow"][
+            "not_applicable"
+        ]
+        == 1
+    )
+    assert detail.json()["dataset_counts"]["money_flow"]["not_applicable"] == 1
+
+
+def test_money_flow_not_applicable_returns_stable_empty_response(tmp_path) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    snapshot_id = seed_market_data(settings)
+    with connect(settings) as connection:
+        repository = MarketInputSnapshotRepository(connection)
+        snapshot = repository.get(snapshot_id)
+        assert snapshot is not None
+        repository.save(
+            snapshot.model_copy(
+                update={
+                    "dataset_quality": {
+                        "000001": {
+                            CaptureDataset.MONEY_FLOW: DatasetQuality(
+                                status=CaptureResultStatus.NOT_APPLICABLE,
+                                source="instrument_policy",
+                            )
+                        }
+                    }
+                }
+            )
+        )
+
+    response = client.get(
+        "/api/v1/market/symbols/000001/money-flow", headers=headers
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "not_applicable"
+    assert response.json()["rows"] == []
+    assert response.json()["warnings"] == []
+
+
+def test_money_flow_not_applicable_hides_legacy_stored_rows(tmp_path) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    snapshot_id = seed_market_data(settings)
+    with connect(settings) as connection:
+        repository = MarketInputSnapshotRepository(connection)
+        snapshot = repository.get(snapshot_id)
+        assert snapshot is not None
+        repository.save(
+            snapshot.model_copy(
+                update={
+                    "dataset_quality": {
+                        "600000": {
+                            CaptureDataset.MONEY_FLOW: DatasetQuality(
+                                status=CaptureResultStatus.NOT_APPLICABLE,
+                                source="instrument_policy",
+                            )
+                        }
+                    }
+                }
+            )
+        )
+
+    response = client.get(
+        "/api/v1/market/symbols/600000/money-flow", headers=headers
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "not_applicable"
+    assert response.json()["rows"] == []
 
 
 def test_market_snapshot_trace_resolves_all_dataset_and_decision_references(
@@ -895,6 +1021,76 @@ def test_market_snapshot_trace_resolves_all_dataset_and_decision_references(
     ]
     assert all(dataset["reference_id"] is not None for dataset in body["datasets"])
     assert all(dataset["status"] == "complete" for dataset in body["datasets"])
+
+
+def test_market_snapshot_trace_returns_frozen_instrument_metadata(tmp_path) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    snapshot_id = seed_market_data(settings)
+    metadata = InstrumentMetadata(
+        symbol="600000",
+        name="Pufa Bank",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.1,
+        metadata_source="test-directory",
+        metadata_checked_at=FETCHED_AT,
+        rule_version="test-rules-v1",
+    )
+    with connect(settings) as connection:
+        repository = MarketInputSnapshotRepository(connection)
+        snapshot = repository.get(snapshot_id)
+        assert snapshot is not None
+        snapshot_id = repository.save(
+            snapshot.model_copy(update={"instrument_metadata": {"600000": metadata}})
+        )
+
+    response = client.get(
+        f"/api/v1/market/snapshots/{snapshot_id}/trace?symbol=600000",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["instrument"] == metadata.model_dump(mode="json")
+
+
+def test_market_snapshot_trace_treats_money_flow_not_applicable_as_complete(
+    tmp_path,
+) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    snapshot_id = seed_market_data(settings)
+    with connect(settings) as connection:
+        repository = MarketInputSnapshotRepository(connection)
+        snapshot = repository.get(snapshot_id)
+        assert snapshot is not None
+        snapshot_id = repository.save(
+            snapshot.model_copy(
+                update={
+                    "money_flow_snapshot_refs": {},
+                    "dataset_quality": {
+                        "600000": {
+                            CaptureDataset.MONEY_FLOW: DatasetQuality(
+                                status=CaptureResultStatus.NOT_APPLICABLE,
+                                source="instrument_policy",
+                            )
+                        }
+                    },
+                }
+            )
+        )
+
+    response = client.get(
+        f"/api/v1/market/snapshots/{snapshot_id}/trace?symbol=600000",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    flow = next(item for item in body["datasets"] if item["dataset"] == "money_flow")
+    assert flow["status"] == "not_applicable"
+    assert flow["reference_id"] is None
+    assert flow["warnings"] == []
+    assert body["status"] == "complete"
 
 
 @pytest.mark.parametrize(

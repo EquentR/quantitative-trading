@@ -3,6 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from quantitative_trading.strategy.models import StrategyAction
+from quantitative_trading.instrument.models import InstrumentMetadata
 
 
 class RiskConfig(BaseModel):
@@ -28,6 +29,7 @@ class RiskContext(BaseModel):
     consecutive_losses: int = Field(default=0, ge=0)
     in_loss_cooldown: bool = False
     liquidity_amount: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    instrument: InstrumentMetadata | None = None
 
 
 class RiskDecision(BaseModel):

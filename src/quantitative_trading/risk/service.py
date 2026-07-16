@@ -11,6 +11,7 @@ from quantitative_trading.risk.models import (
     RiskDecision,
 )
 from quantitative_trading.strategy.models import StrategyAction, StrategySignal
+from quantitative_trading.instrument.models import SettlementCycle
 
 
 BUY_SIDE_ACTIONS = {StrategyAction.BUY, StrategyAction.ADD}
@@ -122,7 +123,14 @@ def apply_risk(
         if available_quantity is None:
             reasons.append("缺少可用数量，禁止卖出或减仓")
         elif available_quantity <= 0:
-            reasons.append("可用数量为 0，受 T+1 可卖数量约束，禁止卖出或减仓")
+            if (
+                context is not None
+                and context.instrument is not None
+                and context.instrument.settlement_cycle is SettlementCycle.T1
+            ):
+                reasons.append("可用数量为 0，受 T+1 可卖数量约束，禁止卖出或减仓")
+            else:
+                reasons.append("手动持仓台账可用数量为 0，禁止卖出或减仓")
 
     if reasons:
         if signal.action in BUY_SIDE_ACTIONS:

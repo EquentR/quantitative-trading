@@ -136,6 +136,27 @@ def test_planned_entry_signal_emits_add_for_existing_position() -> None:
     assert "money_flow_unavailable" in signal.machine_reason
 
 
+def test_planned_entry_signal_marks_etf_money_flow_not_applicable() -> None:
+    signal = planned_entry_signal(
+        symbol="510300",
+        has_position=False,
+        plan_active=True,
+        plan_allows_entry=True,
+        plan_condition_met=True,
+        daily_structure_confirmed=True,
+        intraday_strength="strong",
+        money_flow_confirmed=None,
+        money_flow_applicable=False,
+        data_quality="complete",
+        invalid_if=["跌破计划支撑位"],
+    )
+
+    assert signal.action is StrategyAction.BUY
+    assert signal.confidence == "medium"
+    assert "money_flow_not_applicable" in signal.machine_reason
+    assert "money_flow_unavailable" not in signal.machine_reason
+
+
 @pytest.mark.parametrize(
     ("overrides", "reason"),
     [

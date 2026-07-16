@@ -4,7 +4,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from quantitative_trading.instrument.models import InstrumentMetadata
 
 
 class UniverseSource(StrEnum):
@@ -29,6 +31,7 @@ class UniverseMember(BaseModel):
 
     symbol: str = Field(pattern=r"^\d{6}$")
     name: str = Field(min_length=1)
+    instrument: InstrumentMetadata | None = None
     sources: list[UniverseSource] = Field(min_length=1)
     priority: int = Field(ge=0)
     ledger_updated_at: datetime | None = None
@@ -45,6 +48,12 @@ class UniverseMember(BaseModel):
         info: Any,
     ) -> datetime | None:
         return _require_timezone_aware(value, info.field_name)
+
+    @model_validator(mode="after")
+    def instrument_symbol_must_match(self) -> "UniverseMember":
+        if self.instrument is not None and self.instrument.symbol != self.symbol:
+            raise ValueError("symbol must match instrument symbol")
+        return self
 
 
 class UniverseSnapshot(BaseModel):

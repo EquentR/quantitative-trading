@@ -24,6 +24,7 @@ import type {
   MarketSymbolSummary,
   MinuteBarsResponse,
   MoneyFlowResponse,
+  InstrumentPreview,
 } from '@/api/types'
 
 const now = '2026-07-07T10:30:00+08:00'
@@ -127,8 +128,43 @@ export const mockWatchPinned: WatchPinnedItem[] = [
     source: 'manual',
     note: '核心自选',
     updated_at: now,
+    exchange: 'SH',
+    instrument_type: 'a_share',
+    settlement_cycle: 't1',
+    price_limit_ratio: 0.1,
+    metadata_source: 'instrument_directory',
+    metadata_checked_at: now,
+    rule_version: 'instrument-rules-v1',
+    warnings: [],
   },
 ]
+
+export const mockInstrumentPreview: InstrumentPreview = {
+  preview_id: '11111111-1111-4111-8111-111111111111',
+  source: 'eastmoney_watchlist',
+  query: null,
+  created_at: now,
+  expires_at: '2026-07-07T10:40:00+08:00',
+  warnings: [],
+  items: [
+    {
+      symbol: '510300',
+      name: '沪深300ETF',
+      exchange: 'SH',
+      instrument_type: 'etf',
+      settlement_cycle: 't1',
+      price_limit_ratio: 0.1,
+      metadata_source: 'sse_etf_catalog',
+      metadata_checked_at: now,
+      rule_version: 'instrument-rules-v1',
+      source: 'eastmoney_watchlist',
+      source_rank: 1,
+      already_monitored: false,
+      selectable: true,
+      warnings: [],
+    },
+  ],
+}
 
 export const mockUniverseMembers: UniverseMember[] = [
   {
@@ -558,14 +594,47 @@ export const handlers = [
     HttpResponse.json(await request.json()),
   ),
   http.delete('/api/v1/watchlist/pinned/:symbol', () => new HttpResponse(null, { status: 204 })),
-  http.post('/api/v1/watchlist/pinned/import', () => HttpResponse.json(mockWatchPinned)),
-  http.post('/api/v1/watchlist/pinned/import-csv', () => HttpResponse.json(mockWatchPinned)),
+  http.post('/api/v1/watchlist/pinned/import', () =>
+    HttpResponse.json({ items: mockWatchPinned, warnings: [] }),
+  ),
+  http.post('/api/v1/watchlist/pinned/import-csv', () =>
+    HttpResponse.json({ items: mockWatchPinned, warnings: [] }),
+  ),
   http.get('/api/v1/watchlist/pinned/export-csv', () =>
     new HttpResponse('symbol,name,rank,plan_enabled,note\n600519,示例白酒,1,true,核心自选\n', {
       headers: { 'content-type': 'text/csv' },
     }),
   ),
-  http.post('/api/v1/watchlist/pinned/sync', () => HttpResponse.json(mockWatchPinned)),
+  http.post('/api/v1/watchlist/pinned/select', () =>
+    HttpResponse.json({ items: mockWatchPinned, warnings: [] }),
+  ),
+  http.post('/api/v1/watchlist/pinned/sync', () =>
+    HttpResponse.json(
+      {
+        error: {
+          code: 'watchlist_sync_payload_retired',
+          message: 'payload sync is retired',
+          details: { replacement: '/api/v1/instruments/eastmoney-candidates' },
+        },
+      },
+      { status: 410 },
+    ),
+  ),
+  http.get('/api/v1/instruments/eastmoney-candidates', () =>
+    HttpResponse.json(mockInstrumentPreview),
+  ),
+  http.get('/api/v1/instruments/search', ({ request }) =>
+    HttpResponse.json({
+      ...mockInstrumentPreview,
+      source: 'instrument_search',
+      query: new URL(request.url).searchParams.get('q'),
+      items: mockInstrumentPreview.items.map((item) => ({
+        ...item,
+        source: 'instrument_search',
+        source_rank: null,
+      })),
+    }),
+  ),
   http.get('/api/v1/universe', () => HttpResponse.json(mockUniverseMembers)),
   http.post('/api/v1/universe/snapshots', () =>
     HttpResponse.json({ snapshot_id: 2, snapshot: mockUniverseSnapshot }, { status: 201 }),

@@ -3,9 +3,34 @@ from datetime import UTC, datetime
 import pytest
 
 from quantitative_trading.config import Settings
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
+from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.storage.sqlite import connect, migrate
 from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
 from quantitative_trading.watchlist.repository import WatchPinnedRepository
+
+
+def seed_verified(connection, symbols: list[str], now: datetime) -> None:
+    InstrumentRepository(connection).replace_catalog(
+        [
+            InstrumentMetadata(
+                symbol=symbol,
+                name=symbol,
+                exchange=Exchange.SH,
+                instrument_type=InstrumentType.A_SHARE,
+                settlement_cycle=SettlementCycle.T1,
+                metadata_source="test-directory",
+                metadata_checked_at=now,
+                rule_version="test-rules-v1",
+            )
+            for symbol in symbols
+        ]
+    )
 
 
 def test_watch_pinned_crud_and_merge_preserves_local_switch(tmp_path) -> None:
@@ -13,6 +38,7 @@ def test_watch_pinned_crud_and_merge_preserves_local_switch(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "app.db")
     with connect(settings) as connection:
         migrate(connection)
+        seed_verified(connection, ["600000"], now)
         repository = WatchPinnedRepository(connection)
         repository.replace_all(
             [
@@ -65,6 +91,7 @@ def test_merge_synced_deletes_missing_synced_rows_and_keeps_manual_synced_rows(
     settings = Settings(database_path=tmp_path / "app.db")
     with connect(settings) as connection:
         migrate(connection)
+        seed_verified(connection, ["000001"], now)
         repository = WatchPinnedRepository(connection)
         repository.upsert(
             WatchPinnedInput(

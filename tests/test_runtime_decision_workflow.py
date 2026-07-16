@@ -14,11 +14,11 @@ CLOSE_TIME = datetime(2026, 7, 14, 7, 20, tzinfo=UTC)
 def test_runtime_routes_intraday_to_unified_workflow(tmp_path, monkeypatch) -> None:
     import quantitative_trading.runtime.service_app as service_app
 
-    calls: list[str] = []
+    calls: list[datetime] = []
 
     class FakeWorkflow:
-        def run_intraday(self):
-            calls.append("intraday")
+        def run_intraday(self, *, as_of: datetime):
+            calls.append(as_of)
             return SimpleNamespace(
                 run_id="intraday-20260714-1000",
                 status=CaptureRunStatus.SUCCEEDED,
@@ -31,7 +31,7 @@ def test_runtime_routes_intraday_to_unified_workflow(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(
         service_app,
         "_build_decision_workflow",
-        lambda connection, settings, now: FakeWorkflow(),
+        lambda connection, settings: FakeWorkflow(),
     )
     settings = Settings(database_path=tmp_path / "runtime.db")
 
@@ -41,12 +41,35 @@ def test_runtime_routes_intraday_to_unified_workflow(tmp_path, monkeypatch) -> N
         now=TRADING_TIME,
     )
 
-    assert calls == ["intraday"]
+    assert calls == [TRADING_TIME]
     assert result.task_type == "intraday"
     assert result.reason == "intraday_completed"
     assert result.snapshot_id == 17
     assert result.recommendation_ids == ["rec-1", "rec-2"]
     assert result.run_id == "intraday-20260714-1000"
+
+
+def test_runtime_workflow_factory_does_not_freeze_execution_clock(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.runtime.service_app as service_app
+
+    captured_kwargs = None
+
+    def fake_build(connection, settings, **kwargs):
+        nonlocal captured_kwargs
+        captured_kwargs = kwargs
+        return object()
+
+    monkeypatch.setattr(service_app, "build_decision_workflow", fake_build)
+
+    service_app._build_decision_workflow(
+        object(),
+        Settings(database_path=tmp_path / "runtime.db"),
+    )
+
+    assert captured_kwargs == {}
 
 
 def test_runtime_routes_close_readiness_and_reports_not_ready(
@@ -72,7 +95,7 @@ def test_runtime_routes_close_readiness_and_reports_not_ready(
     monkeypatch.setattr(
         service_app,
         "_build_decision_workflow",
-        lambda connection, settings, now: FakeWorkflow(),
+        lambda connection, settings: FakeWorkflow(),
     )
     settings = Settings(database_path=tmp_path / "runtime.db")
 
@@ -99,7 +122,7 @@ def test_runtime_calendar_guard_skips_market_jobs_outside_session(
     monkeypatch.setattr(
         service_app,
         "_build_decision_workflow",
-        lambda connection, settings, now: (_ for _ in ()).throw(
+        lambda connection, settings: (_ for _ in ()).throw(
             AssertionError("workflow must not run")
         ),
     )
@@ -136,7 +159,7 @@ def test_runtime_runs_cleanup_and_email_worker_independently(
     monkeypatch.setattr(
         service_app,
         "_build_decision_workflow",
-        lambda connection, settings, now: FakeWorkflow(),
+        lambda connection, settings: FakeWorkflow(),
     )
 
     class FakeEmailWorker:
