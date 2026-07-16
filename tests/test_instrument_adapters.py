@@ -13,6 +13,7 @@ from quantitative_trading.instrument.models import (
     InstrumentType,
     SettlementCycle,
 )
+from tests.instrument_fixtures import etf_name_variant_metadata
 
 
 NOW = datetime(2026, 7, 15, 2, 0, tzinfo=UTC)
@@ -247,9 +248,39 @@ def test_directory_accepts_etf_manager_suffix_name_variant() -> None:
     snapshot = directory_adapter(ManagerSuffixDirectory()).fetch(TRADE_DATE)
 
     item = next(item for item in snapshot.items if item.symbol == "510300")
+    assert item.name == "沪深300ETF华泰柏瑞"
     assert item.instrument_type is InstrumentType.ETF
     assert item.settlement_cycle is SettlementCycle.T1
     assert item.warnings == []
+
+
+def test_directory_accepts_topic_short_name_and_uses_spot_full_name() -> None:
+    item = etf_name_variant_metadata()
+
+    assert item.name == "半导体ETF国联安"
+    assert item.exchange is Exchange.SH
+    assert item.instrument_type is InstrumentType.ETF
+    assert item.settlement_cycle is SettlementCycle.T1
+    assert item.warnings == []
+
+
+def test_directory_rejects_extra_topic_text_before_etf_suffix() -> None:
+    class TopicMismatchDirectory(FakeAkShareDirectory):
+        def fund_etf_spot_em(self) -> pd.DataFrame:
+            self.calls.append(("etf_spot", None))
+            return pd.DataFrame(
+                [
+                    {"代码": "510300", "名称": "沪深300指数ETF"},
+                    {"代码": "159915", "名称": "创业板ETF"},
+                ]
+            )
+
+    snapshot = directory_adapter(TopicMismatchDirectory()).fetch(TRADE_DATE)
+
+    item = next(item for item in snapshot.items if item.symbol == "510300")
+    assert item.instrument_type is InstrumentType.UNKNOWN
+    assert item.settlement_cycle is SettlementCycle.UNKNOWN
+    assert item.warnings == ["ETF 510300 has conflicting directory names"]
 
 
 def test_directory_keeps_valid_code_with_missing_name_as_unknown() -> None:

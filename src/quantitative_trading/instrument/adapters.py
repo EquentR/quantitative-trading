@@ -420,7 +420,7 @@ class AkShareInstrumentDirectoryAdapter:
             entries[symbol].append(
                 self._etf_metadata(
                     symbol,
-                    name,
+                    spot_name,
                     exchange=Exchange.SH,
                     source=self.SH_ETF_SOURCE,
                     checked_at=checked_at,
@@ -485,7 +485,7 @@ class AkShareInstrumentDirectoryAdapter:
             entries[symbol].append(
                 self._etf_metadata(
                     symbol,
-                    name,
+                    spot_name,
                     exchange=Exchange.SZ,
                     source=self.SZ_ETF_SOURCE,
                     checked_at=checked_at,
@@ -575,7 +575,10 @@ class AkShareInstrumentDirectoryAdapter:
         if left == right:
             return True
         shorter, longer = sorted((left, right), key=len)
-        return "ETF" in shorter and longer.startswith(shorter)
+        if not longer.startswith(shorter):
+            return False
+        suffix = longer[len(shorter) :]
+        return "ETF" in shorter or suffix.startswith("ETF")
 
     @staticmethod
     def _source_trade_date(frame: Any, field: str, *, fallback: date) -> date:

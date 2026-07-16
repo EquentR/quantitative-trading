@@ -110,6 +110,7 @@
 - A 股必须属于沪深 A 股目录，固定 `settlement_cycle=t1`。
 - ETF 必须由沪深交易所 ETF 产品目录确认，LOF、封闭式基金、REIT 和其他基金不得映射为 ETF。
 - ETF 的 T+0/T+1 只按交易所权威产品类别精确白名单映射。上交所使用 `FUND_LIST.subClass`：`01/03/09/31/35` 为 T+1，`02/04/05/06/07/32/33/34/36/37/38` 为 T+0，`08` 为 unknown；深交所仅将 `ETF + 股票基金` 映射为 T+1、`ETF + 债券基金/货币市场基金` 映射为 T+0，其它类别为 unknown。禁止按名称关键词、代码前缀、相似文本或模型猜测。
+- ETF 目录长短名称只有在同一六位代码已通过所需目录交叉验证，且短名已含 `ETF`、长名以短名开头，或长名新增后缀以 `ETF` 开头时才结构兼容；内部名称使用 spot 的较完整展示名称以区分同主题产品。其它名称冲突继续降为 unknown，名称兼容不得替代交易制度验证。
 - `instrument_type=unknown` 的候选不可加入；兼容保留的旧记录强制 `plan_enabled=false`。
 - 已确认 ETF 若 `settlement_cycle=unknown`，允许加入展示但强制 `plan_enabled=false`，不得生成 `buy/add/sell/reduce`。
 - 未知元数据持仓保留数量和成本，但动作降级为 `hold` 并提示人工复核。

@@ -46,9 +46,9 @@
 
 远端结果经过证券目录验证和分类后写入 10 分钟 `instrument_preview` 标准化缓存。预览仅保存内部候选字段，不保存 Key 或供应商原始 payload；成功空列表也是有效预览，不删除或改变本地观察池。北交所、港美股、LOF、封闭式基金、REIT、场外基金及其他不支持品种被过滤并产生 warning。
 
-名称/代码搜索使用本地标准化沪深 A 股和 ETF 目录，支持精确代码、代码前缀和名称包含，最多返回 50 项。精确代码优先，其次代码前缀，再按名称相关度和代码稳定排序。搜索只在用户提交时运行，不依赖东方财富 Key，也不调用妙想自然语言接口。同一 `Asia/Shanghai` 自然日内每个目录最多自动刷新一次；刷新失败时可使用带 stale warning 的历史目录，从未成功时返回 `instrument_directory_unavailable`。
+名称/代码搜索使用本地标准化沪深 A 股和 ETF 目录，支持精确代码、代码前缀和名称包含，最多返回 50 项。验证通过的 ETF 使用公开 spot 目录的较完整展示名称，保留其中的管理人信息以区分同主题产品。精确代码优先，其次代码前缀，再按名称相关度和代码稳定排序。搜索只在用户提交时运行，不依赖东方财富 Key，也不调用妙想自然语言接口。同一 `Asia/Shanghai` 自然日内每个目录最多自动刷新一次；刷新失败时可使用带 stale warning 的历史目录，从未成功时返回 `instrument_directory_unavailable`。
 
-客户端确认时只提交 `preview_id` 和选中代码。后端从未过期预览读取可信名称和证券规则，并在单一事务中增量写入 `instruments` 和 `watch_pinned`；任一代码无效则整批不写。新验证 A 股或 ETF 默认 `plan_enabled=true`，已有记录保留开关和备注，重复确认幂等。东方财富候选确认使用 `synced`，搜索确认使用 `manual`，命中本地人工记录时使用 `manual_synced`。
+客户端确认时只提交 `preview_id` 和选中代码。后端从未过期预览读取选择范围，并在单一写锁事务中重新读取当前证券目录；当前目录已缺失或降为 unknown 时整批不写，预览不得把旧元数据反写到 `instruments`。当前目录仍有效时才增量写入 `watch_pinned`。新验证 A 股或 ETF 默认 `plan_enabled=true`，已有记录保留开关和备注，重复确认幂等。东方财富候选确认使用 `synced`，搜索确认使用 `manual`，命中本地人工记录时使用 `manual_synced`。
 
 远端空列表、候选减少或用户少选都不得删除观察池记录。现有 JSON/CSV 导入继续保持全量替换语义；导入前尽力刷新同一证券目录，无法可靠解析元数据的记录允许兼容展示，但强制 `plan_enabled=false` 并返回 warning。Web 通过导入响应信封展示这些 warning；兼容调用仍可使用原数组响应。
 
@@ -114,7 +114,7 @@ AkShare 只提供行情报价和公开市场数据，不提供真实持仓、成
 
 市场模块通过内部 Protocol 提供报价、前复权日 K、逐股资金流和 1 分钟行情。A 股与 ETF 分组后分别调用适用 adapter，每个 provider 能力每组每轮最多调用一次；东方财富公开单票行情和腾讯 quote 兜底只用于报价 adapter，不自动扩展为历史数据兜底。1 分钟行情首选 AkShare 东方财富接口，请求失败时在同一 adapter 内降级到 AkShare 新浪分钟接口；两者都失败才保存逐标的失败结果。
 
-证券目录为每个标的提供 `exchange`、`instrument_type`、`settlement_cycle`、`price_limit_ratio`、`metadata_source`、`metadata_checked_at` 和规则版本。A 股固定 T+1。上交所 ETF 必须同时通过 AkShare 规模目录、公开 spot 目录和上交所 `query.sse.com.cn/commonSoaQuery.do?sqlId=FUND_LIST` 详细目录的代码交叉验证，结算制度只按详细目录 `subClass` 官方代码精确映射：`01/03/09/31/35` 为 T+1，`02/04/05/06/07/32/33/34/36/37/38` 为 T+0，`08` 和未覆盖代码为 unknown。深交所只按精确基金类别/投资类别映射：`ETF + 股票基金` 为 T+1，`ETF + 债券基金` 或 `ETF + 货币市场基金` 为 T+0，其它类别为 unknown。同一 ETF 代码在两个目录一致、且简称差异仅为一方在共同 ETF 名称后追加基金管理人简称时，视为兼容名称；其它名称冲突仍映射为 unknown。禁止按名称或代码前缀猜测证券类型和交易制度；目录冲突、类别缺失或规则未覆盖时禁止默认决策启用。
+证券目录为每个标的提供 `exchange`、`instrument_type`、`settlement_cycle`、`price_limit_ratio`、`metadata_source`、`metadata_checked_at` 和规则版本。A 股固定 T+1。上交所 ETF 必须同时通过 AkShare 规模目录、公开 spot 目录和上交所 `query.sse.com.cn/commonSoaQuery.do?sqlId=FUND_LIST` 详细目录的代码交叉验证，结算制度只按详细目录 `subClass` 官方代码精确映射：`01/03/09/31/35` 为 T+1，`02/04/05/06/07/32/33/34/36/37/38` 为 T+0，`08` 和未覆盖代码为 unknown。深交所只按精确基金类别/投资类别映射：`ETF + 股票基金` 为 T+1，`ETF + 债券基金` 或 `ETF + 货币市场基金` 映射为 T+0，其它类别为 unknown。同一 ETF 代码在所需目录一致时，名称完全相同，或短名已含 `ETF` 且长名以短名开头，或长名以短名开头且新增后缀以 `ETF` 开头，视为结构兼容；验证后的内部名称始终使用 spot 名称。其它名称或同代码交易规则冲突仍映射为 unknown。名称只用于交叉验证和展示，禁止按名称或代码前缀猜测证券类型和交易制度；目录冲突、类别缺失或规则未覆盖时禁止默认决策启用。
 
 adapter 必须完成第三方字段映射、数值和单位统一、六位股票代码校验、时区和交易日校验，只返回项目内部模型。日历使用 `exchange-calendars` 的 `XSHG`；下一交易日、交易分钟、午休、stale 计算和保留期边界都不得用自然日或简单周一至周五近似。
 

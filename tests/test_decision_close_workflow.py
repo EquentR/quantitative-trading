@@ -62,6 +62,7 @@ from quantitative_trading.instrument.models import (
 from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
 from quantitative_trading.watchlist.repository import WatchPinnedRepository
+from tests.instrument_fixtures import etf_name_variant_metadata
 
 
 TRADE_DATE = date(2026, 7, 13)
@@ -1729,27 +1730,23 @@ def test_intraday_workflow_routes_etf_metadata_into_recommendation(tmp_path) -> 
     settings = Settings(database_path=tmp_path / "intraday-etf-workflow.db")
     calendar = XSHGTradingCalendar()
     clock = MutableClock(NOW)
-    metadata = InstrumentMetadata(
-        symbol="510300",
-        name="沪深300ETF",
-        exchange=Exchange.SH,
-        instrument_type=InstrumentType.ETF,
-        settlement_cycle=SettlementCycle.T1,
-        price_limit_ratio=0.10,
-        metadata_source="exchange_catalog",
-        metadata_checked_at=NOW,
-        rule_version="instrument-rules-v1",
-    )
-    loader = lambda symbols: {symbol: metadata for symbol in symbols}
+    metadata = etf_name_variant_metadata(now=NOW, trade_date=TRADE_DATE)
     daily_provider = CalendarDailyProvider(calendar)
     flow_provider = CalendarFlowProvider(calendar)
 
     with connect(settings) as connection:
         migrate(connection)
+        instrument_repository = InstrumentRepository(connection)
+        instrument_repository.replace_catalog([metadata])
+        loader = lambda symbols: {
+            symbol: loaded
+            for symbol in symbols
+            if (loaded := instrument_repository.get(symbol)) is not None
+        }
         PositionRepository(connection).add(
             PositionInput(
-                symbol="510300",
-                name="沪深300ETF",
+                symbol="512480",
+                name="半导体ETF国联安",
                 quantity=1000,
                 available_quantity=1000,
                 cost_price=7.0,
@@ -1758,6 +1755,7 @@ def test_intraday_workflow_routes_etf_metadata_into_recommendation(tmp_path) -> 
             now=datetime(2026, 7, 12, 8, 0, tzinfo=UTC),
         )
         CashAccountRepository(connection).initialize(50_000, now=NOW, note="initial")
+        close_quote_provider = ClockQuoteProvider(clock)
         DecisionWorkflow(
             connection,
             calendar=calendar,
@@ -1765,7 +1763,7 @@ def test_intraday_workflow_routes_etf_metadata_into_recommendation(tmp_path) -> 
             daily_provider=UnexpectedProvider(),
             money_flow_provider=flow_provider,
             intraday_provider=NoopIntradayProvider(),
-            etf_quote_provider=ClockQuoteProvider(clock),
+            etf_quote_provider=close_quote_provider,
             etf_daily_provider=daily_provider,
             etf_intraday_provider=NoopIntradayProvider(),
             instrument_metadata_loader=loader,
@@ -1774,6 +1772,7 @@ def test_intraday_workflow_routes_etf_metadata_into_recommendation(tmp_path) -> 
 
         clock.value = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
         minute_provider = RisingIntradayProvider(calendar, clock)
+        intraday_quote_provider = ClockQuoteProvider(clock)
         result = DecisionWorkflow(
             connection,
             calendar=calendar,
@@ -1781,7 +1780,7 @@ def test_intraday_workflow_routes_etf_metadata_into_recommendation(tmp_path) -> 
             daily_provider=UnexpectedProvider(),
             money_flow_provider=flow_provider,
             intraday_provider=NoopIntradayProvider(),
-            etf_quote_provider=ClockQuoteProvider(clock),
+            etf_quote_provider=intraday_quote_provider,
             etf_daily_provider=daily_provider,
             etf_intraday_provider=minute_provider,
             instrument_metadata_loader=loader,
@@ -1792,13 +1791,15 @@ def test_intraday_workflow_routes_etf_metadata_into_recommendation(tmp_path) -> 
             result.market_input_snapshot_id
         )
 
-    assert minute_provider.calls == [("510300", date(2026, 7, 14), "1m")]
+    assert close_quote_provider.calls == [["512480"]]
+    assert intraday_quote_provider.calls == [["512480"]]
+    assert minute_provider.calls == [("512480", date(2026, 7, 14), "1m")]
     assert flow_provider.calls == []
     assert recommendation.instrument == metadata
     assert recommendation.data_references["money_flow"]["status"] == "not_applicable"
     assert recommendation.data_quality["overall"] == "complete"
     assert market_input is not None
-    assert market_input.instrument_metadata["510300"] == metadata
+    assert market_input.instrument_metadata["512480"] == metadata
 
 
 def test_intraday_reuse_repairs_failed_notification_projections_idempotently(

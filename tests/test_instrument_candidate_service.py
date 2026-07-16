@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -20,9 +20,12 @@ from quantitative_trading.instrument.service import (
     InstrumentCandidateService,
     InstrumentSelectionInvalidError,
 )
+from quantitative_trading.ledger.models import PositionInput
+from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.storage.sqlite import connect, migrate
 from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
 from quantitative_trading.watchlist.repository import WatchPinnedRepository
+from tests.instrument_fixtures import etf_name_variant_metadata
 
 
 NOW = datetime(2026, 7, 15, 2, 0, tzinfo=UTC)
@@ -108,6 +111,39 @@ def test_search_preview_uses_catalog_and_does_not_write_watchlist(tmp_path) -> N
         assert preview.query == "茅台"
         assert [item.symbol for item in preview.items] == ["600519"]
         assert WatchPinnedRepository(connection).list() == []
+
+
+def test_held_etf_name_variant_is_searchable_and_selectable_with_full_name(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "held-etf-search.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        metadata = etf_name_variant_metadata(now=NOW)
+        InstrumentRepository(connection).replace_catalog([metadata])
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="512480",
+                name="半导体ETF国联安",
+                quantity=10_000,
+                available_quantity=10_000,
+                cost_price=0.80,
+                opened_at=date(2026, 7, 1),
+            ),
+            now=NOW,
+        )
+        service = InstrumentCandidateService(connection, now=lambda: NOW)
+
+        code_preview = service.search("512480")
+        name_preview = service.search("国联安")
+
+        assert code_preview.items[0].name == "半导体ETF国联安"
+        assert code_preview.items[0].selectable is True
+        assert name_preview.items[0].symbol == "512480"
+
+        selected = service.select(code_preview.preview_id, ["512480"])
+        assert selected.items[0].name == "半导体ETF国联安"
+        assert selected.items[0].plan_enabled is True
 
 
 def test_selection_is_atomic_defaults_verified_items_and_preserves_existing_fields(
