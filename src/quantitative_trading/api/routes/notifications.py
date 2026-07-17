@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ValidationError
@@ -55,6 +56,7 @@ def _storage_failed() -> ApiError:
 
 @router.get("", response_model=NotificationListResponse)
 def list_notifications(
+    view: Literal["current", "history"] | None = None,
     status: NotificationStatus | None = None,
     symbol: str | None = Query(default=None, pattern=r"^[0-9]{6}$"),
     action: str | None = None,
@@ -66,8 +68,11 @@ def list_notifications(
     try:
         with connection_scope(container.settings) as connection:
             repository = NotificationRepository(connection)
+            service = NotificationService(repository)
+            selected_view = view or "history"
             return NotificationListResponse(
-                items=repository.list(
+                items=service.list_notifications(
+                    view=selected_view,
                     status=status,
                     symbol=symbol,
                     action=action,
@@ -75,11 +80,20 @@ def list_notifications(
                     limit=page_size,
                     offset=(page - 1) * page_size,
                 ),
-                total=repository.count(
-                    status=status,
-                    symbol=symbol,
-                    action=action,
-                    recommendation_id=recommendation_id,
+                total=(
+                    repository.count_current(
+                        status=status,
+                        symbol=symbol,
+                        action=action,
+                        recommendation_id=recommendation_id,
+                    )
+                    if selected_view == "current"
+                    else repository.count(
+                        status=status,
+                        symbol=symbol,
+                        action=action,
+                        recommendation_id=recommendation_id,
+                    )
                 ),
                 page=page,
                 page_size=page_size,
@@ -95,7 +109,9 @@ def unread_count(
     try:
         with connection_scope(container.settings) as connection:
             return UnreadCountResponse(
-                count=NotificationRepository(connection).count_unread()
+                count=NotificationService(
+                    NotificationRepository(connection)
+                ).unread_count()
             )
     except sqlite3.Error as exc:
         raise _storage_failed() from exc

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -11,6 +11,7 @@ from quantitative_trading.instrument.models import InstrumentMetadata
 
 
 Confidence = Literal["low", "medium", "high"]
+NotificationStatusValue = Literal["unread", "read", "feedback_recorded"]
 DATA_REFERENCE_NAMES = (
     "ledger",
     "account",
@@ -88,6 +89,7 @@ class Recommendation(BaseModel):
     market_input_snapshot_id: int | None = Field(default=None, gt=0)
     plan_id: str | None = None
     plan_version: int | str | None = None
+    decision_trade_date: date | None = None
     decision_cycle: str | None = Field(default=None, min_length=1)
     condition_fingerprint: str | None = Field(
         default=None,
@@ -176,3 +178,13 @@ class Recommendation(BaseModel):
         self.data_references = references
 
         return self
+
+
+class RecommendationNotificationProjection(BaseModel):
+    notification_id: str = Field(min_length=1)
+    status: NotificationStatusValue
+
+
+class RecommendationListItem(BaseModel):
+    recommendation: Recommendation
+    notification: RecommendationNotificationProjection | None = None

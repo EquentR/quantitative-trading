@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from math import isfinite
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from quantitative_trading.market.calendar import XSHGTradingCalendar
-from quantitative_trading.market.models import DailyBar, DailyMoneyFlow, MinuteBar
+from quantitative_trading.market.models import (
+    DailyBar,
+    DailyBarCoverageEvidence,
+    DailyMoneyFlow,
+    MinuteBar,
+)
 
 
 class DailyBarProvider(Protocol):
@@ -17,6 +23,23 @@ class DailyBarProvider(Protocol):
         end_date: date,
         adjustment: str,
     ) -> Sequence[DailyBar]: ...
+
+
+@dataclass(frozen=True)
+class DailyBarFetchResult:
+    bars: tuple[DailyBar, ...]
+    coverage_evidence: DailyBarCoverageEvidence
+
+
+@runtime_checkable
+class DailyBarCoverageProvider(Protocol):
+    def get_daily_bars_with_coverage(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        adjustment: str,
+    ) -> DailyBarFetchResult: ...
 
 
 class MoneyFlowProvider(Protocol):
@@ -112,6 +135,22 @@ class AkShareDailyBarProvider(_AkShareAdapter):
         end_date: date,
         adjustment: str,
     ) -> list[DailyBar]:
+        return list(
+            self.get_daily_bars_with_coverage(
+                symbol,
+                start_date,
+                end_date,
+                adjustment,
+            ).bars
+        )
+
+    def get_daily_bars_with_coverage(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        adjustment: str,
+    ) -> DailyBarFetchResult:
         _require_symbol(symbol)
         if adjustment != "forward":
             raise ValueError("daily bars require forward adjustment")
@@ -149,7 +188,21 @@ class AkShareDailyBarProvider(_AkShareAdapter):
                     fetched_at=fetched_at,
                 )
             )
-        return sorted(bars, key=lambda bar: bar.trade_date)
+        bars.sort(key=lambda bar: bar.trade_date)
+        return DailyBarFetchResult(
+            bars=tuple(bars),
+            coverage_evidence=DailyBarCoverageEvidence(
+                requested_start=start_date,
+                requested_end=end_date,
+                observed_start=start_date,
+                observed_end=end_date,
+                earliest_available_date=(
+                    None if not bars else bars[0].trade_date
+                ),
+                complete_request_window=True,
+                source=f"{self.source}_daily_full_window",
+            ),
+        )
 
 
 class AkShareEtfDailyBarProvider(AkShareDailyBarProvider):

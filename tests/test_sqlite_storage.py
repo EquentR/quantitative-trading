@@ -633,6 +633,7 @@ def test_migrate_creates_instrument_directory_tables(tmp_path) -> None:
             "instrument_type",
             "settlement_cycle",
             "price_limit_ratio",
+            "listing_date",
             "metadata_source",
             "metadata_checked_at",
             "rule_version",

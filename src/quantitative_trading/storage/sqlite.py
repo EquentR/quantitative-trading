@@ -8,6 +8,9 @@ from pathlib import Path
 
 from quantitative_trading.config import Settings
 from quantitative_trading.market.schema import MARKET_DECISION_SCHEMA_SQL
+from quantitative_trading.notification.migration import (
+    migrate_legacy_recommendation_notifications,
+)
 
 
 POSITIONS_SCHEMA_SQL = """
@@ -92,6 +95,7 @@ CREATE TABLE IF NOT EXISTS instruments (
   price_limit_ratio REAL CHECK (
     price_limit_ratio IS NULL OR (price_limit_ratio > 0 AND price_limit_ratio <= 1)
   ),
+  listing_date TEXT,
   metadata_source TEXT NOT NULL,
   metadata_checked_at TEXT NOT NULL,
   rule_version TEXT NOT NULL,
@@ -411,10 +415,12 @@ def migrate(connection: sqlite3.Connection) -> None:
         _ensure_market_capture_result_status_constraint(connection)
         _ensure_trading_plan_status_constraint(connection)
         _ensure_scheduler_state_columns(connection)
+        _ensure_instrument_columns(connection)
         _ensure_instrument_catalog_state_columns(connection)
         _ensure_notification_columns(connection)
         _ensure_recommendation_columns(connection)
         _ensure_market_capture_run_columns(connection)
+        migrate_legacy_recommendation_notifications(connection)
         _fail_duplicate_running_workflows(connection)
         _supersede_duplicate_active_plans(connection)
         connection.execute(
@@ -575,6 +581,14 @@ def _ensure_scheduler_state_columns(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE scheduler_state ADD COLUMN {name} {column_type}"
             )
+
+
+def _ensure_instrument_columns(connection: sqlite3.Connection) -> None:
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(instruments)").fetchall()
+    }
+    if "listing_date" not in columns:
+        connection.execute("ALTER TABLE instruments ADD COLUMN listing_date TEXT")
 
 
 def _ensure_instrument_catalog_state_columns(connection: sqlite3.Connection) -> None:

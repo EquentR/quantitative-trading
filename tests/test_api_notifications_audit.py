@@ -76,6 +76,12 @@ def test_notifications_api_supports_auth_pagination_filters_and_unread_count(tmp
                 created_at=NOW + timedelta(minutes=2),
             )
         )
+        repository.save_canonical_group("notif-1", "notif-1", created_at=NOW)
+        repository.save_canonical_group(
+            "notif-2",
+            "notif-2",
+            created_at=NOW + timedelta(minutes=1),
+        )
 
     unauthorized = client.get("/api/v1/notifications")
     response = client.get(
@@ -102,6 +108,96 @@ def test_notifications_api_supports_auth_pagination_filters_and_unread_count(tmp
     }
     assert unread.status_code == 200
     assert unread.json() == {"count": 2}
+
+
+def test_notifications_api_current_view_and_unread_count_use_canonical_union(
+    tmp_path,
+) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    with connect(settings) as connection:
+        repository = NotificationRepository(connection)
+        items = [
+            notification(
+                "notif-history-only",
+                recommendation_id="rec-history",
+                created_at=NOW,
+            ),
+            notification(
+                "notif-current-read",
+                status=NotificationStatus.READ,
+                recommendation_id="rec-current-read",
+                created_at=NOW + timedelta(minutes=1),
+            ),
+            notification(
+                "notif-current-unread",
+                recommendation_id="rec-current-unread",
+                created_at=NOW + timedelta(minutes=2),
+            ),
+            notification(
+                "notif-system-alert",
+                symbol="000000",
+                recommendation_id="system-alert:provider",
+                created_at=NOW + timedelta(minutes=3),
+            ).model_copy(
+                update={"action": "system_alert", "confidence": "critical"}
+            ),
+        ]
+        for item in items:
+            repository.save(item)
+        repository.save_canonical_group(
+            "current-read",
+            "notif-current-read",
+            created_at=NOW + timedelta(minutes=1),
+        )
+        repository.save_canonical_group(
+            "current-unread",
+            "notif-current-unread",
+            created_at=NOW + timedelta(minutes=2),
+        )
+
+    legacy = client.get("/api/v1/notifications", headers=headers)
+    history = client.get(
+        "/api/v1/notifications",
+        params={"view": "history"},
+        headers=headers,
+    )
+    current = client.get(
+        "/api/v1/notifications",
+        params={"view": "current"},
+        headers=headers,
+    )
+    current_unread = client.get(
+        "/api/v1/notifications",
+        params={"view": "current", "status": "unread"},
+        headers=headers,
+    )
+    unread = client.get("/api/v1/notifications/unread-count", headers=headers)
+    invalid = client.get(
+        "/api/v1/notifications",
+        params={"view": "latest"},
+        headers=headers,
+    )
+
+    assert [item["notification_id"] for item in legacy.json()["items"]] == [
+        "notif-system-alert",
+        "notif-current-unread",
+        "notif-current-read",
+        "notif-history-only",
+    ]
+    assert history.json() == legacy.json()
+    assert [item["notification_id"] for item in current.json()["items"]] == [
+        "notif-system-alert",
+        "notif-current-unread",
+        "notif-current-read",
+    ]
+    assert current.json()["total"] == 3
+    assert [item["notification_id"] for item in current_unread.json()["items"]] == [
+        "notif-system-alert",
+        "notif-current-unread",
+    ]
+    assert current_unread.json()["total"] == 2
+    assert unread.json() == {"count": 2}
+    assert invalid.status_code == 422
 
 
 def test_mark_notification_read_is_idempotent_preserves_feedback_and_writes_audit(tmp_path) -> None:

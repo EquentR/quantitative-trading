@@ -12,9 +12,20 @@ from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.cash.repository import CashAccountRepository
 from quantitative_trading.config import Settings
 from quantitative_trading.decision.workflow import WorkflowAlreadyRunningError
+from quantitative_trading.instrument.models import (
+    Exchange,
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
+from quantitative_trading.instrument.repository import InstrumentRepository
+from quantitative_trading.ledger.models import PositionInput
+from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.market.models import CaptureRunStatus
 from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.storage.sqlite import connect
+from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
+from quantitative_trading.watchlist.repository import WatchPinnedRepository
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -65,6 +76,37 @@ def install_workflow(monkeypatch, workflow) -> list[datetime]:
 
     monkeypatch.setattr(routes, "build_decision_workflow", factory)
     return factory_times
+
+
+def seed_enabled_symbols(settings: Settings, *symbols: str) -> None:
+    with connect(settings) as connection:
+        InstrumentRepository(connection).replace_catalog(
+            [
+                InstrumentMetadata(
+                    symbol=symbol,
+                    name=symbol,
+                    exchange=Exchange.SH if symbol.startswith("6") else Exchange.SZ,
+                    instrument_type=InstrumentType.A_SHARE,
+                    settlement_cycle=SettlementCycle.T1,
+                    metadata_source="test-directory",
+                    metadata_checked_at=INTRADAY_TIME,
+                    rule_version="test-rules-v1",
+                )
+                for symbol in symbols
+            ]
+        )
+        repository = WatchPinnedRepository(connection)
+        for rank, symbol in enumerate(symbols, start=1):
+            repository.upsert(
+                WatchPinnedInput(
+                    symbol=symbol,
+                    name=symbol,
+                    rank=rank,
+                    plan_enabled=True,
+                ),
+                source=WatchPinnedSource.MANUAL,
+                now=INTRADAY_TIME,
+            )
 
 
 def test_workflow_routes_require_authentication(tmp_path) -> None:
@@ -205,6 +247,7 @@ def test_backfill_passes_explicit_symbols_and_maps_failed_summary(
         tmp_path,
         enable_market_fetch=True,
     )
+    seed_enabled_symbols(settings, "600000", "000001")
 
     response = client.post(
         "/api/v1/service/workflows/backfill/run",
@@ -231,6 +274,92 @@ def test_backfill_passes_explicit_symbols_and_maps_failed_summary(
     assert alerts[0].action == "system_alert"
     assert invalid_symbol.status_code == 422
     assert invalid_symbol.json()["error"]["code"] == "validation_error"
+
+
+def test_backfill_latest_complete_resolves_cutoff_and_validates_scope(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls: list[tuple[date, list[str] | None]] = []
+
+    class FakeWorkflow:
+        def run_backfill(self, trade_date: date, *, symbols=None):
+            calls.append((trade_date, symbols))
+            return SimpleNamespace(
+                run_id="backfill-latest-complete",
+                status=CaptureRunStatus.SUCCEEDED,
+                reused=False,
+                warnings=(),
+            )
+
+    install_clock(monkeypatch, INTRADAY_TIME)
+    install_workflow(monkeypatch, FakeWorkflow())
+    client, headers, settings = authenticated_client(
+        tmp_path,
+        enable_market_fetch=True,
+    )
+    with connect(settings) as connection:
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="512480",
+                name="半导体ETF",
+                quantity=1000,
+                available_quantity=1000,
+                cost_price=1.0,
+                opened_at=INTRADAY_TIME.date(),
+            ),
+            now=INTRADAY_TIME,
+        )
+        WatchPinnedRepository(connection).upsert(
+            WatchPinnedInput(
+                symbol="000001",
+                name="disabled watch",
+                rank=1,
+                plan_enabled=False,
+            ),
+            source=WatchPinnedSource.MANUAL,
+            now=INTRADAY_TIME,
+        )
+
+    response = client.post(
+        "/api/v1/service/workflows/backfill/run",
+        json={"as_of_mode": "latest_complete", "symbols": ["512480"]},
+        headers=headers,
+    )
+    conflicting = client.post(
+        "/api/v1/service/workflows/backfill/run",
+        json={
+            "as_of_mode": "latest_complete",
+            "trade_date": "2026-07-13",
+        },
+        headers=headers,
+    )
+    outside_scope = client.post(
+        "/api/v1/service/workflows/backfill/run",
+        json={"as_of_mode": "latest_complete", "symbols": ["000001"]},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["run_id"] == "backfill-latest-complete"
+    assert calls == [(date(2026, 7, 13), ["512480"])]
+    assert conflicting.status_code == 422
+    assert conflicting.json()["error"]["code"] == "workflow_request_invalid"
+    assert outside_scope.status_code == 422
+    assert outside_scope.json()["error"]["code"] == "workflow_request_invalid"
+    with connect(settings) as connection:
+        requested_audits = AuditLogRepository(connection).list(
+            event_type="service.workflow.run_requested"
+        )
+        rejected_audits = AuditLogRepository(connection).list(
+            event_type="service.workflow.run_rejected"
+        )
+    assert requested_audits[0].payload["as_of_mode"] == "latest_complete"
+    assert len(rejected_audits) == 2
+    assert all(
+        audit.payload["as_of_mode"] == "latest_complete"
+        for audit in rejected_audits
+    )
 
 
 def test_close_workflow_uses_factory_and_returns_unified_result(

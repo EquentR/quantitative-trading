@@ -3,9 +3,17 @@ from datetime import UTC, date, datetime
 
 import pytest
 
+import quantitative_trading.market.models as market_models
+from quantitative_trading.market.adapters import DailyBarFetchResult
 from quantitative_trading.market.backfill import HeavyDataBackfillService
 from quantitative_trading.market.calendar import XSHGTradingCalendar
-from quantitative_trading.market.models import DailyBar, DailyMoneyFlow, MinuteBar
+from quantitative_trading.market.models import (
+    DailyBar,
+    DailyBarCoverageEvidence,
+    DailyMoneyFlow,
+    ListingDateEvidence,
+    MinuteBar,
+)
 from quantitative_trading.market.models import (
     IntradayStrengthSnapshot,
     StrengthConfidence,
@@ -88,9 +96,60 @@ class RecordingFlowProvider:
         ]
 
 
-def make_service(connection):
+class ShortDailyProvider(RecordingDailyProvider):
+    def __init__(
+        self,
+        calendar: XSHGTradingCalendar,
+        *,
+        window_rows: int,
+        omitted_index: int | None = None,
+    ) -> None:
+        super().__init__(calendar)
+        self.window_rows = window_rows
+        self.omitted_index = omitted_index
+
+    def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+        bars = super().get_daily_bars(symbol, start_date, end_date, adjustment)[
+            -self.window_rows :
+        ]
+        if self.omitted_index is not None and self.omitted_index < len(bars):
+            bars.pop(self.omitted_index)
+        return bars
+
+
+class CoverageShortDailyProvider(ShortDailyProvider):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.coverage_calls = []
+
+    def get_daily_bars_with_coverage(
+        self,
+        symbol,
+        start_date,
+        end_date,
+        adjustment,
+    ) -> DailyBarFetchResult:
+        self.coverage_calls.append((symbol, start_date, end_date, adjustment))
+        bars = tuple(self.get_daily_bars(symbol, start_date, end_date, adjustment))
+        return DailyBarFetchResult(
+            bars=bars,
+            coverage_evidence=DailyBarCoverageEvidence(
+                requested_start=start_date,
+                requested_end=end_date,
+                observed_start=start_date,
+                observed_end=end_date,
+                earliest_available_date=(
+                    None if not bars else bars[0].trade_date
+                ),
+                complete_request_window=True,
+                source="fake_daily_full_window",
+            ),
+        )
+
+
+def make_service(connection, *, daily_provider=None):
     calendar = XSHGTradingCalendar()
-    daily_provider = RecordingDailyProvider(calendar)
+    daily_provider = daily_provider or RecordingDailyProvider(calendar)
     flow_provider = RecordingFlowProvider(calendar)
     return (
         HeavyDataBackfillService(
@@ -107,6 +166,188 @@ def make_service(connection):
         daily_provider,
         flow_provider,
     )
+
+
+def test_minimum_history_rows_is_a_shared_contract() -> None:
+    assert market_models.MIN_HISTORY_ROWS == 20
+
+
+def test_provider_window_evidence_verifies_short_history_with_session_gap(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    coverage_provider = CoverageShortDailyProvider(
+        calendar,
+        window_rows=21,
+        omitted_index=10,
+    )
+    coverage_service, _, _, _ = make_service(
+        connection,
+        daily_provider=coverage_provider,
+    )
+
+    covered = coverage_service.backfill_daily("run-covered", "600000", as_of)
+
+    assert coverage_provider.coverage_calls == [
+        (
+            "600000",
+            calendar.sessions_ending(as_of, 250)[0],
+            as_of,
+            "forward",
+        )
+    ]
+    assert covered.snapshot.completeness == "verified_provider_window"
+    assert covered.snapshot.coverage_evidence is not None
+    assert covered.snapshot.coverage_evidence.complete_request_window is True
+    assert covered.snapshot.row_count == 20
+    assert covered.snapshot.is_usable(as_of=as_of, expected_rows=250)
+
+
+def test_provider_window_evidence_allows_no_bar_on_cutoff_session(connection) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    provider = CoverageShortDailyProvider(
+        calendar,
+        window_rows=21,
+        omitted_index=20,
+    )
+    service, _, _, _ = make_service(connection, daily_provider=provider)
+
+    result = service.backfill_daily("run-cutoff-suspension", "600000", as_of)
+
+    assert result.snapshot.row_count == 20
+    assert result.snapshot.data_end == calendar.previous_trading_day(as_of)
+    assert result.snapshot.completeness == "verified_provider_window"
+    assert result.snapshot.is_usable(as_of=as_of, expected_rows=250)
+
+
+def test_legacy_short_history_remains_unverifiable(connection) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    legacy_provider = ShortDailyProvider(calendar, window_rows=20)
+    legacy_service, _, _, _ = make_service(
+        connection,
+        daily_provider=legacy_provider,
+    )
+    legacy = legacy_service.backfill_daily("run-legacy", "000001", as_of)
+
+    assert legacy.snapshot.completeness == "unverifiable"
+    assert not legacy.snapshot.is_usable(as_of=as_of, expected_rows=250)
+
+
+def test_verified_history_below_minimum_rows_is_not_usable(connection) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    insufficient_provider = CoverageShortDailyProvider(calendar, window_rows=19)
+    insufficient_service, _, _, _ = make_service(
+        connection,
+        daily_provider=insufficient_provider,
+    )
+    insufficient = insufficient_service.backfill_daily(
+        "run-insufficient",
+        "600001",
+        as_of,
+    )
+
+    assert insufficient.snapshot.completeness == "verified_provider_window"
+    assert insufficient.snapshot.row_count == 19
+    assert not insufficient.snapshot.is_usable(as_of=as_of, expected_rows=250)
+
+
+def test_unverifiable_local_short_cache_requests_full_window_for_provider_evidence(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    legacy_service, _, _, _ = make_service(
+        connection,
+        daily_provider=ShortDailyProvider(
+            calendar,
+            window_rows=21,
+            omitted_index=10,
+        ),
+    )
+    legacy = legacy_service.backfill_daily("run-legacy-cache", "600000", as_of)
+    assert legacy.snapshot.completeness == "unverifiable"
+
+    coverage_provider = CoverageShortDailyProvider(
+        calendar,
+        window_rows=21,
+        omitted_index=10,
+    )
+    coverage_service, _, _, _ = make_service(
+        connection,
+        daily_provider=coverage_provider,
+    )
+    verified = coverage_service.backfill_daily(
+        "run-verify-cache",
+        "600000",
+        as_of,
+    )
+
+    assert coverage_provider.coverage_calls == [
+        (
+            "600000",
+            calendar.sessions_ending(as_of, 250)[0],
+            as_of,
+            "forward",
+        )
+    ]
+    assert verified.snapshot.completeness == "verified_provider_window"
+    assert verified.snapshot.row_count == 20
+    assert verified.snapshot.is_usable(as_of=as_of, expected_rows=250)
+
+
+def test_short_history_accepts_contiguous_verified_listing_window(connection) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    listing_date = calendar.sessions_ending(as_of, 20)[0]
+    provider = ShortDailyProvider(calendar, window_rows=20)
+    service, _, _, _ = make_service(connection, daily_provider=provider)
+
+    result = service.backfill_daily(
+        "run-listing",
+        "603459",
+        as_of,
+        listing_evidence=ListingDateEvidence(
+            listing_date=listing_date,
+            source="exchange_directory",
+        ),
+    )
+
+    assert result.snapshot.completeness == "verified_listing_date"
+    assert result.snapshot.listing_evidence == ListingDateEvidence(
+        listing_date=listing_date,
+        source="exchange_directory",
+    )
+    assert result.snapshot.is_usable(as_of=as_of, expected_rows=250)
+
+
+def test_listing_evidence_does_not_hide_an_unexplained_history_gap(connection) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    listing_date = calendar.sessions_ending(as_of, 21)[0]
+    provider = ShortDailyProvider(
+        calendar,
+        window_rows=21,
+        omitted_index=10,
+    )
+    service, _, _, _ = make_service(connection, daily_provider=provider)
+
+    result = service.backfill_daily(
+        "run-listing-gap",
+        "603459",
+        as_of,
+        listing_evidence=ListingDateEvidence(
+            listing_date=listing_date,
+            source="exchange_directory",
+        ),
+    )
+
+    assert result.snapshot.row_count == 20
+    assert result.snapshot.completeness == "unverifiable"
+    assert not result.snapshot.is_usable(as_of=as_of, expected_rows=250)
 
 
 def test_backfill_uses_250_and_60_trading_day_baselines_then_five_day_correction(

@@ -14,6 +14,8 @@ from quantitative_trading.feedback.repository import FeedbackRepository
 from quantitative_trading.cash.repository import CashAccountRepository
 from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.market.adapters import (
+    DailyBarCoverageProvider,
+    DailyBarFetchResult,
     DailyBarProvider,
     IntradayProvider,
     MarketProviderError,
@@ -36,6 +38,7 @@ from quantitative_trading.market.models import (
     CaptureResultStatus,
     CaptureRunAlreadyActiveError,
     CaptureRunStatus,
+    DailyBarCoverageEvidence,
     DatasetQuality,
     MarketCaptureResult,
     MarketCaptureRun,
@@ -489,9 +492,13 @@ class DecisionWorkflow:
                 rows_received += history.rows_received
                 rows_written += history.rows_written
                 history_refs[symbol] = history.snapshot_id
-                history_ready = (
-                    history.snapshot.data_end == trade_date
-                    and history.snapshot.row_count >= 20
+                if history.snapshot.warning:
+                    warning = f"{symbol} {history.snapshot.warning}"
+                    if warning not in warnings:
+                        warnings.append(warning)
+                history_ready = history.snapshot.is_usable(
+                    as_of=trade_date,
+                    expected_rows=backfill.DAILY_WINDOW,
                 )
                 if not history_ready:
                     hard_ready = False
@@ -2402,6 +2409,42 @@ class _RoutedDailyProvider:
         self.etf_provider = etf_provider
 
     def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+        provider = self._provider(symbol)
+        return provider.get_daily_bars(symbol, start_date, end_date, adjustment)
+
+    def get_daily_bars_with_coverage(
+        self,
+        symbol,
+        start_date,
+        end_date,
+        adjustment,
+    ) -> DailyBarFetchResult:
+        provider = self._provider(symbol)
+        if isinstance(provider, DailyBarCoverageProvider):
+            return provider.get_daily_bars_with_coverage(
+                symbol,
+                start_date,
+                end_date,
+                adjustment,
+            )
+        bars = tuple(
+            provider.get_daily_bars(symbol, start_date, end_date, adjustment)
+        )
+        dates = [bar.trade_date for bar in bars]
+        return DailyBarFetchResult(
+            bars=bars,
+            coverage_evidence=DailyBarCoverageEvidence(
+                requested_start=start_date,
+                requested_end=end_date,
+                observed_start=None if not dates else min(dates),
+                observed_end=None if not dates else max(dates),
+                earliest_available_date=None if not dates else min(dates),
+                complete_request_window=False,
+                source="legacy_daily_provider_unverified",
+            ),
+        )
+
+    def _provider(self, symbol: str) -> DailyBarProvider:
         instrument = self.metadata.get(symbol)
         if instrument is not None and instrument.instrument_type is InstrumentType.UNKNOWN:
             raise MarketProviderError("instrument type is unknown")
@@ -2412,7 +2455,7 @@ class _RoutedDailyProvider:
         )
         if provider is None:
             raise MarketProviderError("ETF daily provider is not configured")
-        return provider.get_daily_bars(symbol, start_date, end_date, adjustment)
+        return provider
 
 
 class _RoutedIntradayProvider:

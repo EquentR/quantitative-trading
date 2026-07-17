@@ -177,12 +177,16 @@
 
 去重键至少包含交易日、3 分钟周期、标的、最终动作、计划版本和条件指纹。条件指纹覆盖触发规则、风险、失效条件和仓位约束。相同输入和条件的幂等重跑复用已有建议；动作、风险、失效条件、数量、仓位上限或计划版本发生实质变化时允许生成新建议。
 
+条件指纹当前版本为 v2。它包含 `reason`、`risk`、`position_constraint`、`condition_context` 及影响裁决的稳定证券制度字段，排除 `data_time`、`fetched_at`、`metadata_checked_at`、展示名称、来源和 warning 等易变展示元数据。Recommendation 仍按交易日和 3 分钟周期保存完整审计历史；通知 canonical key 则移除周期，使用上海交易日、标的、最终动作、计划 ID/版本和 v2 条件指纹，使跨周期相同条件只产生一条当前通知。
+
 ## 5. HTTP API 契约
 
 建议 API 只读取统一 `DecisionWorkflow` 已经保存的建议：
 
 ```text
 GET /api/v1/recommendations?page=1&page_size=20
+GET /api/v1/recommendations?view=current&page=1&page_size=20
+GET /api/v1/recommendations?view=history&page=1&page_size=20
 GET /api/v1/recommendations/{recommendation_id}
 GET /api/v1/recommendations/{recommendation_id}/trace
 ```
@@ -198,7 +202,7 @@ GET /api/v1/recommendations/{recommendation_id}/trace
 }
 ```
 
-`items` 中每一项必须满足本文定义的建议模型。对于非持仓买入侧，最新计划不存在时返回或降级为稳定的计划门禁结果；计划不可消费时必须保留 `plan_id`、`status` 和 `valid_until`。持仓风险例外不能被计划错误整体阻断。列表接口使用稳定排序，详情接口按 `recommendation_id` 返回单条建议，trace 接口解析实际输入和审计引用。
+无 `view` 时保持旧客户端契约，`items` 直接包含本文定义的 Recommendation，且返回完整历史。显式 `view=current|history` 时，`items` 统一为 `{"recommendation": {...}, "notification": {"notification_id": "...", "status": "unread"}}`；尚未投递或无法建立 link 时 `notification=null`。current 在 SQL 中按 symbol 以 Recommendation 数据库 `created_at DESC, rowid DESC` 选择最新一条，再执行稳定排序和分页，`total` 是 symbol 数；显式 history 保留完整历史、旧排序和建议总数。对于非持仓买入侧，最新计划不存在时返回或降级为稳定的计划门禁结果；计划不可消费时必须保留 `plan_id`、`status` 和 `valid_until`。持仓风险例外不能被计划错误整体阻断。详情接口按 `recommendation_id` 返回原始单条建议，trace 接口解析实际输入和审计引用。
 
 旧 `POST /api/v1/recommendations/scan` 已退役，认证请求固定返回 HTTP `410`、错误码 `recommendation_scan_retired` 和盘中工作流替代地址，不采集数据也不写建议。旧 `qt recommendations scan` 同样以非零状态退出；手动生成盘中建议只能使用认证的 `POST /api/v1/service/workflows/intraday/run` 或 `qt workflow intraday`，两者与后台调度共享 `DecisionWorkflow`。
 
@@ -212,9 +216,9 @@ GET /api/v1/recommendations/{recommendation_id}/trace
 - `read`：用户或后续界面已标记读取。
 - `feedback_recorded`：已记录关联建议的人工执行反馈。
 
-人工执行反馈字段为 `recommendation_id`、`executed`、`execution_price`、`execution_quantity`、`note` 和 `created_at`。反馈写入后可以把同一建议关联通知标记为 `feedback_recorded`，但不得修改手动持仓台账、手动资金账户、现金余额、净本金或账户快照。反馈只用于复盘和策略改进，不代表系统确认真实成交。
+每个 Recommendation 通过显式 link 关联 canonical notification；通知保留首次创建时的原始 Recommendation ID 和审计引用，不随新周期覆盖。人工执行反馈字段为 `recommendation_id`、`executed`、`execution_price`、`execution_quantity`、`note` 和 `created_at`。反馈写入后优先通过 link 把 canonical notification 标记为 `feedback_recorded`；旧数据没有 link 时，只按完全相同的通知原始 Recommendation ID 保守回退，不按标的、动作或相似条件猜测。反馈不得修改手动持仓台账、手动资金账户、现金余额、净本金或账户快照，只用于复盘和策略改进，不代表系统确认真实成交。
 
-通知和审计读取路由是稳定 API：通知支持列表、未读数和标记已读，审计支持列表和按 ID 查询；所有列表统一返回 `{items,total,page,page_size}`。通知去重键包含交易日、标的、动作、计划版本和条件指纹；相同条件不重复创建，实质变化允许新通知。
+通知和审计读取路由是稳定 API：通知支持列表、未读数和标记已读，审计支持列表和按 ID 查询；所有列表统一返回 `{items,total,page,page_size}`。`GET /notifications?view=current|history` 显式选择当前或历史视图，无 `view` 时为兼容旧调用固定返回 history。current 和未读数使用“canonical Recommendation 通知加全部 `system_alert`”集合；history 返回全部原始通知。通知去重键包含上海交易日、标的、动作、计划 ID/版本和 v2 条件指纹；相同条件不重复创建，跨日或实质变化允许新通知。
 
 `buy/add/sell/reduce` 在本地通知成功后立即写入邮件 outbox；`hold/watch/avoid` 只在收盘计划发布后进入同一活动计划版本的一封每日摘要。关键工作流故障先创建数据库通知并投射到 Web/API、控制台和 JSONL，SMTP 可用时再进入邮件 outbox；SMTP 不可用不得压制本地告警。邮件达到最大尝试次数成为 `dead` 时生成去重的本地系统告警，同样可在 Web 查看并写控制台和 JSONL。邮件失败独立重试，不得回滚建议、通知或重跑 `DecisionWorkflow`。通知、邮件和审计中的错误只能保存经过清理的安全摘要。
 

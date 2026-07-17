@@ -5,7 +5,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -32,6 +32,35 @@ class SseFundClassificationProvider(Protocol):
     def fetch(self) -> dict[str, str]: ...
 
 
+@dataclass(frozen=True)
+class SseFundDirectoryMetadata:
+    subclasses: dict[str, str]
+    listing_dates: dict[str, date]
+    listing_date_conflicts: frozenset[str] = frozenset()
+    warnings: tuple[str, ...] = ()
+
+
+@runtime_checkable
+class SseFundDirectoryMetadataProvider(Protocol):
+    def fetch_metadata(self) -> SseFundDirectoryMetadata: ...
+
+
+def _optional_date_value(value: object) -> date | None:
+    text = str(value if value is not None else "").strip()
+    if text.lower() in {"", "none", "nan", "nat", "<na>"}:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    for date_format in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(text, date_format).date()
+        except ValueError:
+            continue
+    return None
+
+
 class SseFundClassificationSource:
     def __init__(
         self,
@@ -43,6 +72,9 @@ class SseFundClassificationSource:
         self._timeout_seconds = timeout_seconds
 
     def fetch(self) -> dict[str, str]:
+        return self.fetch_metadata().subclasses
+
+    def fetch_metadata(self) -> SseFundDirectoryMetadata:
         query = urlencode(
             {
                 "isPagination": "true",
@@ -75,6 +107,9 @@ class SseFundClassificationSource:
                 raise ValueError("result is missing or empty")
 
             subclasses: dict[str, str] = {}
+            listing_dates: dict[str, date] = {}
+            listing_conflicts: set[str] = set()
+            warnings: list[str] = []
             for row in rows:
                 if not isinstance(row, dict):
                     raise ValueError("result row is not an object")
@@ -95,7 +130,34 @@ class SseFundClassificationSource:
                     subclasses[symbol] = SSE_SUBCLASS_CONFLICT
                 elif existing is None:
                     subclasses[symbol] = normalized_subclass
-            return subclasses
+                listing_date = _optional_date_value(row.get("listingDate"))
+                if listing_date is None:
+                    raw = str(row.get("listingDate", "")).strip().lower()
+                    if raw not in {"", "none", "nan", "nat", "<na>"}:
+                        warnings.append(
+                            f"SSE FUND_LIST returned invalid listingDate for {symbol}"
+                        )
+                    continue
+                existing_listing_date = listing_dates.get(symbol)
+                if (
+                    symbol in listing_conflicts
+                    or existing_listing_date is not None
+                    and existing_listing_date != listing_date
+                ):
+                    listing_dates.pop(symbol, None)
+                    if symbol not in listing_conflicts:
+                        warnings.append(
+                            f"SSE FUND_LIST contains conflicting listingDate for {symbol}"
+                        )
+                    listing_conflicts.add(symbol)
+                elif existing_listing_date is None:
+                    listing_dates[symbol] = listing_date
+            return SseFundDirectoryMetadata(
+                subclasses=subclasses,
+                listing_dates=listing_dates,
+                listing_date_conflicts=frozenset(listing_conflicts),
+                warnings=tuple(warnings),
+            )
         except InstrumentDirectoryProviderError:
             raise
         except Exception:
@@ -150,8 +212,24 @@ class AkShareInstrumentDirectoryAdapter:
             raise InstrumentDirectoryProviderError(safe_error_summary(exc)) from None
 
         classification_warnings: list[str] = []
+        sse_listing_dates: dict[str, date] = {}
+        sse_listing_date_conflicts: frozenset[str] = frozenset()
         try:
-            sse_subclasses = self._sse_fund_classifications.fetch()
+            if isinstance(
+                self._sse_fund_classifications,
+                SseFundDirectoryMetadataProvider,
+            ):
+                sse_metadata = self._sse_fund_classifications.fetch_metadata()
+                sse_subclasses = sse_metadata.subclasses
+                sse_listing_dates = sse_metadata.listing_dates
+                sse_listing_date_conflicts = getattr(
+                    sse_metadata,
+                    "listing_date_conflicts",
+                    frozenset(),
+                )
+                classification_warnings.extend(sse_metadata.warnings)
+            else:
+                sse_subclasses = self._sse_fund_classifications.fetch()
         except Exception as exc:
             sse_subclasses = {}
             classification_warnings.append(
@@ -170,6 +248,8 @@ class AkShareInstrumentDirectoryAdapter:
                 sse_etf=sse_etf,
                 szse_etf=szse_etf,
                 sse_subclasses=sse_subclasses,
+                sse_listing_dates=sse_listing_dates,
+                sse_listing_date_conflicts=sse_listing_date_conflicts,
                 initial_warnings=classification_warnings,
             )
         except Exception as exc:
@@ -189,6 +269,8 @@ class AkShareInstrumentDirectoryAdapter:
         sse_etf: Any,
         szse_etf: Any,
         sse_subclasses: dict[str, str],
+        sse_listing_dates: dict[str, date],
+        sse_listing_date_conflicts: frozenset[str],
         initial_warnings: list[str] | None = None,
     ) -> InstrumentDirectorySnapshot:
         warnings: list[str] = list(initial_warnings or [])
@@ -199,6 +281,7 @@ class AkShareInstrumentDirectoryAdapter:
             exchange=Exchange.SH,
             code_field="证券代码",
             name_field="证券简称",
+            listing_date_field="上市日期",
             source=self.SH_A_SOURCE,
             checked_at=checked_at,
             warnings=warnings,
@@ -209,6 +292,7 @@ class AkShareInstrumentDirectoryAdapter:
             exchange=Exchange.SH,
             code_field="证券代码",
             name_field="证券简称",
+            listing_date_field="上市日期",
             source=self.SH_A_SOURCE,
             checked_at=checked_at,
             warnings=warnings,
@@ -219,6 +303,7 @@ class AkShareInstrumentDirectoryAdapter:
             exchange=Exchange.SZ,
             code_field="A股代码",
             name_field="A股简称",
+            listing_date_field="A股上市日期",
             source=self.SZ_A_SOURCE,
             checked_at=checked_at,
             warnings=warnings,
@@ -230,6 +315,8 @@ class AkShareInstrumentDirectoryAdapter:
             sse_etf,
             spot_names=spot_names,
             subclasses=sse_subclasses,
+            listing_dates=sse_listing_dates,
+            listing_date_conflicts=sse_listing_date_conflicts,
             checked_at=checked_at,
             warnings=warnings,
         )
@@ -258,6 +345,7 @@ class AkShareInstrumentDirectoryAdapter:
                     item.instrument_type,
                     item.settlement_cycle,
                     item.price_limit_ratio,
+                    item.listing_date,
                     item.rule_version,
                     tuple(item.warnings),
                 )
@@ -309,6 +397,7 @@ class AkShareInstrumentDirectoryAdapter:
         exchange: Exchange,
         code_field: str,
         name_field: str,
+        listing_date_field: str,
         source: str,
         checked_at: datetime,
         warnings: list[str],
@@ -339,6 +428,13 @@ class AkShareInstrumentDirectoryAdapter:
                     instrument_type=InstrumentType.A_SHARE,
                     settlement_cycle=rule.settlement_cycle,
                     price_limit_ratio=None,
+                    listing_date=self._listing_date(
+                        row,
+                        listing_date_field,
+                        symbol=symbol,
+                        source=source,
+                        warnings=warnings,
+                    ),
                     metadata_source=source,
                     metadata_checked_at=checked_at,
                     rule_version=rule.rule_version,
@@ -372,6 +468,8 @@ class AkShareInstrumentDirectoryAdapter:
         *,
         spot_names: dict[str, str | None],
         subclasses: dict[str, str],
+        listing_dates: dict[str, date],
+        listing_date_conflicts: frozenset[str],
         checked_at: datetime,
         warnings: list[str],
     ) -> None:
@@ -411,6 +509,21 @@ class AkShareInstrumentDirectoryAdapter:
                     )
                 )
                 continue
+            if symbol in listing_date_conflicts:
+                warning = (
+                    f"instrument {symbol} has conflicting directory listing dates"
+                )
+                warnings.append(warning)
+                entries[symbol].append(
+                    self._unknown_metadata(
+                        symbol,
+                        spot_name,
+                        checked_at=checked_at,
+                        warning=warning,
+                        source="directory_conflict",
+                    )
+                )
+                continue
             rule = self._resolver.resolve_sse_etf(subclasses.get(symbol))
             if subclasses.get(symbol) == SSE_SUBCLASS_CONFLICT:
                 rule = replace(
@@ -427,6 +540,7 @@ class AkShareInstrumentDirectoryAdapter:
                     settlement_cycle=rule.settlement_cycle,
                     rule_version=rule.rule_version,
                     warning=rule.warning,
+                    listing_date=listing_dates.get(symbol),
                 )
             )
 
@@ -492,6 +606,13 @@ class AkShareInstrumentDirectoryAdapter:
                     settlement_cycle=rule.settlement_cycle,
                     rule_version=rule.rule_version,
                     warning=rule.warning,
+                    listing_date=self._listing_date(
+                        row,
+                        "上市日期",
+                        symbol=symbol,
+                        source=self.SZ_ETF_SOURCE,
+                        warnings=warnings,
+                    ),
                 )
             )
 
@@ -506,6 +627,7 @@ class AkShareInstrumentDirectoryAdapter:
         settlement_cycle: SettlementCycle,
         rule_version: str,
         warning: str,
+        listing_date: date | None,
     ) -> InstrumentMetadata:
         return InstrumentMetadata(
             symbol=symbol,
@@ -514,6 +636,7 @@ class AkShareInstrumentDirectoryAdapter:
             instrument_type=InstrumentType.ETF,
             settlement_cycle=settlement_cycle,
             price_limit_ratio=None,
+            listing_date=listing_date,
             metadata_source=source,
             metadata_checked_at=checked_at,
             rule_version=rule_version,
@@ -567,6 +690,24 @@ class AkShareInstrumentDirectoryAdapter:
             return None
         text = str(value).strip()
         return None if not text or text.lower() == "nan" else text
+
+    @staticmethod
+    def _listing_date(
+        row: Any,
+        field: str,
+        *,
+        symbol: str,
+        source: str,
+        warnings: list[str],
+    ) -> date | None:
+        raw = row.get(field)
+        listing_date = _optional_date_value(raw)
+        if listing_date is not None:
+            return listing_date
+        text = str(raw if raw is not None else "").strip().lower()
+        if text not in {"", "none", "nan", "nat", "<na>"}:
+            warnings.append(f"{source} returned invalid listing date for {symbol}")
+        return None
 
     @staticmethod
     def _compatible_etf_names(first: str, second: str) -> bool:

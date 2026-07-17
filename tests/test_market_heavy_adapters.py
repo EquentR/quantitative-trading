@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime
 import pandas as pd
 import pytest
 
+import quantitative_trading.market.adapters as market_adapters
 from quantitative_trading.market.adapters import (
     AkShareDailyBarProvider,
     AkShareEtfDailyBarProvider,
@@ -31,8 +32,8 @@ class FakeAkShare:
         self.flow_calls = []
         self.minute_calls = []
 
-    def stock_zh_a_hist(self, **kwargs):
-        self.daily_calls.append(kwargs)
+    @staticmethod
+    def _daily_frame():
         return pd.DataFrame(
             [
                 {
@@ -46,6 +47,10 @@ class FakeAkShare:
                 }
             ]
         )
+
+    def stock_zh_a_hist(self, **kwargs):
+        self.daily_calls.append(("stock_zh_a_hist", kwargs))
+        return self._daily_frame()
 
     def stock_individual_fund_flow(self, **kwargs):
         self.flow_calls.append(kwargs)
@@ -93,8 +98,8 @@ class FakeAkShare:
         )
 
     def fund_etf_hist_em(self, **kwargs):
-        self.daily_calls.append(kwargs)
-        return self.stock_zh_a_hist()
+        self.daily_calls.append(("fund_etf_hist_em", kwargs))
+        return self._daily_frame()
 
     def fund_etf_hist_min_em(self, **kwargs):
         self.minute_calls.append(kwargs)
@@ -109,9 +114,81 @@ def test_akshare_daily_provider_requests_forward_adjustment_and_converts_lots() 
         "600000", date(2026, 7, 10), date(2026, 7, 10), "forward"
     )
 
-    assert akshare.daily_calls[0]["adjust"] == "qfq"
+    assert akshare.daily_calls[0][1]["adjust"] == "qfq"
     assert bars[0].volume == 12_300
     assert bars[0].amount == 129_150
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "symbol", "endpoint", "evidence_source"),
+    [
+        (
+            AkShareDailyBarProvider,
+            "600000",
+            "stock_zh_a_hist",
+            "akshare_daily_full_window",
+        ),
+        (
+            AkShareEtfDailyBarProvider,
+            "510300",
+            "fund_etf_hist_em",
+            "akshare_etf_daily_full_window",
+        ),
+    ],
+)
+def test_akshare_daily_provider_returns_complete_window_coverage_evidence(
+    provider_type,
+    symbol: str,
+    endpoint: str,
+    evidence_source: str,
+) -> None:
+    akshare = FakeAkShare()
+    provider = provider_type(akshare_module=akshare, now=lambda: FETCHED_AT)
+    requested_start = date(2026, 7, 1)
+    requested_end = date(2026, 7, 10)
+
+    result = provider.get_daily_bars_with_coverage(
+        symbol,
+        requested_start,
+        requested_end,
+        "forward",
+    )
+
+    assert isinstance(provider, market_adapters.DailyBarCoverageProvider)
+    assert akshare.daily_calls == [
+        (
+            endpoint,
+            {
+                "symbol": symbol,
+                "period": "daily",
+                "start_date": "20260701",
+                "end_date": "20260710",
+                "adjust": "qfq",
+            },
+        )
+    ]
+    assert [bar.trade_date for bar in result.bars] == [requested_end]
+    assert result.coverage_evidence.model_dump() == {
+        "requested_start": requested_start,
+        "requested_end": requested_end,
+        "observed_start": requested_start,
+        "observed_end": requested_end,
+        "earliest_available_date": requested_end,
+        "complete_request_window": True,
+        "source": evidence_source,
+    }
+
+
+def test_legacy_daily_provider_is_not_misclassified_as_coverage_capable() -> None:
+    class LegacyDailyProvider:
+        @staticmethod
+        def get_daily_bars(symbol, start_date, end_date, adjustment):
+            return []
+
+    assert not isinstance(
+        LegacyDailyProvider(),
+        market_adapters.DailyBarCoverageProvider,
+    )
 
 
 def test_akshare_money_flow_maps_complete_split_in_yuan_and_percentage_points() -> None:
@@ -246,7 +323,7 @@ def test_akshare_etf_daily_and_minute_providers_use_fund_endpoints() -> None:
     assert bars[0].symbol == "510300"
     assert bars[0].volume == 12_300
     assert minutes[0].symbol == "510300"
-    assert any(call.get("symbol") == "510300" for call in akshare.daily_calls)
+    assert any(call.get("symbol") == "510300" for _, call in akshare.daily_calls)
     assert any(call.get("symbol") == "510300" for call in akshare.minute_calls)
 
 

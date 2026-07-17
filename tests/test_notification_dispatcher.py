@@ -3,6 +3,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -260,65 +261,85 @@ def test_condition_fingerprint_deduplicates_same_and_allows_material_changes(tmp
         configure_smtp(connection)
         dispatcher = build_dispatcher(connection, settings)
 
+        first_rec = recommendation("rec-1", RecommendationAction.REDUCE)
+        duplicate_rec = recommendation("rec-duplicate", RecommendationAction.REDUCE)
+        next_cycle_rec = recommendation(
+            "rec-next-cycle",
+            RecommendationAction.REDUCE,
+            created_at=NOW + timedelta(minutes=3),
+        )
+        changed_risk_rec = recommendation(
+            "rec-risk",
+            RecommendationAction.REDUCE,
+            risk_note="new risk",
+        )
+        changed_invalidation_rec = recommendation(
+            "rec-invalid",
+            RecommendationAction.REDUCE,
+            invalid_if="different invalidation",
+        )
+        changed_position_rec = recommendation(
+            "rec-position",
+            RecommendationAction.REDUCE,
+            suggested_quantity=200,
+        )
+        RecommendationRepository(connection).save_many(
+            [
+                first_rec,
+                duplicate_rec,
+                next_cycle_rec,
+                changed_risk_rec,
+                changed_invalidation_rec,
+                changed_position_rec,
+            ],
+            created_at=NOW,
+        )
+
         first = dispatcher.dispatch_recommendation(
-            recommendation("rec-1", RecommendationAction.REDUCE),
+            first_rec,
             plan_version=1,
             now=NOW,
         )
         duplicate = dispatcher.dispatch_recommendation(
-            recommendation(
-                "rec-duplicate",
-                RecommendationAction.REDUCE,
-            ),
+            duplicate_rec,
             plan_version=1,
             now=NOW,
         )
         next_cycle = dispatcher.dispatch_recommendation(
-            recommendation(
-                "rec-next-cycle",
-                RecommendationAction.REDUCE,
-                created_at=NOW + timedelta(minutes=3),
-            ),
+            next_cycle_rec,
             plan_version=1,
             now=NOW + timedelta(minutes=3),
         )
         changed_risk = dispatcher.dispatch_recommendation(
-            recommendation(
-                "rec-risk",
-                RecommendationAction.REDUCE,
-                risk_note="new risk",
-            ),
+            changed_risk_rec,
             plan_version=1,
             now=NOW,
         )
         changed_invalidation = dispatcher.dispatch_recommendation(
-            recommendation(
-                "rec-invalid",
-                RecommendationAction.REDUCE,
-                invalid_if="different invalidation",
-            ),
+            changed_invalidation_rec,
             plan_version=1,
             now=NOW,
         )
         changed_position = dispatcher.dispatch_recommendation(
-            recommendation(
-                "rec-position",
-                RecommendationAction.REDUCE,
-                suggested_quantity=200,
-            ),
+            changed_position_rec,
             plan_version=1,
             now=NOW,
         )
 
         assert duplicate.created is False
-        assert next_cycle.created is True
+        assert next_cycle.created is False
         assert duplicate.notification == first.notification
+        assert next_cycle.notification == first.notification
         assert changed_risk.notification != first.notification
         assert changed_invalidation.notification != first.notification
         assert changed_position.notification != first.notification
-        assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 5
-        assert connection.execute("SELECT COUNT(*) FROM email_deliveries").fetchone()[0] == 5
-        assert len((settings.log_dir / "notifications.jsonl").read_text().splitlines()) == 5
+        links = NotificationRepository(connection)
+        assert links.get_link(first_rec.recommendation_id).notification_id == first.notification.notification_id
+        assert links.get_link(duplicate_rec.recommendation_id).notification_id == first.notification.notification_id
+        assert links.get_link(next_cycle_rec.recommendation_id).notification_id == first.notification.notification_id
+        assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM email_deliveries").fetchone()[0] == 4
+        assert len((settings.log_dir / "notifications.jsonl").read_text().splitlines()) == 4
 
 
 def test_condition_fingerprint_normalizes_structured_json_values() -> None:
@@ -336,6 +357,144 @@ def test_condition_fingerprint_normalizes_structured_json_values() -> None:
 
     assert first == second
     assert len(first) == 64
+
+
+def test_concurrent_same_condition_creates_one_notification_and_audit(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "concurrent.db", log_dir=tmp_path / "logs")
+    with connect(settings) as connection:
+        migrate(connection)
+
+    barrier = threading.Barrier(2)
+    created: list[bool] = []
+    failures: list[BaseException] = []
+
+    def dispatch(index: int) -> None:
+        try:
+            with connect(settings) as connection:
+                rec = recommendation(
+                    f"rec-concurrent-{index}",
+                    RecommendationAction.HOLD,
+                )
+                RecommendationRepository(connection).save_many([rec], created_at=NOW)
+                dispatcher = build_dispatcher(connection, settings)
+                barrier.wait(timeout=5)
+                result = dispatcher.persist_local_recommendation(
+                    rec,
+                    plan_version=1,
+                    now=NOW,
+                )
+                created.append(result.created)
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=dispatch, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not failures
+    assert sorted(created) == [False, True]
+    with connect(settings) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM notification_canonical_groups").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM recommendation_notification_links").fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_logs WHERE event_type='notification.created'"
+        ).fetchone()[0] == 1
+
+
+def test_notification_conflict_preserves_outer_savepoint_and_recommendation(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "outer-savepoint.db", log_dir=tmp_path / "logs")
+    with connect(settings) as connection:
+        migrate(connection)
+        first_rec = recommendation("rec-first", RecommendationAction.HOLD)
+        RecommendationRepository(connection).save_many([first_rec], created_at=NOW)
+        dispatcher = build_dispatcher(connection, settings)
+        first = dispatcher.persist_local_recommendation(
+            first_rec,
+            plan_version=1,
+            now=NOW,
+        )
+
+        second_rec = recommendation("rec-second", RecommendationAction.HOLD)
+        connection.execute("SAVEPOINT outer_stage")
+        RecommendationRepository(connection).save_many(
+            [second_rec], created_at=NOW, commit=False
+        )
+        repository = dispatcher.notification_service.repository
+        original_get = repository.get_canonical_group
+        missed_lookups = 0
+
+        def miss_twice(canonical_key: str):
+            nonlocal missed_lookups
+            if missed_lookups < 2:
+                missed_lookups += 1
+                return None
+            return original_get(canonical_key)
+
+        repository.get_canonical_group = miss_twice
+        recovered = dispatcher.persist_local_recommendation(
+            second_rec,
+            plan_version=1,
+            now=NOW,
+            commit=False,
+        )
+        connection.execute("RELEASE SAVEPOINT outer_stage")
+        connection.commit()
+
+        assert recovered.created is False
+        assert recovered.notification == first.notification
+        assert RecommendationRepository(connection).get(second_rec.recommendation_id) is not None
+        assert repository.get_link(second_rec.recommendation_id) is not None
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_logs WHERE event_type='notification.created'"
+        ).fetchone()[0] == 1
+
+
+def test_notification_canonical_key_uses_decision_day_not_stale_data_day(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "decision-day.db", log_dir=tmp_path / "logs")
+    next_day = NOW + timedelta(days=1)
+    with connect(settings) as connection:
+        migrate(connection)
+        first_rec = recommendation("rec-day-1", RecommendationAction.HOLD)
+        next_rec = recommendation(
+            "rec-day-2",
+            RecommendationAction.HOLD,
+            created_at=next_day,
+        ).model_copy(update={"data_time": first_rec.data_time})
+        RecommendationRepository(connection).save_many(
+            [first_rec, next_rec], created_at=NOW
+        )
+        dispatcher = build_dispatcher(connection, settings)
+
+        first = dispatcher.persist_local_recommendation(
+            first_rec, plan_version=1, now=NOW
+        )
+        second = dispatcher.persist_local_recommendation(
+            next_rec, plan_version=1, now=next_day
+        )
+
+        assert first.notification != second.notification
+        assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 2
+
+        no_plan_rec = recommendation(
+            "rec-no-plan",
+            RecommendationAction.HOLD,
+            plan_id=None,
+            created_at=next_day,
+        )
+        RecommendationRepository(connection).save_many(
+            [no_plan_rec], created_at=next_day
+        )
+        no_plan = dispatcher.persist_local_recommendation(
+            no_plan_rec,
+            plan_version=None,
+            now=next_day,
+        )
+        assert ":no-plan:no-version:" in no_plan.notification.dedup_key
 
 
 def test_daily_summary_aggregates_hold_watch_avoid_once_per_plan_version(tmp_path) -> None:

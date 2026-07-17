@@ -20,7 +20,7 @@ from quantitative_trading.email.repository import SmtpSettingsRepository
 from quantitative_trading.email.service import SmtpSettingsService
 from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import PositionRepository
-from quantitative_trading.market.adapters import MarketProviderError
+from quantitative_trading.market.adapters import DailyBarFetchResult, MarketProviderError
 from quantitative_trading.market.backfill import HeavyDataBackfillService
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.cli_service import MarketCliService
@@ -31,6 +31,7 @@ from quantitative_trading.market.models import (
     DailyMoneyFlow,
     CaptureRunStatus,
     CaptureRunAlreadyActiveError,
+    DailyBarCoverageEvidence,
     LimitStatus,
     QuoteSnapshot,
     QuoteStatus,
@@ -40,6 +41,7 @@ from quantitative_trading.market.models import (
 )
 from quantitative_trading.market.repositories import (
     DailyBarRepository,
+    HistorySnapshotRepository,
     MarketCaptureRunRepository,
     MoneyFlowRepository,
     IntradayStrengthSnapshotRepository,
@@ -1371,6 +1373,73 @@ def test_backfill_routes_etf_daily_marks_flow_not_applicable_and_skips_unknown(
     assert by_symbol_dataset[("900001", CaptureDataset.MONEY_FLOW)].status is CaptureResultStatus.FAILED
 
 
+@pytest.mark.parametrize(
+    ("provider_kind", "expected_completeness", "coverage_complete"),
+    [
+        ("coverage", "verified_provider_window", True),
+        ("legacy", "unverifiable", False),
+    ],
+)
+def test_market_cli_preserves_optional_daily_coverage_evidence(
+    tmp_path,
+    provider_kind: str,
+    expected_completeness: str,
+    coverage_complete: bool,
+) -> None:
+    settings = Settings(database_path=tmp_path / "market-cli-coverage.db")
+    calendar = XSHGTradingCalendar()
+    with connect(settings) as connection:
+        migrate(connection)
+        InstrumentRepository(connection).replace_catalog(
+            [
+                InstrumentMetadata(
+                    symbol="600000",
+                    name="A share",
+                    exchange=Exchange.SH,
+                    instrument_type=InstrumentType.A_SHARE,
+                    settlement_cycle=SettlementCycle.T1,
+                    price_limit_ratio=0.1,
+                    metadata_source="test-directory",
+                    metadata_checked_at=NOW,
+                    rule_version="test-rules-v1",
+                )
+            ]
+        )
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="600000",
+                name="A share",
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=date(2026, 7, 1),
+            ),
+            now=NOW,
+        )
+        summary = MarketCliService(
+            connection,
+            calendar=calendar,
+            daily_provider=(
+                TwentyDayCoverageProvider(calendar)
+                if provider_kind == "coverage"
+                else TwentyDayDailyProvider(calendar)
+            ),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            now=lambda: NOW,
+        ).backfill(TRADE_DATE)
+        row = connection.execute(
+            "SELECT id FROM history_snapshots WHERE symbol=? ORDER BY id DESC LIMIT 1",
+            ("600000",),
+        ).fetchone()
+        history = HistorySnapshotRepository(connection).get(int(row["id"]))
+
+    assert summary.status is CaptureRunStatus.DEGRADED
+    assert history is not None
+    assert history.completeness == expected_completeness
+    assert history.coverage_evidence is not None
+    assert history.coverage_evidence.complete_request_window is coverage_complete
+
+
 def test_maintenance_workflows_reject_concurrent_active_runs(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "maintenance-concurrent.db")
     calendar = XSHGTradingCalendar()
@@ -1496,6 +1565,29 @@ class FailingIntradayProvider:
 class TwentyDayDailyProvider(CalendarDailyProvider):
     def get_daily_bars(self, symbol, start_date, end_date, adjustment):
         return super().get_daily_bars(symbol, start_date, end_date, adjustment)[-20:]
+
+
+class TwentyDayCoverageProvider(TwentyDayDailyProvider):
+    def get_daily_bars_with_coverage(
+        self,
+        symbol,
+        start_date,
+        end_date,
+        adjustment,
+    ) -> DailyBarFetchResult:
+        bars = tuple(self.get_daily_bars(symbol, start_date, end_date, adjustment))
+        return DailyBarFetchResult(
+            bars=bars,
+            coverage_evidence=DailyBarCoverageEvidence(
+                requested_start=start_date,
+                requested_end=end_date,
+                observed_start=start_date,
+                observed_end=end_date,
+                earliest_available_date=bars[0].trade_date,
+                complete_request_window=True,
+                source="fake_daily_full_window",
+            ),
+        )
 
 
 class PartialAccountQuoteProvider(ClockQuoteProvider):
@@ -2332,7 +2424,9 @@ def test_intraday_partial_account_is_reflected_in_holding_recommendation(
     assert any("账户估值" in note for note in recommendation.risk["notes"])
 
 
-def test_close_plan_is_degraded_when_history_has_only_twenty_bars(tmp_path) -> None:
+def test_close_plan_is_not_published_for_unverifiable_twenty_bar_history(
+    tmp_path,
+) -> None:
     settings = Settings(database_path=tmp_path / "close-short-history.db")
     calendar = XSHGTradingCalendar()
     with connect(settings) as connection:
@@ -2350,19 +2444,49 @@ def test_close_plan_is_degraded_when_history_has_only_twenty_bars(tmp_path) -> N
         plan = TradingPlanRepository(connection).get(result.plan_id or "")
         run = MarketCaptureRunRepository(connection).get(result.run_id)
 
+    assert result.ready is False
+    assert result.plan_id is None
+    assert plan is None
+    assert run is not None
+    assert run.status is CaptureRunStatus.FAILED
+    assert any("short history start is unverifiable" in warning for warning in result.warnings)
+
+
+def test_close_plan_accepts_verified_twenty_bar_provider_history(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "close-verified-short-history.db")
+    calendar = XSHGTradingCalendar()
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=RecordingQuoteProvider(),
+            daily_provider=TwentyDayCoverageProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=NoopIntradayProvider(),
+            now=lambda: NOW,
+        ).run_close(TRADE_DATE)
+        plan = TradingPlanRepository(connection).get(result.plan_id or "")
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        history = HistorySnapshotRepository(connection).get(
+            market_input.history_snapshot_refs["600000"]
+        )
+
     assert result.ready is True
     assert plan is not None
     assert plan.data_quality == "degraded"
-    assert run is not None
-    assert run.status is CaptureRunStatus.DEGRADED
-    assert plan.symbol_contexts["600000"].data_quality == "degraded"
+    assert history is not None
+    assert history.completeness == "verified_provider_window"
+    assert history.row_count == 20
     feature_facts = plan.symbol_contexts["600000"].daily_feature_facts
     assert feature_facts["ma60"] == {
         "value": None,
         "available": False,
         "reason": "requires 60 daily bars",
     }
-    assert any("expected 250 daily bars, got 20" in warning for warning in plan.warnings)
 
 
 def test_intraday_missing_quote_time_does_not_fall_back_to_run_time(

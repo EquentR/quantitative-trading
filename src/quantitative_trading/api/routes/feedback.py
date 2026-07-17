@@ -117,5 +117,9 @@ def _mark_matching_notifications_feedback_recorded(
 ) -> None:
     repository = NotificationRepository(connection)
     service = NotificationService(repository)
+    link = repository.get_link(recommendation_id)
+    if link is not None:
+        service.mark_feedback_recorded(link.notification_id, commit=False)
+        return
     for notification in repository.list_by_recommendation_id(recommendation_id):
         service.mark_feedback_recorded(notification.notification_id, commit=False)

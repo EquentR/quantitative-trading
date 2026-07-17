@@ -71,11 +71,11 @@ class InstrumentRepository:
                     """
                     INSERT INTO instruments (
                       symbol, name, exchange, instrument_type, settlement_cycle,
-                      price_limit_ratio, metadata_source, metadata_checked_at,
+                      price_limit_ratio, listing_date, metadata_source, metadata_checked_at,
                       rule_version, is_active, warnings_json
                     ) VALUES (
                       :symbol, :name, :exchange, :instrument_type, :settlement_cycle,
-                      :price_limit_ratio, :metadata_source, :metadata_checked_at,
+                      :price_limit_ratio, :listing_date, :metadata_source, :metadata_checked_at,
                       :rule_version, 1, :warnings_json
                     )
                     ON CONFLICT(symbol) DO UPDATE SET
@@ -84,6 +84,7 @@ class InstrumentRepository:
                       instrument_type=excluded.instrument_type,
                       settlement_cycle=excluded.settlement_cycle,
                       price_limit_ratio=excluded.price_limit_ratio,
+                      listing_date=excluded.listing_date,
                       metadata_source=excluded.metadata_source,
                       metadata_checked_at=excluded.metadata_checked_at,
                       rule_version=excluded.rule_version,
@@ -181,6 +182,9 @@ class InstrumentRepository:
             "instrument_type": item.instrument_type.value,
             "settlement_cycle": item.settlement_cycle.value,
             "price_limit_ratio": item.price_limit_ratio,
+            "listing_date": (
+                None if item.listing_date is None else item.listing_date.isoformat()
+            ),
             "metadata_source": item.metadata_source,
             "metadata_checked_at": item.metadata_checked_at.isoformat(),
             "rule_version": item.rule_version,
@@ -197,6 +201,7 @@ class InstrumentRepository:
                 "instrument_type": row["instrument_type"],
                 "settlement_cycle": row["settlement_cycle"],
                 "price_limit_ratio": row["price_limit_ratio"],
+                "listing_date": row["listing_date"],
                 "metadata_source": row["metadata_source"],
                 "metadata_checked_at": row["metadata_checked_at"],
                 "rule_version": row["rule_version"],

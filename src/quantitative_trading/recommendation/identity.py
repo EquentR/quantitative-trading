@@ -7,6 +7,9 @@ from datetime import date, datetime
 from quantitative_trading.recommendation.models import Recommendation
 
 
+CONDITION_FINGERPRINT_VERSION = 2
+
+
 def recommendation_condition_fingerprint(recommendation: Recommendation) -> str:
     material_conditions = recommendation.model_dump(
         mode="json",
@@ -15,8 +18,23 @@ def recommendation_condition_fingerprint(recommendation: Recommendation) -> str:
             "risk",
             "position_constraint",
             "condition_context",
-            "instrument",
         },
+    )
+    instrument = recommendation.instrument
+    material_conditions["instrument"] = (
+        None
+        if instrument is None
+        else instrument.model_dump(
+            mode="json",
+            include={
+                "symbol",
+                "exchange",
+                "instrument_type",
+                "settlement_cycle",
+                "price_limit_ratio",
+                "rule_version",
+            },
+        )
     )
     canonical = json.dumps(
         material_conditions,
@@ -59,8 +77,10 @@ def with_recommendation_identity(
         update={
             "recommendation_id": f"rec-{identity_digest[:32]}",
             "decision_cycle": decision_cycle,
+            "decision_trade_date": trade_date,
             "plan_version": plan_version,
             "condition_fingerprint": condition_fingerprint,
+            "condition_fingerprint_version": CONDITION_FINGERPRINT_VERSION,
             "dedup_key": dedup_key,
         }
     )

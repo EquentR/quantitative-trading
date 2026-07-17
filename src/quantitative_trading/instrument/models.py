@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
@@ -52,6 +52,7 @@ class InstrumentMetadata(BaseModel):
     instrument_type: InstrumentType
     settlement_cycle: SettlementCycle
     price_limit_ratio: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False)
+    listing_date: date | None = None
     metadata_source: str = Field(min_length=1)
     metadata_checked_at: datetime
     rule_version: str = Field(min_length=1)
@@ -81,6 +82,8 @@ class InstrumentMetadata(BaseModel):
             and self.settlement_cycle is not SettlementCycle.UNKNOWN
         ):
             raise ValueError("unknown instrument requires unknown settlement")
+        if self.instrument_type is InstrumentType.UNKNOWN and self.listing_date is not None:
+            raise ValueError("unknown instrument cannot claim listing date")
         return self
 
 
@@ -93,6 +96,7 @@ class InstrumentCandidate(BaseModel):
     instrument_type: InstrumentType
     settlement_cycle: SettlementCycle
     price_limit_ratio: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False)
+    listing_date: date | None = None
     metadata_source: str = Field(min_length=1)
     metadata_checked_at: datetime
     rule_version: str = Field(min_length=1)
@@ -130,6 +134,7 @@ class InstrumentCandidate(BaseModel):
             instrument_type=self.instrument_type,
             settlement_cycle=self.settlement_cycle,
             price_limit_ratio=self.price_limit_ratio,
+            listing_date=self.listing_date,
             metadata_source=self.metadata_source,
             metadata_checked_at=self.metadata_checked_at,
             rule_version=self.rule_version,
@@ -145,6 +150,12 @@ class InstrumentCandidate(BaseModel):
     @classmethod
     def warnings_must_be_readable(cls, value: list[str]) -> list[str]:
         return _text_list(value, "warnings")
+
+    @model_validator(mode="after")
+    def unknown_instrument_cannot_claim_listing_date(self) -> "InstrumentCandidate":
+        if self.instrument_type is InstrumentType.UNKNOWN and self.listing_date is not None:
+            raise ValueError("unknown instrument cannot claim listing date")
+        return self
 
 
 class InstrumentPreview(BaseModel):

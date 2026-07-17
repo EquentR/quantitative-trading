@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime
+from typing import Literal
 
 from quantitative_trading.recommendation.models import (
     Recommendation,
     RecommendationAction,
+    RecommendationListItem,
+    RecommendationNotificationProjection,
 )
 
 
@@ -131,6 +134,74 @@ class RecommendationRepository:
         ).fetchone()
         return int(row["count"])
 
+    def list_linked(
+        self,
+        *,
+        view: Literal["current", "history"],
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[RecommendationListItem]:
+        if view == "current":
+            rows = self.connection.execute(
+                """
+                WITH ranked AS (
+                  SELECT recommendations.rowid AS recommendation_rowid,
+                         recommendations.recommendation_id,
+                         recommendations.created_at,
+                         recommendations.payload_json,
+                         ROW_NUMBER() OVER (
+                           PARTITION BY recommendations.symbol
+                           ORDER BY recommendations.created_at DESC,
+                                    recommendations.rowid DESC
+                         ) AS symbol_rank
+                  FROM recommendations
+                )
+                SELECT ranked.payload_json,
+                       notifications.notification_id,
+                       notifications.status AS notification_status
+                FROM ranked
+                LEFT JOIN recommendation_notification_links
+                  ON recommendation_notification_links.recommendation_id =
+                     ranked.recommendation_id
+                LEFT JOIN notifications
+                  ON notifications.notification_id =
+                     recommendation_notification_links.notification_id
+                WHERE ranked.symbol_rank = 1
+                ORDER BY ranked.created_at DESC, ranked.recommendation_rowid DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+        elif view == "history":
+            rows = self.connection.execute(
+                """
+                SELECT recommendations.payload_json,
+                       notifications.notification_id,
+                       notifications.status AS notification_status
+                FROM recommendations
+                LEFT JOIN recommendation_notification_links
+                  ON recommendation_notification_links.recommendation_id =
+                     recommendations.recommendation_id
+                LEFT JOIN notifications
+                  ON notifications.notification_id =
+                     recommendation_notification_links.notification_id
+                ORDER BY recommendations.data_time DESC,
+                         recommendations.created_at DESC,
+                         recommendations.rowid ASC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+        else:
+            raise ValueError(f"unsupported recommendation view: {view}")
+        return [self._linked_item(row) for row in rows]
+
+    def count_current(self) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(DISTINCT symbol) AS count FROM recommendations"
+        ).fetchone()
+        return int(row["count"])
+
     def latest_for_symbol(self, symbol: str) -> Recommendation | None:
         row = self.connection.execute(
             """
@@ -173,3 +244,18 @@ class RecommendationRepository:
         if row is None:
             return None
         return Recommendation.model_validate_json(row["payload_json"])
+
+    @staticmethod
+    def _linked_item(row: sqlite3.Row) -> RecommendationListItem:
+        notification_id = row["notification_id"]
+        return RecommendationListItem(
+            recommendation=Recommendation.model_validate_json(row["payload_json"]),
+            notification=(
+                None
+                if notification_id is None
+                else RecommendationNotificationProjection(
+                    notification_id=notification_id,
+                    status=row["notification_status"],
+                )
+            ),
+        )

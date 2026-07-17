@@ -81,6 +81,9 @@ class HistoryCompleteness(StrEnum):
     VERIFIED_LISTING_DATE = "verified_listing_date"
 
 
+MIN_HISTORY_ROWS = 20
+
+
 class StrengthLabel(StrEnum):
     STRONG = "strong"
     NEUTRAL = "neutral"
@@ -478,6 +481,23 @@ class HistorySnapshot(DatasetSnapshotBase):
             if self.data_start is not None and self.data_start < self.listing_evidence.listing_date:
                 raise ValueError("history cannot start before verified listing date")
         return self
+
+    def is_usable(self, *, as_of: date, expected_rows: int) -> bool:
+        if expected_rows < MIN_HISTORY_ROWS:
+            raise ValueError("expected history rows cannot be below strategy minimum")
+        if self.row_count < MIN_HISTORY_ROWS or self.data_start is None:
+            return False
+        if self.row_count >= expected_rows:
+            return self.data_end == as_of
+        if self.completeness is HistoryCompleteness.VERIFIED_PROVIDER_WINDOW:
+            return (
+                self.coverage_evidence is not None
+                and self.coverage_evidence.complete_request_window
+                and self.coverage_evidence.requested_end == as_of
+            )
+        if self.completeness is HistoryCompleteness.VERIFIED_LISTING_DATE:
+            return self.data_end == as_of
+        return False
 
 
 class MoneyFlowSnapshot(DatasetSnapshotBase):

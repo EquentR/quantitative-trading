@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from quantitative_trading.audit.models import AuditLog
 from quantitative_trading.audit.service import AuditService
@@ -13,10 +13,15 @@ from quantitative_trading.email.models import EmailDelivery
 from quantitative_trading.email.outbox import EmailDeliveryService
 from quantitative_trading.email.service import SmtpSettingsService
 from quantitative_trading.notification.jsonl import JsonlNotificationWriter
+from quantitative_trading.notification.identity import notification_canonical_key
 from quantitative_trading.notification.local_alert import LocalAlertDispatcher
 from quantitative_trading.notification.models import NotificationSummary
 from quantitative_trading.notification.service import NotificationService
 from quantitative_trading.recommendation.models import Recommendation, RecommendationAction
+from quantitative_trading.recommendation.identity import (
+    CONDITION_FINGERPRINT_VERSION,
+    recommendation_condition_fingerprint,
+)
 
 
 IMMEDIATE_ACTIONS = frozenset(
@@ -33,6 +38,7 @@ DAILY_SUMMARY_ACTIONS = (
     RecommendationAction.AVOID,
 )
 LOGGER = logging.getLogger(__name__)
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -93,35 +99,128 @@ class NotificationDispatcher:
         commit: bool = True,
     ) -> RecommendationDispatchResult:
         dispatched_at = now or datetime.now(UTC)
-        dedup_key = self._notification_dedup_key(recommendation, plan_version)
-        existing = self.notification_service.get_by_dedup_key(dedup_key)
-        if existing is not None:
+        dedup_key = self._notification_dedup_key(
+            recommendation,
+            plan_version,
+            dispatched_at=dispatched_at,
+        )
+        repository = self.notification_service.repository
+        standalone_transaction = commit and not repository.connection.in_transaction
+        if standalone_transaction:
+            repository.connection.execute("BEGIN IMMEDIATE")
+        group = repository.get_canonical_group(dedup_key)
+        if group is not None:
+            existing = self.notification_service.get(group.notification_id)
+            if existing is None:
+                if standalone_transaction:
+                    repository.connection.rollback()
+                raise RuntimeError("canonical notification reference is missing")
+            try:
+                self._link_persisted_recommendation(
+                    recommendation,
+                    existing.notification_id,
+                    dedup_key,
+                    now=dispatched_at,
+                    commit=False,
+                )
+                if commit:
+                    repository.connection.commit()
+            except BaseException:
+                if standalone_transaction:
+                    repository.connection.rollback()
+                raise
             return RecommendationDispatchResult(
                 notification=existing,
                 email_delivery=None,
                 created=False,
             )
 
-        audit = self.audit_service.record_event(
-            event_type="notification.created",
-            recommendation_id=recommendation.recommendation_id,
-            payload={
-                "symbol": recommendation.symbol,
-                "action": recommendation.action.value,
-                "plan_id": recommendation.plan_id,
-                "plan_version": plan_version,
-                "condition_fingerprint": self.condition_fingerprint(recommendation),
-            },
-            now=dispatched_at,
-            commit=commit,
-        )
-        notification = self.notification_service.create_from_recommendation(
-            recommendation,
-            audit,
-            dedup_key=dedup_key,
-            now=dispatched_at,
-            commit=commit,
-        )
+        savepoint = "persist_local_recommendation"
+        repository.connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            group = repository.get_canonical_group(dedup_key)
+            if group is not None:
+                existing = self.notification_service.get(group.notification_id)
+                if existing is None:
+                    raise RuntimeError("canonical notification reference is missing")
+                self._link_persisted_recommendation(
+                    recommendation,
+                    existing.notification_id,
+                    dedup_key,
+                    now=dispatched_at,
+                    commit=False,
+                )
+                repository.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                if commit:
+                    repository.connection.commit()
+                return RecommendationDispatchResult(
+                    notification=existing,
+                    email_delivery=None,
+                    created=False,
+                )
+            audit = self.audit_service.record_event(
+                event_type="notification.created",
+                recommendation_id=recommendation.recommendation_id,
+                payload={
+                    "symbol": recommendation.symbol,
+                    "action": recommendation.action.value,
+                    "plan_id": recommendation.plan_id,
+                    "plan_version": plan_version,
+                    "condition_fingerprint": self.condition_fingerprint(
+                        recommendation
+                    ),
+                    "condition_fingerprint_version": CONDITION_FINGERPRINT_VERSION,
+                },
+                now=dispatched_at,
+                commit=False,
+            )
+            notification = self.notification_service.build_summary(
+                recommendation,
+                audit,
+                dedup_key=dedup_key,
+                now=dispatched_at,
+            )
+            repository.save(notification, commit=False)
+            repository.save_canonical_group(
+                dedup_key,
+                notification.notification_id,
+                created_at=dispatched_at,
+                commit=False,
+            )
+            self._link_persisted_recommendation(
+                recommendation,
+                notification.notification_id,
+                dedup_key,
+                now=dispatched_at,
+                commit=False,
+            )
+            repository.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if commit:
+                repository.connection.commit()
+        except sqlite3.IntegrityError:
+            repository.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            repository.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if self.notification_service.get_by_dedup_key(dedup_key) is None:
+                if standalone_transaction:
+                    repository.connection.rollback()
+                raise
+            try:
+                return self._recover_canonical_notification(
+                    recommendation,
+                    dedup_key,
+                    now=dispatched_at,
+                    commit=commit,
+                )
+            except BaseException:
+                if standalone_transaction:
+                    repository.connection.rollback()
+                raise
+        except BaseException:
+            repository.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            repository.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if standalone_transaction:
+                repository.connection.rollback()
+            raise
         return RecommendationDispatchResult(
             notification=notification,
             email_delivery=None,
@@ -137,7 +236,11 @@ class NotificationDispatcher:
         now: datetime | None = None,
     ) -> RecommendationDispatchResult:
         dispatched_at = now or datetime.now(UTC)
-        dedup_key = self._notification_dedup_key(recommendation, plan_version)
+        dedup_key = self._notification_dedup_key(
+            recommendation,
+            plan_version,
+            dispatched_at=dispatched_at,
+        )
         notification = local.notification
         audit = self.audit_service.get(notification.audit_id)
         if audit is None:
@@ -307,41 +410,100 @@ class NotificationDispatcher:
 
     @staticmethod
     def condition_fingerprint(recommendation: Recommendation) -> str:
-        material_conditions = recommendation.model_dump(
-            mode="json",
-            include={"reason", "risk", "position_constraint"},
-        )
-        canonical = json.dumps(
-            material_conditions,
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        if (
+            recommendation.condition_fingerprint_version
+            == CONDITION_FINGERPRINT_VERSION
+            and recommendation.condition_fingerprint is not None
+        ):
+            return recommendation.condition_fingerprint
+        return recommendation_condition_fingerprint(recommendation)
 
     def _notification_dedup_key(
         self,
         recommendation: Recommendation,
         plan_version: str | int | None,
+        *,
+        dispatched_at: datetime,
     ) -> str:
-        cycle = recommendation.run_id
-        if cycle is None:
-            created_at = recommendation.created_at
-            cycle = created_at.replace(
-                minute=created_at.minute - created_at.minute % 3,
-                second=0,
-                microsecond=0,
-            ).isoformat()
-        return ":".join(
-            (
-                "notification",
-                recommendation.symbol,
-                recommendation.action.value,
-                recommendation.plan_id or "no-plan",
-                f"v{plan_version if plan_version is not None else 'none'}",
-                cycle,
-                self.condition_fingerprint(recommendation),
+        trade_date = recommendation.decision_trade_date
+        if trade_date is None:
+            trade_date = dispatched_at.astimezone(SHANGHAI).date()
+        return notification_canonical_key(
+            recommendation,
+            trade_date=trade_date,
+            plan_version=plan_version,
+            condition_fingerprint=self.condition_fingerprint(recommendation),
+        )
+
+    def _recover_canonical_notification(
+        self,
+        recommendation: Recommendation,
+        canonical_key: str,
+        *,
+        now: datetime,
+        commit: bool,
+    ) -> RecommendationDispatchResult:
+        repository = self.notification_service.repository
+        existing = self.notification_service.get_by_dedup_key(canonical_key)
+        if existing is None:
+            raise sqlite3.IntegrityError(
+                "notification conflict did not produce a canonical notification"
             )
+        savepoint = "recover_canonical_notification"
+        repository.connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            group = repository.get_canonical_group(canonical_key)
+            if group is None:
+                repository.save_canonical_group(
+                    canonical_key,
+                    existing.notification_id,
+                    created_at=existing.created_at,
+                    commit=False,
+                )
+            elif group.notification_id != existing.notification_id:
+                raise sqlite3.IntegrityError("canonical notification group conflicts")
+            self._link_persisted_recommendation(
+                recommendation,
+                existing.notification_id,
+                canonical_key,
+                now=now,
+                commit=False,
+            )
+            repository.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            if commit:
+                repository.connection.commit()
+        except BaseException:
+            repository.connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            repository.connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        return RecommendationDispatchResult(
+            notification=existing,
+            email_delivery=None,
+            created=False,
+        )
+
+    def _link_persisted_recommendation(
+        self,
+        recommendation: Recommendation,
+        notification_id: str,
+        canonical_key: str,
+        *,
+        now: datetime,
+        commit: bool,
+    ) -> None:
+        repository = self.notification_service.repository
+        exists = repository.connection.execute(
+            "SELECT 1 FROM recommendations WHERE recommendation_id = ?",
+            (recommendation.recommendation_id,),
+        ).fetchone()
+        if exists is None:
+            return
+        repository.link_recommendation(
+            recommendation.recommendation_id,
+            notification_id,
+            canonical_key,
+            created_at=now,
+            commit=commit,
         )
 
     def _enqueue_immediate(

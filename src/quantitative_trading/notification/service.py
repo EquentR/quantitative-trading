@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Literal
 from uuid import uuid4
 
 from quantitative_trading.audit.models import AuditLog
@@ -70,7 +71,8 @@ class NotificationService:
         except sqlite3.IntegrityError:
             if dedup_key is None:
                 raise
-            self.repository.connection.rollback()
+            if commit:
+                self.repository.connection.rollback()
             existing = self.repository.get_by_dedup_key(dedup_key)
             if existing is None:
                 raise
@@ -146,6 +148,7 @@ class NotificationService:
     def list_notifications(
         self,
         *,
+        view: Literal["current", "history"] = "history",
         status: NotificationStatus | None = None,
         symbol: str | None = None,
         action: str | None = None,
@@ -153,6 +156,17 @@ class NotificationService:
         limit: int = 50,
         offset: int = 0,
     ) -> list[NotificationSummary]:
+        if view == "current":
+            return self.repository.list_current(
+                status=status,
+                symbol=symbol,
+                action=action,
+                recommendation_id=recommendation_id,
+                limit=limit,
+                offset=offset,
+            )
+        if view != "history":
+            raise ValueError(f"unsupported notification view: {view}")
         return self.repository.list(
             status=status,
             symbol=symbol,
@@ -162,8 +176,11 @@ class NotificationService:
             offset=offset,
         )
 
-    def unread_count(self) -> int:
-        return self.repository.count_unread()
+    def unread_count(self, *, symbol: str | None = None) -> int:
+        return self.repository.count_current(
+            status=NotificationStatus.UNREAD,
+            symbol=symbol,
+        )
 
     def _set_status(
         self,

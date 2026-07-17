@@ -205,6 +205,35 @@ class NotificationRepository:
     def list_recent(self, *, limit: int = 50) -> list[NotificationSummary]:
         return self.list(limit=limit)
 
+    def list_current(
+        self,
+        *,
+        status: NotificationStatus | None = None,
+        symbol: str | None = None,
+        action: str | None = None,
+        recommendation_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[NotificationSummary]:
+        clauses, parameters = self._current_filters(
+            status=status,
+            symbol=symbol,
+            action=action,
+            recommendation_id=recommendation_id,
+        )
+        parameters.extend((limit, offset))
+        rows = self.connection.execute(
+            f"""
+            SELECT notifications.payload_json
+            FROM notifications
+            WHERE {' AND '.join(clauses)}
+            ORDER BY notifications.created_at DESC, notifications.notification_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            parameters,
+        ).fetchall()
+        return [NotificationSummary.model_validate_json(row["payload_json"]) for row in rows]
+
     def list(
         self,
         *,
@@ -244,6 +273,30 @@ class NotificationRepository:
         row = self.connection.execute(
             "SELECT COUNT(*) AS count FROM notifications WHERE status = ?",
             (NotificationStatus.UNREAD.value,),
+        ).fetchone()
+        return int(row["count"])
+
+    def count_current(
+        self,
+        *,
+        status: NotificationStatus | None = None,
+        symbol: str | None = None,
+        action: str | None = None,
+        recommendation_id: str | None = None,
+    ) -> int:
+        clauses, parameters = self._current_filters(
+            status=status,
+            symbol=symbol,
+            action=action,
+            recommendation_id=recommendation_id,
+        )
+        row = self.connection.execute(
+            f"""
+            SELECT COUNT(*) AS count
+            FROM notifications
+            WHERE {' AND '.join(clauses)}
+            """,
+            parameters,
         ).fetchone()
         return int(row["count"])
 
@@ -301,3 +354,35 @@ class NotificationRepository:
                 (recommendation_id, limit),
             ).fetchall()
         return [NotificationSummary.model_validate_json(row["payload_json"]) for row in rows]
+
+    @staticmethod
+    def _current_filters(
+        *,
+        status: NotificationStatus | None,
+        symbol: str | None,
+        action: str | None,
+        recommendation_id: str | None,
+    ) -> tuple[list[str], list[object]]:
+        clauses = [
+            """
+            (
+              notifications.action = 'system_alert'
+              OR EXISTS (
+                SELECT 1
+                FROM notification_canonical_groups
+                WHERE notification_canonical_groups.notification_id = notifications.notification_id
+              )
+            )
+            """
+        ]
+        parameters: list[object] = []
+        for column, value in (
+            ("status", status.value if status is not None else None),
+            ("symbol", symbol),
+            ("action", action),
+            ("recommendation_id", recommendation_id),
+        ):
+            if value is not None:
+                clauses.append(f"notifications.{column} = ?")
+                parameters.append(value)
+        return clauses, parameters

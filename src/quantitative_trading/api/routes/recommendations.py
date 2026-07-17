@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ValidationError
@@ -18,7 +19,10 @@ from quantitative_trading.market.models import MarketInputSnapshot
 from quantitative_trading.market.repository import MarketInputSnapshotRepository
 from quantitative_trading.planning.models import TradingPlan
 from quantitative_trading.planning.repository import TradingPlanRepository
-from quantitative_trading.recommendation.models import Recommendation
+from quantitative_trading.recommendation.models import (
+    Recommendation,
+    RecommendationListItem,
+)
 from quantitative_trading.recommendation.repository import RecommendationRepository
 
 
@@ -31,6 +35,13 @@ router = APIRouter(
 
 class RecommendationListResponse(BaseModel):
     items: list[Recommendation]
+    total: int
+    page: int
+    page_size: int
+
+
+class LinkedRecommendationListResponse(BaseModel):
+    items: list[RecommendationListItem]
     total: int
     page: int
     page_size: int
@@ -70,15 +81,34 @@ def scan_recommendations() -> None:
     )
 
 
-@router.get("", response_model=RecommendationListResponse)
+@router.get(
+    "",
+    response_model=RecommendationListResponse | LinkedRecommendationListResponse,
+)
 def list_recommendations(
+    view: Literal["current", "history"] | None = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     container: ApiContainer = Depends(get_container),
-) -> RecommendationListResponse:
+) -> RecommendationListResponse | LinkedRecommendationListResponse:
     try:
         with connection_scope(container.settings) as connection:
             repository = RecommendationRepository(connection)
+            if view is not None:
+                return LinkedRecommendationListResponse(
+                    items=repository.list_linked(
+                        view=view,
+                        limit=page_size,
+                        offset=(page - 1) * page_size,
+                    ),
+                    total=(
+                        repository.count_current()
+                        if view == "current"
+                        else repository.count()
+                    ),
+                    page=page,
+                    page_size=page_size,
+                )
             return RecommendationListResponse(
                 items=repository.list(
                     limit=page_size,

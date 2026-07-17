@@ -11,6 +11,8 @@ from quantitative_trading.instrument.models import (
     InstrumentType,
     SettlementCycle,
 )
+from quantitative_trading.notification.models import NotificationStatus, NotificationSummary
+from quantitative_trading.notification.repository import NotificationRepository
 
 
 NOW = datetime(2026, 7, 13, 2, 30, tzinfo=UTC)
@@ -91,6 +93,102 @@ def test_latest_for_symbol_and_filtered_pagination(tmp_path) -> None:
     assert latest.recommendation_id == "rec-3"
     assert [item.recommendation_id for item in filtered] == ["rec-3"]
     assert count == 2
+
+
+def test_linked_current_view_selects_latest_per_symbol_in_sql(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "recommendation-current-view.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = RecommendationRepository(connection)
+        history_newer_market_time = recommendation(
+            "rec-600-old",
+            "600000",
+            RecommendationAction.HOLD,
+            data_time=NOW + timedelta(minutes=10),
+        )
+        current_600 = recommendation(
+            "rec-600-current",
+            "600000",
+            RecommendationAction.REDUCE,
+            data_time=NOW,
+        )
+        current_000001 = recommendation(
+            "rec-000001-current",
+            "000001",
+            RecommendationAction.WATCH,
+            data_time=NOW + timedelta(minutes=2),
+        )
+        repository.save_many(
+            [history_newer_market_time],
+            created_at=NOW + timedelta(minutes=2, seconds=30),
+        )
+        repository.save_many(
+            [current_000001],
+            created_at=NOW + timedelta(minutes=2),
+        )
+        repository.save_many(
+            [current_600],
+            created_at=NOW + timedelta(minutes=3),
+        )
+        notification_repository = NotificationRepository(connection)
+        notification = NotificationSummary(
+            notification_id="notif-600-current",
+            recommendation_id=current_600.recommendation_id,
+            symbol=current_600.symbol,
+            action=current_600.action.value,
+            confidence=current_600.confidence,
+            key_price=10.0,
+            reason=list(current_600.reason),
+            risk=list(current_600.risk["invalid_if"]),
+            data_time=current_600.data_time,
+            audit_id="audit-600-current",
+            status=NotificationStatus.READ,
+            created_at=NOW + timedelta(minutes=3),
+        )
+        notification_repository.save(notification)
+        notification_repository.save_canonical_group(
+            "canonical-600-current",
+            notification.notification_id,
+            created_at=NOW + timedelta(minutes=3),
+        )
+        notification_repository.link_recommendation(
+            current_600.recommendation_id,
+            notification.notification_id,
+            "canonical-600-current",
+            created_at=NOW + timedelta(minutes=3),
+        )
+
+        current = repository.list_linked(view="current", limit=20, offset=0)
+        second_current_page = repository.list_linked(
+            view="current",
+            limit=1,
+            offset=1,
+        )
+        history = repository.list_linked(view="history", limit=20, offset=0)
+        current_count = repository.count_current()
+        history_count = repository.count()
+
+    assert [item.recommendation.recommendation_id for item in current] == [
+        "rec-600-current",
+        "rec-000001-current",
+    ]
+    assert current_count == 2
+    assert [item.recommendation.recommendation_id for item in second_current_page] == [
+        "rec-000001-current"
+    ]
+    assert current[0].notification is not None
+    assert current[0].notification.model_dump(mode="json") == {
+        "notification_id": "notif-600-current",
+        "status": "read",
+    }
+    assert current[1].notification is None
+    assert history_count == 3
+    assert [item.recommendation.recommendation_id for item in history] == [
+        "rec-600-old",
+        "rec-000001-current",
+        "rec-600-current",
+    ]
+    assert history[2].notification == current[0].notification
 
 
 def test_save_many_can_participate_in_caller_transaction(tmp_path) -> None:
@@ -189,6 +287,7 @@ def test_recommendation_identity_aligns_to_three_minute_cycle() -> None:
     )
 
     assert identified.decision_cycle == "2026-07-13T02:30:00+00:00"
+    assert identified.decision_trade_date == date(2026, 7, 13)
 
 
 def test_recommendation_fingerprint_changes_with_instrument_rule_version() -> None:
@@ -211,3 +310,36 @@ def test_recommendation_fingerprint_changes_with_instrument_rule_version() -> No
     )
 
     assert first.condition_fingerprint != second.condition_fingerprint
+
+
+def test_recommendation_fingerprint_v2_ignores_volatile_instrument_time() -> None:
+    instrument = metadata("instrument-rules-v2")
+    first = recommendation(
+        "temporary-id-1", "600000", RecommendationAction.WATCH, data_time=NOW
+    ).model_copy(update={"instrument": instrument})
+    second = first.model_copy(
+        update={
+            "instrument": instrument.model_copy(
+                update={"metadata_checked_at": NOW + timedelta(days=1)}
+            ),
+            "data_time": NOW + timedelta(minutes=3),
+            "created_at": NOW + timedelta(minutes=3),
+        }
+    )
+
+    first = with_recommendation_identity(
+        first,
+        trade_date=date(2026, 7, 13),
+        period_start=NOW,
+        plan_version=1,
+    )
+    second = with_recommendation_identity(
+        second,
+        trade_date=date(2026, 7, 13),
+        period_start=NOW,
+        plan_version=1,
+    )
+
+    assert first.condition_fingerprint == second.condition_fingerprint
+    assert first.condition_fingerprint_version == 2
+    assert second.condition_fingerprint_version == 2

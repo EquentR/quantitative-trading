@@ -5,11 +5,19 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Generic, TypeVar
 
-from quantitative_trading.market.adapters import DailyBarProvider, MoneyFlowProvider
+from quantitative_trading.market.adapters import (
+    DailyBarCoverageProvider,
+    DailyBarProvider,
+    MoneyFlowProvider,
+)
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
     CaptureResultStatus,
+    DailyBar,
+    DailyBarCoverageEvidence,
+    HistoryCompleteness,
     HistorySnapshot,
+    ListingDateEvidence,
     MoneyFlowSnapshot,
 )
 from quantitative_trading.market.repositories import (
@@ -17,6 +25,7 @@ from quantitative_trading.market.repositories import (
     HistorySnapshotRepository,
     MoneyFlowRepository,
     MoneyFlowSnapshotRepository,
+    StoredDailyBar,
     content_digest,
 )
 
@@ -64,7 +73,12 @@ class HeavyDataBackfillService:
         self.now = now or (lambda: datetime.now(UTC))
 
     def backfill_daily(
-        self, run_id: str, symbol: str, as_of: date
+        self,
+        run_id: str,
+        symbol: str,
+        as_of: date,
+        *,
+        listing_evidence: ListingDateEvidence | None = None,
     ) -> CreatedDatasetSnapshot[HistorySnapshot]:
         desired = self.calendar.sessions_ending(as_of, self.DAILY_WINDOW)
         existing = {
@@ -72,14 +86,42 @@ class HeavyDataBackfillService:
             for stored in self.daily_repository.current(symbol)
             if stored.bar.trade_date in desired
         }
-        ranges = self._fetch_ranges(desired, set(existing))
-        fetched = [
-            bar
-            for start, end in ranges
-            for bar in self.daily_provider.get_daily_bars(
-                symbol, start, end, "forward"
-            )
-        ]
+        ranges = (
+            [(desired[0], desired[-1])]
+            if isinstance(self.daily_provider, DailyBarCoverageProvider)
+            and len(existing) < len(desired)
+            else self._fetch_ranges(desired, set(existing))
+        )
+        fetched: list[DailyBar] = []
+        coverage_evidence: DailyBarCoverageEvidence | None = None
+        for start, end in ranges:
+            if isinstance(self.daily_provider, DailyBarCoverageProvider):
+                result = self.daily_provider.get_daily_bars_with_coverage(
+                    symbol,
+                    start,
+                    end,
+                    "forward",
+                )
+                bars = list(result.bars)
+                self._validate_daily_fetch(
+                    symbol,
+                    start,
+                    end,
+                    bars,
+                    result.coverage_evidence,
+                )
+                if start == desired[0] and end == desired[-1]:
+                    coverage_evidence = result.coverage_evidence
+            else:
+                bars = list(
+                    self.daily_provider.get_daily_bars(
+                        symbol,
+                        start,
+                        end,
+                        "forward",
+                    )
+                )
+            fetched.extend(bars)
         connection = self.daily_repository.connection
         connection.execute("SAVEPOINT daily_backfill_dataset")
         try:
@@ -106,6 +148,20 @@ class HeavyDataBackfillService:
             ]
             fetched_at = self._fetched_at()
             complete = len(current) == len(desired)
+            completeness = HistoryCompleteness.UNVERIFIABLE
+            verified_listing_evidence: ListingDateEvidence | None = None
+            if (
+                coverage_evidence is not None
+                and coverage_evidence.complete_request_window
+            ):
+                completeness = HistoryCompleteness.VERIFIED_PROVIDER_WINDOW
+            elif listing_evidence is not None and self._listing_window_is_complete(
+                current,
+                listing_evidence=listing_evidence,
+                as_of=as_of,
+            ):
+                completeness = HistoryCompleteness.VERIFIED_LISTING_DATE
+                verified_listing_evidence = listing_evidence
             snapshot = HistorySnapshot(
                 run_id=run_id,
                 symbol=symbol,
@@ -121,9 +177,17 @@ class HeavyDataBackfillService:
                 warning=(
                     ""
                     if complete
-                    else f"expected {len(desired)} daily bars, got {len(current)}"
+                    else self._short_history_warning(
+                        expected_rows=len(desired),
+                        actual_rows=len(current),
+                        completeness=completeness,
+                        listing_evidence=verified_listing_evidence,
+                    )
                 ),
                 fetched_at=fetched_at,
+                completeness=completeness,
+                coverage_evidence=coverage_evidence,
+                listing_evidence=verified_listing_evidence,
             )
             snapshot_id = self.history_snapshot_repository.save(
                 snapshot, [stored.id for stored in current], commit=False
@@ -141,6 +205,59 @@ class HeavyDataBackfillService:
             rows_received=len(fetched),
             rows_written=rows_written,
         )
+
+    @staticmethod
+    def _validate_daily_fetch(
+        symbol: str,
+        start: date,
+        end: date,
+        bars: list[DailyBar],
+        evidence: DailyBarCoverageEvidence,
+    ) -> None:
+        if evidence.requested_start != start or evidence.requested_end != end:
+            raise ValueError("daily coverage evidence does not match requested range")
+        if any(
+            bar.symbol != symbol
+            or bar.adjustment != "forward"
+            or not start <= bar.trade_date <= end
+            for bar in bars
+        ):
+            raise ValueError("daily provider returned bars outside requested scope")
+        earliest = None if not bars else min(bar.trade_date for bar in bars)
+        if evidence.complete_request_window and evidence.earliest_available_date != earliest:
+            raise ValueError("daily coverage earliest date does not match returned bars")
+
+    def _listing_window_is_complete(
+        self,
+        current: list[StoredDailyBar],
+        *,
+        listing_evidence: ListingDateEvidence,
+        as_of: date,
+    ) -> bool:
+        expected = self.calendar.trading_days(
+            listing_evidence.listing_date,
+            as_of,
+        )
+        actual = [stored.bar.trade_date for stored in current]
+        return bool(expected) and actual == expected
+
+    @staticmethod
+    def _short_history_warning(
+        *,
+        expected_rows: int,
+        actual_rows: int,
+        completeness: HistoryCompleteness,
+        listing_evidence: ListingDateEvidence | None,
+    ) -> str:
+        prefix = f"expected {expected_rows} daily bars, got {actual_rows}"
+        if completeness is HistoryCompleteness.VERIFIED_PROVIDER_WINDOW:
+            return f"{prefix}; provider observed the complete request window"
+        if completeness is HistoryCompleteness.VERIFIED_LISTING_DATE:
+            return (
+                f"{prefix}; verified from listing date "
+                f"{listing_evidence.listing_date.isoformat()}"
+            )
+        return f"{prefix}; short history start is unverifiable"
 
     def backfill_money_flow(
         self, run_id: str, symbol: str, as_of: date

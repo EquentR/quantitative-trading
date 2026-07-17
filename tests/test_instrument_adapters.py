@@ -1,4 +1,5 @@
 from datetime import UTC, date, datetime
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -21,13 +22,33 @@ TRADE_DATE = date(2026, 7, 14)
 
 
 class FakeSseFundClassificationSource:
-    def __init__(self, subclasses: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        subclasses: dict[str, str] | None = None,
+        listing_dates: dict[str, date] | None = None,
+        listing_date_conflicts: frozenset[str] = frozenset(),
+    ) -> None:
         self.subclasses = {"510300": "03"} if subclasses is None else subclasses
+        self.listing_dates = (
+            {"510300": date(2012, 5, 28)}
+            if listing_dates is None
+            else listing_dates
+        )
+        self.listing_date_conflicts = listing_date_conflicts
         self.calls = 0
 
     def fetch(self):  # noqa: ANN201
         self.calls += 1
         return self.subclasses
+
+    def fetch_metadata(self):  # noqa: ANN201
+        self.calls += 1
+        return SimpleNamespace(
+            subclasses=self.subclasses,
+            listing_dates=self.listing_dates,
+            listing_date_conflicts=self.listing_date_conflicts,
+            warnings=(),
+        )
 
 
 def directory_adapter(akshare, *, source=None):  # noqa: ANN001, ANN201
@@ -46,13 +67,35 @@ class FakeAkShareDirectory:
         self.calls.append(("sh_a", symbol))
         if symbol == "主板A股":
             return pd.DataFrame(
-                [{"证券代码": "600519", "证券简称": "贵州茅台"}]
+                [
+                    {
+                        "证券代码": "600519",
+                        "证券简称": "贵州茅台",
+                        "上市日期": date(2001, 8, 27),
+                    }
+                ]
             )
-        return pd.DataFrame([{"证券代码": "688001", "证券简称": "华兴源创"}])
+        return pd.DataFrame(
+            [
+                {
+                    "证券代码": "688001",
+                    "证券简称": "华兴源创",
+                    "上市日期": date(2019, 7, 22),
+                }
+            ]
+        )
 
     def stock_info_sz_name_code(self, *, symbol: str) -> pd.DataFrame:
         self.calls.append(("sz_a", symbol))
-        return pd.DataFrame([{"A股代码": "000001", "A股简称": "平安银行"}])
+        return pd.DataFrame(
+            [
+                {
+                    "A股代码": "000001",
+                    "A股简称": "平安银行",
+                    "A股上市日期": date(1991, 4, 3),
+                }
+            ]
+        )
 
     def fund_etf_spot_em(self) -> pd.DataFrame:
         self.calls.append(("etf_spot", None))
@@ -115,6 +158,10 @@ def test_directory_maps_exchange_specific_a_shares_and_verified_etfs() -> None:
     assert by_symbol["510300"].instrument_type is InstrumentType.ETF
     assert by_symbol["510300"].settlement_cycle is SettlementCycle.T1
     assert by_symbol["159915"].exchange is Exchange.SZ
+    assert by_symbol["600519"].listing_date == date(2001, 8, 27)
+    assert by_symbol["000001"].listing_date == date(1991, 4, 3)
+    assert by_symbol["510300"].listing_date == date(2012, 5, 28)
+    assert by_symbol["159915"].listing_date == date(2011, 12, 9)
     assert "160000" not in by_symbol
     assert akshare.calls == [
         ("sh_a", "主板A股"),
@@ -126,6 +173,88 @@ def test_directory_maps_exchange_specific_a_shares_and_verified_etfs() -> None:
     ]
     assert snapshot.source_trade_dates[adapter.SH_ETF_SOURCE] == TRADE_DATE
     assert classifications.calls == 1
+
+
+def test_directory_listing_date_conflict_degrades_instrument_to_unknown() -> None:
+    class ListingConflictDirectory(FakeAkShareDirectory):
+        def stock_info_sh_name_code(self, *, symbol: str) -> pd.DataFrame:
+            if symbol != "主板A股":
+                return super().stock_info_sh_name_code(symbol=symbol)
+            self.calls.append(("sh_a", symbol))
+            return pd.DataFrame(
+                [
+                    {
+                        "证券代码": "600519",
+                        "证券简称": "贵州茅台",
+                        "上市日期": date(2001, 8, 27),
+                    },
+                    {
+                        "证券代码": "600519",
+                        "证券简称": "贵州茅台",
+                        "上市日期": date(2001, 8, 28),
+                    },
+                ]
+            )
+
+    snapshot = directory_adapter(ListingConflictDirectory()).fetch(TRADE_DATE)
+
+    item = next(item for item in snapshot.items if item.symbol == "600519")
+    assert item.instrument_type is InstrumentType.UNKNOWN
+    assert item.listing_date is None
+    assert item.metadata_source == "directory_conflict"
+    assert item.warnings == [
+        "instrument 600519 has conflicting directory metadata"
+    ]
+
+
+@pytest.mark.parametrize("raw", [None, float("nan"), pd.NaT, pd.NA, "<NA>"])
+def test_directory_treats_missing_listing_date_values_as_none(raw) -> None:
+    class MissingListingDateDirectory(FakeAkShareDirectory):
+        def stock_info_sh_name_code(self, *, symbol: str) -> pd.DataFrame:
+            frame = super().stock_info_sh_name_code(symbol=symbol)
+            frame["上市日期"] = raw
+            return frame
+
+    snapshot = directory_adapter(MissingListingDateDirectory()).fetch(TRADE_DATE)
+
+    item = next(item for item in snapshot.items if item.symbol == "600519")
+    assert item.listing_date is None
+    assert not any("invalid listing date" in warning for warning in snapshot.warnings)
+
+
+@pytest.mark.parametrize("raw", ["2001-08-27", "20010827"])
+def test_directory_accepts_exact_listing_date_formats(raw: str) -> None:
+    class ExactListingDateDirectory(FakeAkShareDirectory):
+        def stock_info_sh_name_code(self, *, symbol: str) -> pd.DataFrame:
+            frame = super().stock_info_sh_name_code(symbol=symbol)
+            frame["上市日期"] = raw
+            return frame
+
+    snapshot = directory_adapter(ExactListingDateDirectory()).fetch(TRADE_DATE)
+
+    item = next(item for item in snapshot.items if item.symbol == "600519")
+    assert item.listing_date == date(2001, 8, 27)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["not-a-date", "2001-08-27garbage", "20010827garbage"],
+)
+def test_directory_discards_invalid_nonempty_listing_date_with_warning(raw: str) -> None:
+    class InvalidListingDateDirectory(FakeAkShareDirectory):
+        def stock_info_sh_name_code(self, *, symbol: str) -> pd.DataFrame:
+            frame = super().stock_info_sh_name_code(symbol=symbol)
+            frame["上市日期"] = raw
+            return frame
+
+    snapshot = directory_adapter(InvalidListingDateDirectory()).fetch(TRADE_DATE)
+
+    item = next(item for item in snapshot.items if item.symbol == "600519")
+    assert item.listing_date is None
+    assert any(
+        "akshare_sh_a_share returned invalid listing date for 600519" in warning
+        for warning in snapshot.warnings
+    )
 
 
 def test_directory_keeps_verified_etf_with_unknown_rule_as_observation_only() -> None:
@@ -348,14 +477,29 @@ def test_sse_fund_classification_source_reads_exact_fund_list_contract() -> None
         calls.append((url, headers, timeout))
         return {
             "result": [
-                {"fundCode": "510300", "subClass": "03", "fundName": "沪深300ETF"},
-                {"fundCode": "511010", "subClass": "02", "fundName": "国债ETF"},
+                {
+                    "fundCode": "510300",
+                    "subClass": "03",
+                    "fundName": "沪深300ETF",
+                    "listingDate": "20120528",
+                },
+                {
+                    "fundCode": "511010",
+                    "subClass": "02",
+                    "fundName": "国债ETF",
+                    "listingDate": "20091215",
+                },
             ]
         }
 
-    result = SseFundClassificationSource(transport=transport).fetch()
+    result = SseFundClassificationSource(transport=transport).fetch_metadata()
 
-    assert result == {"510300": "03", "511010": "02"}
+    assert result.subclasses == {"510300": "03", "511010": "02"}
+    assert result.listing_dates == {
+        "510300": date(2012, 5, 28),
+        "511010": date(2009, 12, 15),
+    }
+    assert len(calls) == 1
     assert "query.sse.com.cn/commonSoaQuery.do" in calls[0][0]
     assert "sqlId=FUND_LIST" in calls[0][0]
     assert "isPagination=true" in calls[0][0]
@@ -376,6 +520,49 @@ def test_sse_fund_classification_source_isolates_conflicting_subclasses() -> Non
     )
 
     assert source.fetch() == {"510300": "__conflict__"}
+
+
+def test_sse_fund_classification_source_isolates_conflicting_listing_dates() -> None:
+    source = SseFundClassificationSource(
+        transport=lambda *_args: {
+            "result": [
+                {
+                    "fundCode": "510300",
+                    "subClass": "03",
+                    "listingDate": "20120528",
+                },
+                {
+                    "fundCode": "510300",
+                    "subClass": "03",
+                    "listingDate": "20120529",
+                },
+            ]
+        }
+    )
+
+    result = source.fetch_metadata()
+
+    assert result.subclasses == {"510300": "03"}
+    assert result.listing_dates == {}
+    assert result.listing_date_conflicts == frozenset({"510300"})
+
+
+def test_sse_etf_conflicting_listing_dates_degrade_directory_metadata() -> None:
+    snapshot = directory_adapter(
+        FakeAkShareDirectory(),
+        source=FakeSseFundClassificationSource(
+            listing_dates={},
+            listing_date_conflicts=frozenset({"510300"}),
+        ),
+    ).fetch(TRADE_DATE)
+
+    item = next(item for item in snapshot.items if item.symbol == "510300")
+    assert item.instrument_type is InstrumentType.UNKNOWN
+    assert item.listing_date is None
+    assert item.metadata_source == "directory_conflict"
+    assert item.warnings == [
+        "instrument 510300 has conflicting directory listing dates"
+    ]
 
 
 def test_sse_etf_conflicting_detailed_classification_remains_watch_only() -> None:

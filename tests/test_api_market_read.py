@@ -408,7 +408,8 @@ def seed_market_data(settings: Settings) -> int:
                 created_at=FETCHED_AT,
             )
         )
-        NotificationRepository(connection).save(
+        notification_repository = NotificationRepository(connection)
+        notification_repository.save(
             NotificationSummary(
                 notification_id="notification-1",
                 recommendation_id=recommendation.recommendation_id,
@@ -422,6 +423,11 @@ def seed_market_data(settings: Settings) -> int:
                 audit_id="audit-1",
                 created_at=FETCHED_AT,
             )
+        )
+        notification_repository.save_canonical_group(
+            "notification-1",
+            "notification-1",
+            created_at=FETCHED_AT,
         )
         return market_snapshot_id
 
@@ -543,6 +549,22 @@ def test_empty_market_datasets_return_explicit_unavailable_responses(tmp_path) -
 def test_symbol_scanner_paginates_latest_universe_and_composes_state(tmp_path) -> None:
     client, headers, settings = authenticated_client(tmp_path)
     seed_market_data(settings)
+    with connect(settings) as connection:
+        NotificationRepository(connection).save(
+            NotificationSummary(
+                notification_id="notification-history-only",
+                recommendation_id="rec-history-only",
+                symbol="600000",
+                action="hold",
+                confidence="medium",
+                key_price=14.8,
+                reason=["historical cycle"],
+                risk=["historical invalidation"],
+                data_time=DATA_TIME,
+                audit_id="audit-history-only",
+                created_at=FETCHED_AT - timedelta(minutes=3),
+            )
+        )
 
     first = client.get("/api/v1/market/symbols?page=1&page_size=1", headers=headers)
     second = client.get("/api/v1/market/symbols?page=2&page_size=1", headers=headers)

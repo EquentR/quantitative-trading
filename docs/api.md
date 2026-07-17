@@ -237,6 +237,8 @@ GET /api/v1/recommendations/{recommendation_id}/trace
 
 建议读取当前 `DecisionWorkflow` 已固化的输入，读取阶段不访问第三方。`buy/add` 必须通过活动计划、多因子确认和硬性风控；无计划的非持仓标的只能 `watch/avoid`。持仓新风险仍可覆盖计划，但缺少报价、成本、数量或可用数量时必须降级为保守 `hold` 和人工复核。
 
+建议列表支持 `GET /api/v1/recommendations?view=current|history&page=1&page_size=20`。无 `view` 时保持旧响应，`items` 直接返回完整历史 Recommendation；显式 view 时返回 linked DTO `{"recommendation": {...}, "notification": {"notification_id": "...", "status": "..."}}`，没有 link 时 notification 为 null。current 按 symbol 选择数据库创建顺序最新的建议并在分组后分页，total 为 symbol 数；history 返回完整历史及建议总数。详情和 trace 始终返回原始 Recommendation 契约。
+
 `POST /api/v1/recommendations/scan` 已退役。认证请求固定返回 HTTP `410` 和 `recommendation_scan_retired`，响应 `details.replacement` 指向 `/api/v1/service/workflows/intraday/run`；它不会采集行情或写建议。建议只由统一盘中 `DecisionWorkflow` 生成，列表 `items` 中每条记录都必须包含 `reason`、风险和失效条件、仓位约束、`run_id`、`market_input_snapshot_id`、`plan_id`、逐数据集引用、质量、`valid_until` 和 `data_time`。trace 接口解析台账、账户、行情、历史、资金流、分时、计划、通知和审计引用。
 
 ## 反馈接口
@@ -246,12 +248,13 @@ POST /api/v1/feedback
 GET /api/v1/feedback?recommendation_id=rec-001&page=1&page_size=50
 ```
 
-反馈接口记录人工是否执行建议、实际成交价、成交数量和备注。写入反馈后，后端会在同一事务中把关联通知标记为 `feedback_recorded`。反馈接口不得修改手动持仓台账、手动资金账户、现金余额、净本金或账户快照；真实成交后的权威持仓和资金变化仍必须由用户通过台账和资金入口手动维护。
+反馈接口记录人工是否执行建议、实际成交价、成交数量和备注。写入反馈后，后端会在同一事务中优先通过 Recommendation-notification link 把 canonical 通知标记为 `feedback_recorded`；没有 link 的旧数据只按完全相同的通知原始 Recommendation ID 回退，不按标的或条件猜测。反馈接口不得修改手动持仓台账、手动资金账户、现金余额、净本金或账户快照；真实成交后的权威持仓和资金变化仍必须由用户通过台账和资金入口手动维护。
 
 ## 通知、反馈和审计
 
 ```text
-GET /api/v1/notifications?status=unread&symbol=600000&page=1&page_size=50
+GET /api/v1/notifications?view=current&status=unread&symbol=600000&page=1&page_size=50
+GET /api/v1/notifications?view=history&page=1&page_size=50
 GET /api/v1/notifications/unread-count
 POST /api/v1/notifications/{notification_id}/read
 GET /api/v1/audit?page=1&page_size=50
@@ -260,7 +263,7 @@ GET /api/v1/audit/{audit_id}
 
 通知摘要状态为 `unread`、`read`、`feedback_recorded`。`feedback_recorded` 只表示已记录人工反馈，不表示系统确认真实成交或真实账户已经变化。
 
-通知和审计路由是认证稳定接口。标记已读只改变本地处理状态；反馈可以把关联通知更新为 `feedback_recorded`，但不能修改台账或资金。系统故障通知使用 `action=system_alert`，关键工作流故障和 `dead` 邮件都会写入数据库并投射到 Web/API、控制台和 JSONL；SMTP 未配置、禁用或失败不影响这些本地告警。所有列表使用稳定排序和统一分页封装；错误摘要不得包含第三方 payload、路径或凭据。
+通知和审计路由是认证稳定接口。通知 `view=current` 返回 canonical Recommendation 通知与全部 `system_alert`，`view=history` 返回完整历史；不传 `view` 时为兼容旧客户端固定使用 history。未读 endpoint、行情扫描器逐标未读数和 CLI `qt notifications unread` 使用同一 current 集合。标记已读只改变本地处理状态；反馈可以把关联通知更新为 `feedback_recorded`，但不能修改台账或资金。系统故障通知使用 `action=system_alert`，关键工作流故障和 `dead` 邮件都会写入数据库并投射到 Web/API、控制台和 JSONL；SMTP 未配置、禁用或失败不影响这些本地告警。所有列表使用稳定排序和统一分页封装；错误摘要不得包含第三方 payload、路径或凭据。
 
 ## SMTP 设置和邮件 outbox
 

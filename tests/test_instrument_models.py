@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -73,6 +73,55 @@ def test_unknown_instrument_cannot_claim_known_settlement() -> None:
             settlement_cycle=SettlementCycle.T1,
             price_limit_ratio=None,
         )
+
+
+def test_verified_listing_date_round_trips_through_candidate_metadata() -> None:
+    listing_date = date(2001, 8, 27)
+    item = metadata(listing_date=listing_date)
+
+    candidate = InstrumentCandidate.from_metadata(
+        item,
+        source=InstrumentPreviewSource.INSTRUMENT_SEARCH,
+        source_rank=None,
+        already_monitored=False,
+        selectable=True,
+    )
+
+    assert item.listing_date == listing_date
+    assert candidate.listing_date == listing_date
+    assert candidate.to_metadata() == item
+
+
+def test_unknown_instrument_cannot_claim_verified_listing_date() -> None:
+    with pytest.raises(ValidationError, match="unknown instrument cannot claim listing date"):
+        metadata(
+            exchange=None,
+            instrument_type=InstrumentType.UNKNOWN,
+            settlement_cycle=SettlementCycle.UNKNOWN,
+            price_limit_ratio=None,
+            metadata_source="legacy",
+            listing_date=date(2001, 8, 27),
+        )
+
+
+def test_unknown_candidate_cannot_claim_verified_listing_date() -> None:
+    item = metadata()
+    payload = {
+        **item.model_dump(),
+        "exchange": None,
+        "instrument_type": InstrumentType.UNKNOWN,
+        "settlement_cycle": SettlementCycle.UNKNOWN,
+        "price_limit_ratio": None,
+        "listing_date": date(2001, 8, 27),
+        "metadata_source": "legacy",
+        "source": InstrumentPreviewSource.INSTRUMENT_SEARCH,
+        "source_rank": None,
+        "already_monitored": False,
+        "selectable": False,
+    }
+
+    with pytest.raises(ValidationError, match="unknown instrument cannot claim listing date"):
+        InstrumentCandidate.model_validate(payload)
 
 
 def test_instrument_preview_round_trips_normalized_candidate() -> None:

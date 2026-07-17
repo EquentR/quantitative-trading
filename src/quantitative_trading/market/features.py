@@ -8,6 +8,7 @@ from quantitative_trading.market.models import (
     ComponentStatus,
     DailyBar,
     IntradayStrengthSnapshot,
+    MIN_HISTORY_ROWS,
     MinuteBar,
     QuoteSnapshot,
     StrengthComponent,
@@ -117,14 +118,14 @@ def calculate_daily_features(bars: list[DailyBar]) -> DailyFeatures:
 
     ma5 = ma(5)
     ma10 = ma(10)
-    ma20 = ma(20)
+    ma20 = ma(MIN_HISTORY_ROWS)
     ma60 = ma(60)
     high5 = rolling_high(5)
     low5 = rolling_low(5)
     high10 = rolling_high(10)
     low10 = rolling_low(10)
-    high20 = rolling_high(20)
-    low20 = rolling_low(20)
+    high20 = rolling_high(MIN_HISTORY_ROWS)
+    low20 = rolling_low(MIN_HISTORY_ROWS)
     if high20.available and low20.available:
         denominator = float(high20.value) - float(low20.value)
         position20 = (
@@ -136,7 +137,9 @@ def calculate_daily_features(bars: list[DailyBar]) -> DailyFeatures:
             else _unavailable("20-day high equals low")
         )
     else:
-        position20 = _unavailable("requires 20 daily bars")
+        position20 = _unavailable(
+            f"requires {MIN_HISTORY_ROWS} daily bars"
+        )
 
     if len(ordered) >= 15:
         true_ranges = [
@@ -152,7 +155,7 @@ def calculate_daily_features(bars: list[DailyBar]) -> DailyFeatures:
         atr14 = _unavailable("requires 15 daily bars")
 
     average_volume5 = average_volume(5)
-    average_volume20 = average_volume(20)
+    average_volume20 = average_volume(MIN_HISTORY_ROWS)
     if average_volume20.available and float(average_volume20.value) > 0:
         volume_ratio = _available(
             ordered[-1].volume / float(average_volume20.value),
@@ -168,11 +171,11 @@ def calculate_daily_features(bars: list[DailyBar]) -> DailyFeatures:
         ma60=ma60,
         return_5=period_return(5),
         return_10=period_return(10),
-        return_20=period_return(20),
+        return_20=period_return(MIN_HISTORY_ROWS),
         return_60=period_return(60),
         ma5_slope=slope(5),
         ma10_slope=slope(10),
-        ma20_slope=slope(20),
+        ma20_slope=slope(MIN_HISTORY_ROWS),
         high20=high20,
         low20=low20,
         position20=position20,

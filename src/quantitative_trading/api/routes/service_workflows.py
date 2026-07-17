@@ -26,7 +26,10 @@ from quantitative_trading.market.models import (
     CaptureRunStatus,
 )
 from quantitative_trading.planning.repository import TradingPlanRepository
+from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.sanitization import safe_error_summary
+from quantitative_trading.universe.service import build_universe
+from quantitative_trading.watchlist.repository import WatchPinnedRepository
 
 
 router = APIRouter(
@@ -37,6 +40,7 @@ router = APIRouter(
 LOGGER = logging.getLogger(__name__)
 
 WorkflowType = Literal["close", "intraday", "backfill", "cleanup"]
+BackfillAsOfMode = Literal["latest_complete"]
 Symbol = Annotated[str, Field(pattern=r"^[0-9]{6}$")]
 
 
@@ -48,7 +52,8 @@ class WorkflowRunRequest(BaseModel):
     skip_calendar: bool = False
     manual_reason: str | None = Field(default=None, min_length=1, max_length=500)
     as_of: date | None = None
-    symbols: list[Symbol] | None = Field(default=None, max_length=500)
+    as_of_mode: BackfillAsOfMode | None = None
+    symbols: list[Symbol] | None = Field(default=None, min_length=1, max_length=500)
 
 
 class WorkflowRunResponse(BaseModel):
@@ -151,7 +156,11 @@ def _validate_fields(
     request: WorkflowRunRequest,
 ) -> None:
     if workflow_type == "close":
-        if request.as_of is not None or request.symbols is not None:
+        if (
+            request.as_of is not None
+            or request.as_of_mode is not None
+            or request.symbols is not None
+        ):
             raise _invalid_request(workflow_type)
         return
     if workflow_type == "intraday":
@@ -162,6 +171,7 @@ def _validate_fields(
                 request.skip_calendar,
                 request.manual_reason is not None,
                 request.as_of is not None,
+                request.as_of_mode is not None,
                 request.symbols is not None,
             )
         ):
@@ -174,6 +184,7 @@ def _validate_fields(
                 request.skip_calendar,
                 request.manual_reason is not None,
                 request.as_of is not None,
+                request.trade_date is not None and request.as_of_mode is not None,
             )
         ):
             raise _invalid_request(workflow_type)
@@ -184,6 +195,7 @@ def _validate_fields(
             request.force,
             request.skip_calendar,
             request.manual_reason is not None,
+            request.as_of_mode is not None,
             request.symbols is not None,
         )
     ):
@@ -219,6 +231,11 @@ def _audit_request(
             "late": late,
             "manual_reason": request.manual_reason,
             "symbols": request.symbols,
+            **(
+                {"as_of_mode": request.as_of_mode}
+                if request.as_of_mode is not None
+                else {}
+            ),
         },
         now=now,
     )
@@ -255,6 +272,11 @@ def _audit_failed_request(
                     ),
                     "as_of": None if request.as_of is None else request.as_of.isoformat(),
                     "symbols": request.symbols,
+                    **(
+                        {"as_of_mode": request.as_of_mode}
+                        if request.as_of_mode is not None
+                        else {}
+                    ),
                 },
                 now=now,
             )
@@ -441,11 +463,29 @@ def _run_backfill(
     ):
         raise _workflow_not_available()
     calendar = XSHGTradingCalendar()
-    trade_date = request.trade_date or now.astimezone(calendar.timezone).date()
-    if not calendar.is_trading_day(trade_date):
-        raise _backfill_calendar_guard_failed(trade_date)
+    local_date = now.astimezone(calendar.timezone).date()
     try:
         with connection_scope(container.settings) as connection:
+            scope = _backfill_scope(connection, request, now)
+            resolution_warnings: tuple[str, ...] = ()
+            if request.as_of_mode == "latest_complete":
+                resolution = calendar.resolve_market_dates(
+                    now,
+                    session_ready=lambda trade_day: _history_session_ready(
+                        connection,
+                        calendar=calendar,
+                        requested_at=now,
+                        local_date=local_date,
+                        trade_date=trade_day,
+                        symbols=scope,
+                    ),
+                )
+                trade_date = resolution.history_cutoff_date
+                resolution_warnings = resolution.warnings
+            else:
+                trade_date = request.trade_date or local_date
+            if not calendar.is_trading_day(trade_date):
+                raise _backfill_calendar_guard_failed(trade_date)
             _audit_request(
                 connection,
                 workflow_type="backfill",
@@ -462,7 +502,7 @@ def _run_backfill(
             )
             summary = workflow.run_backfill(
                 trade_date,
-                symbols=request.symbols,
+                symbols=(scope if request.symbols is not None else None),
             )
             if summary.status is CaptureRunStatus.FAILED:
                 _dispatch_failed_result_alert(
@@ -494,11 +534,61 @@ def _run_backfill(
         snapshot_id=None,
         plan_id=None,
         recommendation_ids=[],
-        warnings=list(summary.warnings),
+        warnings=[*resolution_warnings, *summary.warnings],
         reused=summary.reused,
         ready=None,
         cleaned_rows=None,
     )
+
+
+def _backfill_scope(
+    connection,
+    request: WorkflowRunRequest,
+    now: datetime,
+) -> list[str]:
+    members = build_universe(
+        positions=PositionRepository(connection).list(),
+        watchlist=WatchPinnedRepository(connection).list(),
+        created_at=now,
+    )
+    enabled = {member.symbol for member in members if member.plan_enabled}
+    if request.symbols is None:
+        return sorted(enabled)
+    requested = list(dict.fromkeys(request.symbols))
+    if set(requested) - enabled:
+        raise _invalid_request("backfill")
+    return requested
+
+
+def _history_session_ready(
+    connection,
+    *,
+    calendar: XSHGTradingCalendar,
+    requested_at: datetime,
+    local_date: date,
+    trade_date: date,
+    symbols: list[str],
+) -> bool:
+    if trade_date < local_date:
+        return True
+    if trade_date > local_date or not calendar.is_trading_day(local_date):
+        return False
+    if requested_at.astimezone(calendar.timezone) <= calendar.session(local_date).close_at:
+        return False
+    if not symbols:
+        return True
+    placeholders = ",".join("?" for _ in symbols)
+    row = connection.execute(
+        f"""
+        SELECT COUNT(DISTINCT symbol) AS count
+        FROM daily_bars
+        WHERE trade_date = ?
+          AND adjustment = 'forward'
+          AND symbol IN ({placeholders})
+        """,
+        (trade_date.isoformat(), *symbols),
+    ).fetchone()
+    return int(row["count"]) == len(symbols)
 
 
 def _run_cleanup(

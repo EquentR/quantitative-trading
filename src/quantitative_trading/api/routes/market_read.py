@@ -53,6 +53,8 @@ from quantitative_trading.market.repository import (
     MarketInputSnapshotRepository,
     QuoteSnapshotRepository,
 )
+from quantitative_trading.notification.repository import NotificationRepository
+from quantitative_trading.notification.service import NotificationService
 from quantitative_trading.planning.models import TradingPlan
 from quantitative_trading.recommendation.models import Recommendation
 from quantitative_trading.recommendation.repository import RecommendationRepository
@@ -528,11 +530,9 @@ def _merge_persisted_quality(
 
 
 def _unread_count(connection: sqlite3.Connection, symbol: str) -> int:
-    row = connection.execute(
-        "SELECT COUNT(*) AS count FROM notifications WHERE symbol = ? AND status = ?",
-        (symbol, "unread"),
-    ).fetchone()
-    return int(row["count"])
+    return NotificationService(NotificationRepository(connection)).unread_count(
+        symbol=symbol
+    )
 
 
 def _scanner_item(

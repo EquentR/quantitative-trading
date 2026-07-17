@@ -37,6 +37,7 @@ def metadata(
     instrument_type: InstrumentType = InstrumentType.A_SHARE,
     settlement_cycle: SettlementCycle = SettlementCycle.T1,
     source: str = "akshare_sh_a_share",
+    listing_date: date | None = None,
 ) -> InstrumentMetadata:
     return InstrumentMetadata(
         symbol=symbol,
@@ -44,10 +45,67 @@ def metadata(
         exchange=exchange,
         instrument_type=instrument_type,
         settlement_cycle=settlement_cycle,
+        listing_date=listing_date,
         metadata_source=source,
         metadata_checked_at=NOW,
         rule_version="instrument-rules-v1",
     )
+
+
+def test_catalog_round_trips_verified_listing_date(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "catalog-listing-date.db")
+    expected = date(2001, 8, 27)
+    with connect(settings) as connection:
+        migrate(connection)
+        repository = InstrumentRepository(connection)
+        repository.replace_catalog(
+            [metadata("600000", "浦发银行", listing_date=expected)]
+        )
+
+        loaded = repository.get("600000")
+
+    assert loaded is not None
+    assert loaded.listing_date == expected
+
+
+def test_migrate_adds_nullable_listing_date_to_existing_catalog(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "legacy-catalog-listing-date.db")
+    with connect(settings) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE instruments (
+              symbol TEXT PRIMARY KEY NOT NULL,
+              name TEXT NOT NULL,
+              exchange TEXT,
+              instrument_type TEXT NOT NULL,
+              settlement_cycle TEXT NOT NULL,
+              price_limit_ratio REAL,
+              metadata_source TEXT NOT NULL,
+              metadata_checked_at TEXT NOT NULL,
+              rule_version TEXT NOT NULL,
+              is_active INTEGER NOT NULL,
+              warnings_json TEXT NOT NULL
+            );
+            INSERT INTO instruments VALUES (
+              '600000', 'legacy', 'SH', 'a_share', 't1', 0.1,
+              'legacy-directory', '2026-07-15T02:00:00+00:00',
+              'legacy-rules-v1', 1, '[]'
+            );
+            """
+        )
+
+        migrate(connection)
+
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(instruments)")
+        }
+        row = connection.execute(
+            "SELECT name, listing_date FROM instruments WHERE symbol='600000'"
+        ).fetchone()
+
+    assert "listing_date" in columns
+    assert row["name"] == "legacy"
+    assert row["listing_date"] is None
 
 
 def test_replace_catalog_marks_missing_rows_inactive_and_keeps_other_metadata(
