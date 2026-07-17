@@ -87,7 +87,7 @@
 
 ### 证券身份与交易制度
 
-顶层 `symbol` 使用 ASCII 六位代码，`name` 是建议展示名称；`instrument` 对象保存后端已验证的 `symbol`、`name`、`exchange`、`instrument_type`、`settlement_cycle`、`price_limit_ratio`、`metadata_source`、`metadata_checked_at`、规则版本和 warnings，并随建议保存。前端不得根据代码或名称补算证券类型、T+0/T+1 或涨跌停比例。
+顶层 `symbol` 使用 ASCII 六位代码，`name` 是建议展示名称；`instrument` 对象保存后端已验证的 `symbol`、`name`、`exchange`、`instrument_type`、`settlement_cycle`、`price_limit_ratio`、可用时的权威 `listing_date`、`metadata_source`、`metadata_checked_at`、规则版本和 warnings，并随建议保存。前端不得根据代码或名称补算证券类型、T+0/T+1、上市日期或涨跌停比例。
 
 `instrument_type` 为 `a_share/etf/unknown`，`settlement_cycle` 为 `t0/t1/unknown`。A 股固定 T+1；ETF 只根据交易所产品类别的明确规则映射。未知证券或未知交易制度不得产生 `buy/add/sell/reduce`；未知持仓降级为保守 `hold` 并要求人工复核。
 

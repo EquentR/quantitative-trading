@@ -902,8 +902,15 @@ def test_close_workflow_internal_contract_error_inside_capture_terminates_run(
     settings = Settings(database_path=tmp_path / "close-contract-failure.db")
     calendar = XSHGTradingCalendar()
 
-    def fail_internal_contract(self, run_id, symbol, as_of):  # noqa: ANN001
-        del self, run_id, symbol, as_of
+    def fail_internal_contract(  # noqa: ANN001
+        self,
+        run_id,
+        symbol,
+        as_of,
+        *,
+        listing_evidence=None,
+    ):
+        del self, run_id, symbol, as_of, listing_evidence
         raise ValueError("synthetic daily mapping invariant failure")
 
     monkeypatch.setattr(
@@ -1440,6 +1447,251 @@ def test_market_cli_preserves_optional_daily_coverage_evidence(
     assert history.coverage_evidence.complete_request_window is coverage_complete
 
 
+def test_market_cli_persists_listing_evidence_for_legacy_short_history(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "market-cli-listing-evidence.db")
+    calendar = XSHGTradingCalendar()
+    listing_date = calendar.sessions_ending(TRADE_DATE, 20)[0]
+    metadata = InstrumentMetadata(
+        symbol="600000",
+        name="A share",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.1,
+        listing_date=listing_date,
+        metadata_source="distinctive-listing-directory",
+        metadata_checked_at=NOW,
+        rule_version="test-rules-v1",
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        InstrumentRepository(connection).replace_catalog([metadata])
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol=metadata.symbol,
+                name=metadata.name,
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=listing_date,
+            ),
+            now=NOW,
+        )
+
+        summary = MarketCliService(
+            connection,
+            calendar=calendar,
+            daily_provider=TwentyDayDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            now=lambda: NOW,
+        ).backfill(TRADE_DATE)
+        row = connection.execute(
+            "SELECT id FROM history_snapshots WHERE symbol=? ORDER BY id DESC LIMIT 1",
+            (metadata.symbol,),
+        ).fetchone()
+        history = HistorySnapshotRepository(connection).get(int(row["id"]))
+        run = MarketCaptureRunRepository(connection).get(summary.run_id)
+
+    assert summary.status is CaptureRunStatus.DEGRADED
+    assert run is not None
+    assert run.status is CaptureRunStatus.DEGRADED
+    assert history is not None
+    assert history.row_count == 20
+    assert history.completeness == "verified_listing_date"
+    assert history.listing_evidence is not None
+    assert history.listing_evidence.listing_date == listing_date
+    assert history.listing_evidence.source == "distinctive-listing-directory"
+    assert history.is_usable(as_of=TRADE_DATE, expected_rows=250)
+
+
+def test_market_cli_listing_evidence_does_not_hide_internal_history_gap(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "market-cli-listing-gap.db")
+    calendar = XSHGTradingCalendar()
+    listing_date = calendar.sessions_ending(TRADE_DATE, 21)[0]
+    metadata = InstrumentMetadata(
+        symbol="600000",
+        name="A share",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.1,
+        listing_date=listing_date,
+        metadata_source="distinctive-listing-directory",
+        metadata_checked_at=NOW,
+        rule_version="test-rules-v1",
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        InstrumentRepository(connection).replace_catalog([metadata])
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol=metadata.symbol,
+                name=metadata.name,
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=listing_date,
+            ),
+            now=NOW,
+        )
+
+        MarketCliService(
+            connection,
+            calendar=calendar,
+            daily_provider=TwentyOneDayGapDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            now=lambda: NOW,
+        ).backfill(TRADE_DATE)
+        row = connection.execute(
+            "SELECT id FROM history_snapshots WHERE symbol=? ORDER BY id DESC LIMIT 1",
+            (metadata.symbol,),
+        ).fetchone()
+        history = HistorySnapshotRepository(connection).get(int(row["id"]))
+
+    assert history is not None
+    assert history.row_count == 20
+    assert history.completeness == "unverifiable"
+    assert history.listing_evidence is None
+    assert not history.is_usable(as_of=TRADE_DATE, expected_rows=250)
+
+
+def test_close_accepts_legacy_short_history_with_verified_listing_date(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "close-listing-evidence.db")
+    calendar = XSHGTradingCalendar()
+    listing_date = calendar.sessions_ending(TRADE_DATE, 20)[0]
+    metadata = InstrumentMetadata(
+        symbol="600000",
+        name="浦发银行",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.1,
+        listing_date=listing_date,
+        metadata_source="distinctive-close-listing-directory",
+        metadata_checked_at=NOW,
+        rule_version="test-rules-v1",
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        instrument_repository = InstrumentRepository(connection)
+        instrument_repository.replace_catalog([metadata])
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol=metadata.symbol,
+                name=metadata.name,
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=listing_date,
+            ),
+            now=NOW,
+        )
+        CashAccountRepository(connection).initialize(50_000, now=NOW, note="initial")
+        loader = lambda symbols: {
+            symbol: loaded
+            for symbol in symbols
+            if (loaded := instrument_repository.get(symbol)) is not None
+        }
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=RecordingQuoteProvider(),
+            daily_provider=TwentyDayDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=NoopIntradayProvider(),
+            instrument_metadata_loader=loader,
+            now=lambda: NOW,
+        ).run_close(TRADE_DATE)
+        plan = TradingPlanRepository(connection).active_for_day(date(2026, 7, 14))
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        history = HistorySnapshotRepository(connection).get(
+            market_input.history_snapshot_refs[metadata.symbol]
+        )
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+
+    assert result.ready is True
+    assert plan is not None
+    assert plan.data_quality == "degraded"
+    assert run is not None
+    assert run.status is CaptureRunStatus.DEGRADED
+    assert history is not None
+    assert history.row_count == 20
+    assert history.completeness == "verified_listing_date"
+    assert history.listing_evidence is not None
+    assert history.listing_evidence.source == "distinctive-close-listing-directory"
+    assert history.is_usable(as_of=TRADE_DATE, expected_rows=250)
+
+
+def test_close_listing_evidence_does_not_hide_internal_history_gap(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "close-listing-gap.db")
+    calendar = XSHGTradingCalendar()
+    listing_date = calendar.sessions_ending(TRADE_DATE, 21)[0]
+    metadata = InstrumentMetadata(
+        symbol="600000",
+        name="浦发银行",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.1,
+        listing_date=listing_date,
+        metadata_source="distinctive-close-listing-directory",
+        metadata_checked_at=NOW,
+        rule_version="test-rules-v1",
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        instrument_repository = InstrumentRepository(connection)
+        instrument_repository.replace_catalog([metadata])
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol=metadata.symbol,
+                name=metadata.name,
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=listing_date,
+            ),
+            now=NOW,
+        )
+        CashAccountRepository(connection).initialize(50_000, now=NOW, note="initial")
+        loader = lambda symbols: {
+            symbol: loaded
+            for symbol in symbols
+            if (loaded := instrument_repository.get(symbol)) is not None
+        }
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=RecordingQuoteProvider(),
+            daily_provider=TwentyOneDayGapDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=NoopIntradayProvider(),
+            instrument_metadata_loader=loader,
+            now=lambda: NOW,
+        ).run_close(TRADE_DATE)
+        plan = TradingPlanRepository(connection).active_for_day(date(2026, 7, 14))
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        history = HistorySnapshotRepository(connection).get(
+            market_input.history_snapshot_refs[metadata.symbol]
+        )
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+
+    assert result.ready is False
+    assert plan is None
+    assert run is not None
+    assert run.status is CaptureRunStatus.FAILED
+    assert history is not None
+    assert history.row_count == 20
+    assert history.completeness == "unverifiable"
+    assert history.listing_evidence is None
+
+
 def test_maintenance_workflows_reject_concurrent_active_runs(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "maintenance-concurrent.db")
     calendar = XSHGTradingCalendar()
@@ -1588,6 +1840,12 @@ class TwentyDayCoverageProvider(TwentyDayDailyProvider):
                 source="fake_daily_full_window",
             ),
         )
+
+
+class TwentyOneDayGapDailyProvider(CalendarDailyProvider):
+    def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+        bars = super().get_daily_bars(symbol, start_date, end_date, adjustment)[-21:]
+        return [*bars[:10], *bars[11:]]
 
 
 class PartialAccountQuoteProvider(ClockQuoteProvider):

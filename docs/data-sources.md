@@ -116,6 +116,8 @@ AkShare 只提供行情报价和公开市场数据，不提供真实持仓、成
 
 证券目录为每个标的提供 `exchange`、`instrument_type`、`settlement_cycle`、`price_limit_ratio`、可用时的权威 `listing_date`、`metadata_source`、`metadata_checked_at` 和规则版本。上市日期分别读取上交所 A 股 `上市日期`、深交所 A 股 `A股上市日期`、深交所 ETF `上市日期`，以及上交所 `FUND_LIST` 的 `listingDate`；上交所 ETF 的分类和上市日期必须由同一次 `FUND_LIST` 请求返回。缺失日期保存为 null，非法非空日期丢弃并产生安全 warning，不得猜测；同一代码出现不同上市日期时必须降级为 `directory_conflict`/unknown 且清空 `listing_date`。A 股固定 T+1。上交所 ETF 必须同时通过 AkShare 规模目录、公开 spot 目录和上交所 `query.sse.com.cn/commonSoaQuery.do?sqlId=FUND_LIST` 详细目录的代码交叉验证，结算制度只按详细目录 `subClass` 官方代码精确映射：`01/03/09/31/35` 为 T+1，`02/04/05/06/07/32/33/34/36/37/38` 为 T+0，`08` 和未覆盖代码为 unknown。深交所只按精确基金类别/投资类别映射：`ETF + 股票基金` 为 T+1，`ETF + 债券基金` 或 `ETF + 货币市场基金` 映射为 T+0，其它类别为 unknown。同一 ETF 代码在所需目录一致时，名称完全相同，或短名已含 `ETF` 且长名以短名开头，或长名以短名开头且新增后缀以 `ETF` 开头，视为结构兼容；验证后的内部名称始终使用 spot 名称。其它名称或同代码交易规则冲突仍映射为 unknown。名称只用于交叉验证和展示，禁止按名称或代码前缀猜测证券类型和交易制度；目录冲突、类别缺失或规则未覆盖时禁止默认决策启用。
 
+已验证证券元数据中的非空 `listing_date` 和 `metadata_source` 必须共同转换为结构化 `ListingDateEvidence`，并随版本化 `HistorySnapshot` 保存。少于 250 根但不少于策略最小行数的日 K 有两条独立验证路径：从上市日至 cutoff 的逐交易日窗口连续时标为 `verified_listing_date`；provider 明确完整观测整个请求窗口时标为 `verified_provider_window`，该路径允许停牌等合法情形在个别交易日没有 bar，不要求逐交易日连续。两类证据都没有，或 listing-date 路径存在无法解释的内部缺口且没有 provider 完整窗口证明时，仍为 `unverifiable`；不得据代码、名称或返回行数猜测。
+
 adapter 必须完成第三方字段映射、数值和单位统一、六位股票代码校验、时区和交易日校验，只返回项目内部模型。日历使用 `exchange-calendars` 的 `XSHG`；下一交易日、交易分钟、午休、stale 计算和保留期边界都不得用自然日或简单周一至周五近似。
 
 ### 8.3 前复权日 K

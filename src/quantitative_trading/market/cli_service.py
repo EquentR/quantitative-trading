@@ -28,6 +28,7 @@ from quantitative_trading.market.models import (
     DailyBarCoverageEvidence,
     MarketCaptureResult,
     MarketCaptureRun,
+    listing_date_evidence_from_metadata,
 )
 from quantitative_trading.market.repositories import (
     DailyBarRepository,
@@ -235,6 +236,7 @@ class MarketCliService:
                 )
                 calls = received = written = 0
             else:
+                listing_evidence = listing_date_evidence_from_metadata(metadata)
                 provider_started = perf_counter()
                 result, calls, received, written = self._capture_dataset(
                     run.run_id,
@@ -242,7 +244,12 @@ class MarketCliService:
                     trade_date,
                     CaptureDataset.DAILY_BAR,
                     250,
-                    lambda: backfill.backfill_daily(run.run_id, symbol, trade_date),
+                    lambda: backfill.backfill_daily(
+                        run.run_id,
+                        symbol,
+                        trade_date,
+                        listing_evidence=listing_evidence,
+                    ),
                 )
                 provider_duration_ms += (perf_counter() - provider_started) * 1000
             results.append(result)

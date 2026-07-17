@@ -15,7 +15,7 @@ from pydantic import (
     model_validator,
 )
 
-from quantitative_trading.instrument.models import InstrumentMetadata
+from quantitative_trading.instrument.models import InstrumentMetadata, InstrumentType
 
 
 StrictPositiveId = Annotated[int, Field(strict=True, gt=0)]
@@ -454,6 +454,21 @@ class ListingDateEvidence(BaseModel):
 
     listing_date: date
     source: str = Field(min_length=1)
+
+
+def listing_date_evidence_from_metadata(
+    metadata: InstrumentMetadata | None,
+) -> ListingDateEvidence | None:
+    if (
+        metadata is None
+        or metadata.instrument_type is InstrumentType.UNKNOWN
+        or metadata.listing_date is None
+    ):
+        return None
+    return ListingDateEvidence(
+        listing_date=metadata.listing_date,
+        source=metadata.metadata_source,
+    )
 
 
 class HistorySnapshot(DatasetSnapshotBase):

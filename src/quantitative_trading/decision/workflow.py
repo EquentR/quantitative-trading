@@ -45,6 +45,7 @@ from quantitative_trading.market.models import (
     MarketInputSnapshot,
     QuoteSnapshot,
     QuoteStatus,
+    listing_date_evidence_from_metadata,
 )
 from quantitative_trading.market.providers import MarketDataProvider
 from quantitative_trading.market.repositories import (
@@ -460,7 +461,12 @@ class DecisionWorkflow:
             )
             try:
                 provider_started = perf_counter()
-                history = backfill.backfill_daily(run_id, symbol, trade_date)
+                history = backfill.backfill_daily(
+                    run_id,
+                    symbol,
+                    trade_date,
+                    listing_evidence=listing_date_evidence_from_metadata(metadata),
+                )
             except Exception as exc:
                 self._require_provider_capture_error(exc)
                 if daily_provider_configured:

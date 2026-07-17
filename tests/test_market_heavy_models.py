@@ -252,6 +252,83 @@ def test_verified_history_rejects_missing_or_inconsistent_evidence() -> None:
     assert listed.listing_evidence == listing_evidence
 
 
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        (None, None),
+        (
+            InstrumentMetadata(
+                symbol="600000",
+                name="浦发银行",
+                exchange=Exchange.SH,
+                instrument_type=InstrumentType.A_SHARE,
+                settlement_cycle=SettlementCycle.T1,
+                listing_date=None,
+                metadata_source="directory-without-listing-date",
+                metadata_checked_at=FETCHED_AT,
+                rule_version="instrument-rules-v1",
+            ),
+            None,
+        ),
+        (
+            InstrumentMetadata(
+                symbol="900001",
+                name="unknown",
+                exchange=None,
+                instrument_type=InstrumentType.UNKNOWN,
+                settlement_cycle=SettlementCycle.UNKNOWN,
+                listing_date=None,
+                metadata_source="legacy-unverified",
+                metadata_checked_at=FETCHED_AT,
+                rule_version="unverified-v1",
+            ),
+            None,
+        ),
+        (
+            InstrumentMetadata(
+                symbol="600000",
+                name="浦发银行",
+                exchange=Exchange.SH,
+                instrument_type=InstrumentType.A_SHARE,
+                settlement_cycle=SettlementCycle.T1,
+                listing_date=date(1999, 11, 10),
+                metadata_source="distinctive-a-share-directory",
+                metadata_checked_at=FETCHED_AT,
+                rule_version="instrument-rules-v1",
+            ),
+            market_models.ListingDateEvidence(
+                listing_date=date(1999, 11, 10),
+                source="distinctive-a-share-directory",
+            ),
+        ),
+        (
+            InstrumentMetadata(
+                symbol="510300",
+                name="沪深300ETF",
+                exchange=Exchange.SH,
+                instrument_type=InstrumentType.ETF,
+                settlement_cycle=SettlementCycle.UNKNOWN,
+                listing_date=date(2012, 5, 28),
+                metadata_source="distinctive-etf-directory",
+                metadata_checked_at=FETCHED_AT,
+                rule_version="instrument-rules-v1",
+            ),
+            market_models.ListingDateEvidence(
+                listing_date=date(2012, 5, 28),
+                source="distinctive-etf-directory",
+            ),
+        ),
+    ],
+)
+def test_listing_date_evidence_comes_only_from_verified_metadata(
+    metadata: InstrumentMetadata | None,
+    expected: market_models.ListingDateEvidence | None,
+) -> None:
+    helper = getattr(market_models, "listing_date_evidence_from_metadata")
+
+    assert helper(metadata) == expected
+
+
 def test_intraday_capture_context_is_explicit_and_legacy_defaults_to_decision() -> None:
     lease_expires_at = datetime(2026, 7, 13, 7, 11, tzinfo=UTC)
     display_run = MarketCaptureRun(

@@ -11,7 +11,10 @@ from quantitative_trading.api.app import create_app
 from quantitative_trading.audit.repository import AuditLogRepository
 from quantitative_trading.cash.repository import CashAccountRepository
 from quantitative_trading.config import Settings
-from quantitative_trading.decision.workflow import WorkflowAlreadyRunningError
+from quantitative_trading.decision.workflow import (
+    DecisionWorkflow,
+    WorkflowAlreadyRunningError,
+)
 from quantitative_trading.instrument.models import (
     Exchange,
     InstrumentMetadata,
@@ -21,7 +24,13 @@ from quantitative_trading.instrument.models import (
 from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import PositionRepository
-from quantitative_trading.market.models import CaptureRunStatus
+from quantitative_trading.market.calendar import XSHGTradingCalendar
+from quantitative_trading.market.models import (
+    CaptureRunStatus,
+    DailyBar,
+    DailyMoneyFlow,
+)
+from quantitative_trading.market.repositories import HistorySnapshotRepository
 from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.storage.sqlite import connect
 from quantitative_trading.watchlist.models import WatchPinnedInput, WatchPinnedSource
@@ -360,6 +369,124 @@ def test_backfill_latest_complete_resolves_cutoff_and_validates_scope(
         audit.payload["as_of_mode"] == "latest_complete"
         for audit in rejected_audits
     )
+
+
+def test_backfill_api_persists_verified_listing_evidence(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import quantitative_trading.api.routes.service_workflows as routes
+
+    trade_date = date(2026, 7, 13)
+    calendar = XSHGTradingCalendar()
+    listing_date = calendar.sessions_ending(trade_date, 20)[0]
+
+    class LegacyTwentyDayProvider:
+        def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+            days = calendar.trading_days(start_date, end_date)[-20:]
+            return [
+                DailyBar(
+                    symbol=symbol,
+                    trade_date=day,
+                    open=10,
+                    high=11,
+                    low=9,
+                    close=10.5,
+                    volume=100_000,
+                    amount=1_050_000,
+                    source="api-legacy-daily",
+                    fetched_at=INTRADAY_TIME,
+                )
+                for day in days
+            ]
+
+    class CompleteFlowProvider:
+        def get_daily_money_flow(self, symbol, start_date, end_date):
+            return [
+                DailyMoneyFlow(
+                    symbol=symbol,
+                    trade_date=day,
+                    main_net_amount=1_000_000,
+                    main_net_pct=2,
+                    super_large_net_amount=600_000,
+                    super_large_net_pct=1.2,
+                    large_net_amount=400_000,
+                    large_net_pct=0.8,
+                    medium_net_amount=-300_000,
+                    medium_net_pct=-0.6,
+                    small_net_amount=-700_000,
+                    small_net_pct=-1.4,
+                    source="api-flow",
+                    fetched_at=INTRADAY_TIME,
+                )
+                for day in calendar.trading_days(start_date, end_date)
+            ]
+
+    def factory(connection, settings, *, now):
+        del settings
+        return DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=object(),
+            daily_provider=LegacyTwentyDayProvider(),
+            money_flow_provider=CompleteFlowProvider(),
+            intraday_provider=object(),
+            now=now,
+        )
+
+    install_clock(monkeypatch, INTRADAY_TIME)
+    monkeypatch.setattr(routes, "build_decision_workflow", factory)
+    client, headers, settings = authenticated_client(
+        tmp_path,
+        enable_market_fetch=True,
+    )
+    with connect(settings) as connection:
+        InstrumentRepository(connection).replace_catalog(
+            [
+                InstrumentMetadata(
+                    symbol="600000",
+                    name="浦发银行",
+                    exchange=Exchange.SH,
+                    instrument_type=InstrumentType.A_SHARE,
+                    settlement_cycle=SettlementCycle.T1,
+                    listing_date=listing_date,
+                    metadata_source="distinctive-api-listing-directory",
+                    metadata_checked_at=INTRADAY_TIME,
+                    rule_version="test-rules-v1",
+                )
+            ]
+        )
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol="600000",
+                name="浦发银行",
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=listing_date,
+            ),
+            now=INTRADAY_TIME,
+        )
+
+    response = client.post(
+        "/api/v1/service/workflows/backfill/run",
+        json={"trade_date": trade_date.isoformat(), "symbols": ["600000"]},
+        headers=headers,
+    )
+    with connect(settings) as connection:
+        row = connection.execute(
+            "SELECT id FROM history_snapshots WHERE symbol=? ORDER BY id DESC LIMIT 1",
+            ("600000",),
+        ).fetchone()
+        history = HistorySnapshotRepository(connection).get(int(row["id"]))
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "degraded"
+    assert history is not None
+    assert history.row_count == 20
+    assert history.completeness == "verified_listing_date"
+    assert history.listing_evidence is not None
+    assert history.listing_evidence.source == "distinctive-api-listing-directory"
 
 
 def test_close_workflow_uses_factory_and_returns_unified_result(
