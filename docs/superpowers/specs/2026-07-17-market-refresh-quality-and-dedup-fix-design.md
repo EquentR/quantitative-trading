@@ -88,16 +88,18 @@
 
 上市以来完整且达到策略最小历史窗口时为 degraded/usable；不足最小窗口时 history 不可用于结构判断。响应必须保存完整性证据、实际起止、行数和 warning，不能用 250 根硬性期望将新股伪装成 provider failure。
 
+adapter 边界增加独立的 `DailyBarCoverageEvidence` 能力，保存 requested start/end、provider 实际观测窗口、earliest available date、是否完整观测请求窗口和 source。只有 adapter 对其接口契约确认完整窗口响应时才能设置 complete；核心 service 不根据“返回行数少”猜测上市日期。不实现 coverage evidence 的旧 provider/fake 仍可返回 bars，但不足 250 根时保持 unverifiable，直到获得权威 listing date 或覆盖证据。
+
 ## Backfill 与不可变 History 固化
 
 backfill 采用 local-first：
 
 1. 从版本化 `daily_bars` 查找 symbol、前复权口径和 `history_cutoff_date` 范围。
-2. 校验成员的 symbol、交易日、版本/source/fetched_at、排序、去重、交易日缺口和 content hash。
+2. 校验成员的 symbol、交易日、版本/source/fetched_at、排序、去重、provider 覆盖证据和 content hash。不能要求每个 XSHG 会话都有 bar，因为合法停牌日也没有日 K；完整性由 listing date、已知停牌/复牌事实或 provider 对完整请求窗口的观测证据证明。
 3. intraday 只需要固化引用且本地已有经过 backfill 验证的完整覆盖时，直接固化不可变 `HistorySnapshot` 及 members，不调用 provider。
 4. 人工 `as_of_mode=latest_complete` 第一次命中新的 cutoff/symbol scope 时继续执行现有最近 5 日 correction，以接收历史修订；同一幂等 scope 的后续请求复用已完成 backfill。显式 CLI backfill 和 close workflow 的 correction 语义保持不变。
 5. 存在真实缺口或短历史起点无法证明时，调用对应 A 股或 ETF 日 K adapter，并通过现有 repository 保存版本化事实后重新固化快照。
-6. 每个 snapshot 保留成员版本、source、fetched_at、范围、行数、短历史完整性证据和内容摘要，API 层不得从可变事实临时拼接引用。
+6. 每个 snapshot 保留成员版本、source、fetched_at、范围、行数、短历史完整性证据和内容摘要，API 层不得从可变事实临时拼接引用。策略最小历史窗口使用单一共享常量 `MIN_HISTORY_ROWS=20`，backfill、计划和盘中判定不得各自维护阈值。
 
 盘中 MarketInput 的 history 引用遵循以下优先级：
 
@@ -111,7 +113,13 @@ backfill 采用 local-first：
 
 `display_only` 是 `DecisionWorkflow` 的显式执行模式，不是客户端通用 `force`。服务端根据交易日历和请求的 `outside_session_mode=display_only` 决定实际模式；客户端不能要求在交易时段跳过风控后生成动作，也不能在非交易时段强制进入 decision。
 
-模式必须进入 intraday 的 run ID/幂等键、CaptureRun、MarketInputSnapshot、API 响应和审计。这样 display-only 运行不会错误复用同周期 decision run，也不会被后续决策误认为交易时段输入。
+后台 scheduler 永远发起 decision 模式，不使用 display-only。CLI 现有 force/reason 行为保持不变；新增展示刷新参数必须显式，不能把 force 重新解释为 display-only。
+
+模式必须进入 intraday 的 run ID/幂等键、CaptureRun、MarketInputSnapshot、API 响应和审计。decision 继续使用交易时段三分钟周期；display-only 使用 `mode + effective_trade_date + requested_at 的 Asia/Shanghai 墙钟三分钟 bucket`，避免周末或盘前永久复用旧运行。这样 display-only 不会错误复用同周期 decision run，也不会被后续决策误认为交易时段输入。
+
+CaptureRun 还保存请求 symbol scope 和由后端 10 分钟 intraday lease 计算的 `lease_expires_at`。run detail API 原样暴露这些字段，前端不得硬编码另一个超时。
+
+新增 mode、dates、scope、lease 和 history completeness 字段必须有 SQLite migration、JSON payload 旧行默认和 repository round-trip。旧 CaptureRun 默认为既有工作流语义：intraday 为 decision，其余 mode 为空；缺少 dates/evidence 时保持不可验证而不伪造。服务升级和重启后，run list/detail 仍能读取旧行。
 
 在读取策略、风控或通知之前设置硬门禁。display-only 允许写入：
 
@@ -171,7 +179,7 @@ overall 仍保存完整聚合质量用于展示和审计，但不能作为一个
 
 - quote 不可用：保留 `quote_unavailable` 和“当前行情不可用，暂停价格触发型动作”。即使对象中残留价格，stale/failed 也不可触发。
 - quote 可用、history 不可用：不得使用 `quote_unavailable`；保存独立 `history_unavailable` 原因，关闭依赖日线结构的条件。
-- quote 和成本/数量可用但 history 缺失：持仓成本止损等不依赖历史结构的硬风险仍可执行；买入侧和历史结构触发保持关闭。
+- quote 和台账数量上下文可用但 history 缺失：只允许执行项目规约和当前代码已经定义、且不依赖 history 的硬风险；不得借本修复新增机械成本比例止损。没有现成可执行硬风险，或 `available_quantity=0` 时保持 HOLD，并准确说明 history/计划/可用数量约束。
 - plan 缺失：非持仓不能 `buy/add`；持仓风险管理继续按可用数据执行。
 - intraday 只有 status=complete、组件覆盖率达到规则要求且数据时间未 stale 时才可作为 `buy/add` 的分时确认。provider 失败后由缓存得到的 degraded/stale strength 只用于展示和风险说明，不能满足买入侧多因子门禁；依赖分时强弱的持仓条件也关闭，独立的有效 quote 硬风险不受影响。
 - quote 与 history 都可用：继续现有计划、策略和硬性风控链。
@@ -219,7 +227,9 @@ intraday 请求增加：
 - `reused`。
 - `mode`（intraday stage）。
 
-第一阶段成功、第二阶段失败时保留并显示部分成功。每个阶段的 `409 workflow_in_progress` 都必须携带精确 run ID；coordinator 知道冲突属于哪个 stage，再轮询该 run 的详情。
+第一阶段成功、第二阶段失败时保留并显示部分成功。Stage 1 的业务终态 degraded/failed 不阻止 Stage 2 刷新报价与分时；认证、请求校验、数据库契约或无法获得可信 run 身份的 transport fatal 才停止组合流程。
+
+每个阶段的 `409 workflow_in_progress` 都必须携带精确 run ID。coordinator 轮询终态后校验 run 的 requested symbol scope；若 active backfill 没覆盖本次 scope，只对 missing symbols 有界重提一次，仍不足则显示部分完成而不无限重试。intraday 仍核对本轮统一股票池覆盖。
 
 ## 前端交互与运行跟随
 
@@ -233,16 +243,17 @@ intraday 请求增加：
 
 - 正常同步响应的阶段推进。
 - `409 workflow_in_progress` 转为“已有任务正在运行”，读取 `details.run_id`。
-- 每 2 秒轮询精确 run 详情，短暂 404 继续等待，达到后端租约超时上限后停止并提示“任务仍未结束，请在监控页查看”，不得宣称失败或成功。
+- 每 2 秒轮询精确 run 详情，短暂 404 继续等待；使用 run detail 返回的 `lease_expires_at`/`retry_after` 决定等待上限，达到上限后提示“任务仍未结束，请在监控页查看”，不得宣称失败或成功。
 - 页面卸载或用户取消时终止前端轮询，但不终止后台工作流。
 - terminal succeeded 时显示完成；degraded 时显示部分可用和 warnings；failed 时才显示失败。
+- 将 WorkflowRunResponse 的 `success` 与 run detail 的 `succeeded` 归一为同一成功终态；未知状态保守停止并显示契约错误。
 - 终态后 invalidate market symbols/overview/daily/minute/strength/trace、recommendations、notifications 和 market runs 查询。
 
 非交易时段 display-only 完成提示“行情展示已刷新，本次未生成交易建议”。使用同日缓存时提示“已使用当日缓存，数据部分可用”。不得再把 409、422、degraded 或运行中状态统一映射成“盘中决策工作流运行失败”。
 
 ## 建议当前视图与历史视图
 
-建议 API 增加显式 `view=current|history`，默认 `current`：
+建议 API 增加显式 `view=current|history`。为兼容现有 API/CLI，无 `view` 参数时保持旧 history 数据、旧 Recommendation item 结构和分页语义；显式传 view 时才返回 linked projection。前端建议页显式请求 `current` 作为产品默认视图：
 
 - current 使用 SQL 按 symbol 分组，以 `created_at DESC, rowid DESC` 稳定选择最新建议，`total` 是分组后的标的数。
 - history 返回完整周期历史，保留现有稳定分页，`total` 是建议总数。
@@ -256,7 +267,7 @@ intraday 请求增加：
 }
 ```
 
-`notification` 在尚未投递或历史迁移无法建立 link 时为 null。current 和 history 两种 view 都返回同一 `RecommendationListItem` 结构，分页 total 仍分别使用当前分组数和历史总数。详情和 trace 继续按实际 recommendation ID 返回原始 Recommendation。
+`notification` 在尚未投递或历史迁移无法建立 link 时为 null。显式 current 和 history 两种 view 都返回同一 `RecommendationListItem` 结构，分页 total 仍分别使用当前分组数和历史总数。无 view 的 legacy 响应不包装 DTO；详情和 trace 继续按实际 recommendation ID 返回原始 Recommendation。
 
 前端使用分段控件切换“当前状态 / 历史记录”，从 DTO 的 notification 投影显示处理状态。默认当前状态每个标的只显示一条。不能在前端先分页再分组，也不能为了当前视图删除历史建议。
 
@@ -272,7 +283,7 @@ Asia/Shanghai 交易日
 + recommendation.condition_fingerprint
 ```
 
-去重键移除 run ID 和三分钟周期。dispatcher 直接复用 recommendation 已保存的 canonical `condition_fingerprint`，不得再自行计算一个字段覆盖较少的版本。fingerprint 覆盖触发条件、风险、失效条件、仓位约束和影响裁决的证券制度；排除 data_time、metadata_checked_at 等纯时间元数据，避免无实质变化时制造新通知。
+去重键移除 run ID 和三分钟周期。canonical fingerprint 使用明确的 `fingerprint_version=v2`；新 Recommendation 在创建身份时保存 v2 fingerprint。它覆盖触发条件、风险、失效条件、仓位约束和影响裁决的稳定证券制度字段，排除 data_time、fetched_at、metadata_checked_at 等纯时间元数据。dispatcher 直接复用该版本化字段，不再自行维护另一个算法。
 
 数据库唯一索引继续作为并发兜底，重复 dispatch 不能重置既有通知的 unread/read/feedback 状态。
 
@@ -283,11 +294,15 @@ Asia/Shanghai 交易日
 - 不更新旧 notification 的原始 recommendation ID，不破坏首次通知审计。
 - 反馈使用 link 找到 canonical notification 并更新处理状态；建议列表响应返回本页 recommendation 对应的 notification link/status，前端不再只按 notification 原始 recommendation ID 猜测。
 
-canonical 身份通过独立 `notification_canonical_groups` 映射表表达，至少包含唯一 canonical key、canonical notification ID 和创建时间；API、迁移和查询不得解析 dedup key 字符串来判断 canonical。notification 表的唯一 dedup index 与 canonical key 唯一约束共同兜底并发创建。
+canonical 身份通过独立 `notification_canonical_groups` 映射表表达：`canonical_key` 主键、`notification_id` 非空唯一外键、`created_at`，外键删除策略为 RESTRICT。`recommendation_notification_links` 使用 recommendation ID 主键、notification ID 非空外键和 canonical key 非空外键，均为 RESTRICT，并为 notification ID 建索引。API、迁移和查询不得解析 dedup key 字符串判断 canonical。
 
-通知 API 增加 `GET /notifications?view=current|history`，默认 current。current 列表和未读计数是“canonical recommendation notifications UNION 全部 system_alert”；建议通知通过 canonical mapping 折叠，系统告警沿用自身现有去重语义且不进入建议条件分组。history 返回全部原始建议通知和系统告警。迁移前后均不得让系统告警从默认列表或未读闭环消失。
+创建顺序在一个事务中固定为 notification/audit -> canonical group -> recommendation link。并发唯一冲突时回滚本事务，重新读取已提交 group，再单独幂等写 link；notification dedup index、canonical key 主键和 recommendation link 主键共同收敛并发。
 
-已有重复建议通知不删除。兼容迁移按保存的 recommendation condition fingerprint、上海交易日、symbol、action、plan ID 和 plan version 分组，选择每组最新通知作为 canonical row，写入 canonical mapping，并为相关建议建立 links；其他旧通知保留在 history。迁移必须单事务、可幂等重跑，冲突时由唯一约束收敛；失败时回滚 mapping、dedup key 更新和 links，不能留下半迁移状态。迁移不得改写旧通知的处理状态或审计引用。
+通知 API 增加 `GET /notifications?view=current|history`。为兼容旧调用，无参数默认 history；前端复盘/仪表盘显式请求 current。current 列表和未读计数是“canonical recommendation notifications UNION 全部 system_alert”；行情扫描器的逐标未读数和 CLI unread 也必须调用同一 canonical repository/service 查询。系统告警沿用自身去重语义且不进入建议条件分组。history 返回全部原始建议通知和系统告警。
+
+已有重复建议通知不删除。兼容迁移从保存的 Recommendation payload 重新计算 v2 fingerprint，不改写旧 Recommendation identity。旧 fingerprint 为 NULL/旧版本、包含易变元数据时不能直接作为 canonical；payload 损坏或 recommendation 缺失时保守地让该通知独立成组并记录脱敏 warning，绝不猜测折叠。
+
+同一组存在多种处理状态时按 `feedback_recorded > read > unread` 选择 canonical，同级再选最新，避免已处理事实重新变成未读。迁移写入 canonical mapping 和 recommendation links，其他旧通知保留在 history。迁移必须单事务、可幂等重跑；失败时回滚 mapping、dedup 更新和 links，不能留下半迁移状态，也不得改写旧通知的处理状态或审计引用。
 
 动作、风险、失效条件、仓位约束、证券制度、计划版本或 canonical condition fingerprint 发生实质变化时必须生成新通知；跨上海交易日即使条件相同也生成新通知。
 
