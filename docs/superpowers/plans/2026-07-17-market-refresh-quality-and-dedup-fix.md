@@ -115,15 +115,15 @@
 
 **步骤：**
 
-- [ ] Cycle 4A：RED/GREEN 10:00、午休、盘后未就绪/已就绪、开盘前、周末解析 effective trade date/history cutoff；运行 calendar/API 定向测试。
-- [ ] Cycle 4B：RED/GREEN `as_of_mode=latest_complete` 与 trade_date 互斥，只接受启用股票池子集；首次 scope 做 5 日 correction，同 scope 复用。
-- [ ] Cycle 4C：RED/GREEN adapter 的 `DailyBarCoverageEvidence` protocol/模型/映射；不支持证据的旧 provider 保守 unverifiable，不能从短响应猜 listing date。
-- [ ] Cycle 4D：RED/GREEN 新上市短历史凭权威 listing date 或完整请求窗口 evidence 判定；覆盖合法停牌窗口无 bar，不按每个 XSHG 日强求一根。统一使用 `MIN_HISTORY_ROWS=20` 常量。
-- [ ] Cycle 4E：RED/GREEN 无活动计划时从版本化 facts 固化不可变 history 并挂 MarketInput；活动计划冻结 history 优先，content digest/member version/evidence round-trip。
-- [ ] Cycle 4F：RED/GREEN intraday 或已完成 scope 本地固化不请求 provider；真实缺口才补，CLI/close correction 不回归。
-- [ ] 同步 project/data-source 文档并运行 docs tests。
-- [ ] VERIFY：运行 calendar/backfill/workflow/API 定向测试。
-- [ ] REVIEW：后台 agent 核对未收盘日 K、前复权、content digest、计划冻结引用和幂等陷阱。
+- [x] Cycle 4A：RED/GREEN 10:00、午休、盘后未就绪/已就绪、开盘前、周末解析 effective trade date/history cutoff；运行 calendar/API 定向测试。
+- [x] Cycle 4B：RED/GREEN `as_of_mode=latest_complete` 与 trade_date 互斥，只接受启用股票池子集；首次 scope 做 5 日 correction，同 scope 复用。
+- [x] Cycle 4C：RED/GREEN adapter 的 `DailyBarCoverageEvidence` protocol/模型/映射；不支持证据的旧 provider 保守 unverifiable，不能从短响应猜 listing date。
+- [x] Cycle 4D：RED/GREEN 新上市短历史凭权威 listing date 或完整请求窗口 evidence 判定；覆盖合法停牌窗口无 bar，不按每个 XSHG 日强求一根。统一使用 `MIN_HISTORY_ROWS=20` 常量。
+- [x] Cycle 4E：RED/GREEN 无活动计划时从版本化 facts 固化不可变 history 并挂 MarketInput；活动计划冻结 history 优先，content digest/member version/evidence round-trip。
+- [x] Cycle 4F：RED/GREEN intraday 或已完成 scope 本地固化不请求 provider；真实缺口才补，CLI/close correction 不回归。
+- [x] 同步 project/data-source 文档并运行 docs tests。
+- [x] VERIFY：运行 calendar/backfill/workflow/API 定向测试。
+- [x] REVIEW：后台 agent 核对未收盘日 K、前复权、content digest、计划冻结引用和幂等陷阱。
 
 ## Task 5：分钟缓存异常兜底与 dataset-specific quality
 

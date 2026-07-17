@@ -26,6 +26,7 @@ from quantitative_trading.market.repositories import (
     MoneyFlowRepository,
     MoneyFlowSnapshotRepository,
     IntradayStrengthSnapshotRepository,
+    content_digest,
 )
 from quantitative_trading.market.retention import MinuteBarRetentionService
 from quantitative_trading.market.schema import MARKET_DECISION_SCHEMA_SQL
@@ -147,6 +148,74 @@ class CoverageShortDailyProvider(ShortDailyProvider):
         )
 
 
+class FixedStartCoverageDailyProvider(RecordingDailyProvider):
+    def __init__(
+        self,
+        calendar: XSHGTradingCalendar,
+        *,
+        listing_date: date,
+        omitted_date: date,
+    ) -> None:
+        super().__init__(calendar)
+        self.listing_date = listing_date
+        self.omitted_date = omitted_date
+        self.coverage_calls = []
+        self.revisions: dict[date, float] = {}
+        self.evidence_source = "fixed_start_full_window"
+        self.incomplete_ranges: set[tuple[date, date]] = set()
+
+    def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+        bars = [
+            bar
+            for bar in super().get_daily_bars(
+                symbol,
+                start_date,
+                end_date,
+                adjustment,
+            )
+            if bar.trade_date >= self.listing_date
+            and bar.trade_date != self.omitted_date
+        ]
+        return [
+            bar.model_copy(
+                update={
+                    "high": max(bar.high, self.revisions[bar.trade_date]),
+                    "close": self.revisions[bar.trade_date],
+                    "amount": bar.volume * self.revisions[bar.trade_date],
+                }
+            )
+            if bar.trade_date in self.revisions
+            else bar
+            for bar in bars
+        ]
+
+    def get_daily_bars_with_coverage(
+        self,
+        symbol,
+        start_date,
+        end_date,
+        adjustment,
+    ) -> DailyBarFetchResult:
+        self.coverage_calls.append((symbol, start_date, end_date, adjustment))
+        bars = tuple(self.get_daily_bars(symbol, start_date, end_date, adjustment))
+        complete_request_window = (
+            start_date,
+            end_date,
+        ) not in self.incomplete_ranges
+        return DailyBarFetchResult(
+            bars=bars,
+            coverage_evidence=DailyBarCoverageEvidence(
+                requested_start=start_date,
+                requested_end=end_date,
+                observed_start=start_date,
+                observed_end=end_date,
+                earliest_available_date=bars[0].trade_date,
+                complete_request_window=complete_request_window,
+                source=self.evidence_source,
+            ),
+        )
+
+
 def make_service(connection, *, daily_provider=None):
     calendar = XSHGTradingCalendar()
     daily_provider = daily_provider or RecordingDailyProvider(calendar)
@@ -202,6 +271,260 @@ def test_provider_window_evidence_verifies_short_history_with_session_gap(
     assert covered.snapshot.coverage_evidence.complete_request_window is True
     assert covered.snapshot.row_count == 20
     assert covered.snapshot.is_usable(as_of=as_of, expected_rows=250)
+
+
+def test_verified_provider_snapshot_reuses_exact_frozen_history_after_unchanged_correction(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    provider = CoverageShortDailyProvider(
+        calendar,
+        window_rows=21,
+        omitted_index=10,
+    )
+    service, _, _, _ = make_service(connection, daily_provider=provider)
+    repository = HistorySnapshotRepository(connection)
+    first = service.backfill_daily("run-covered-first", "600000", as_of)
+    first_members = repository.members(first.snapshot_id)
+    assert first.snapshot.completeness == "verified_provider_window"
+    assert first.snapshot.is_usable(as_of=as_of, expected_rows=250)
+    snapshot_count = connection.execute(
+        "SELECT COUNT(*) FROM history_snapshots"
+    ).fetchone()[0]
+    provider.calls.clear()
+    provider.coverage_calls.clear()
+
+    second = service.backfill_daily("run-covered-second", "600000", as_of)
+
+    last_five = calendar.sessions_ending(as_of, 5)
+    assert provider.coverage_calls == [
+        ("600000", last_five[0], last_five[-1], "forward")
+    ]
+    assert second.snapshot_id == first.snapshot_id
+    assert second.snapshot == first.snapshot
+    assert repository.members(second.snapshot_id) == first_members
+    assert second.snapshot.content_digest == first.snapshot.content_digest
+    assert second.snapshot.coverage_evidence == first.snapshot.coverage_evidence
+    assert second.provider_calls == 1
+    assert second.rows_received == 5
+    assert second.rows_written == 0
+    assert connection.execute("SELECT COUNT(*) FROM history_snapshots").fetchone()[0] == (
+        snapshot_count
+    )
+
+
+def test_verified_provider_snapshot_requests_new_full_window_for_next_cutoff(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    next_cutoff = calendar.next_trading_day(as_of)
+    listing_window = calendar.sessions_ending(as_of, 21)
+    provider = FixedStartCoverageDailyProvider(
+        calendar,
+        listing_date=listing_window[0],
+        omitted_date=listing_window[10],
+    )
+    service, _, _, _ = make_service(connection, daily_provider=provider)
+    repository = HistorySnapshotRepository(connection)
+    first = service.backfill_daily("run-covered-first", "600000", as_of)
+    first_snapshot = first.snapshot
+    first_members = repository.members(first.snapshot_id)
+    snapshot_count = connection.execute(
+        "SELECT COUNT(*) FROM history_snapshots"
+    ).fetchone()[0]
+    assert first_snapshot.completeness == "verified_provider_window"
+    assert first_snapshot.is_usable(as_of=as_of, expected_rows=250)
+    provider.calls.clear()
+    provider.coverage_calls.clear()
+
+    second = service.backfill_daily("run-covered-next", "600000", next_cutoff)
+
+    assert provider.coverage_calls == [
+        (
+            "600000",
+            calendar.sessions_ending(next_cutoff, 250)[0],
+            next_cutoff,
+            "forward",
+        )
+    ]
+    assert second.snapshot_id != first.snapshot_id
+    assert second.provider_calls == 1
+    assert second.rows_received == 21
+    assert second.rows_written == 1
+    assert second.snapshot.coverage_evidence is not None
+    assert second.snapshot.coverage_evidence.requested_end == next_cutoff
+    assert second.snapshot.is_usable(as_of=next_cutoff, expected_rows=250)
+    assert connection.execute("SELECT COUNT(*) FROM history_snapshots").fetchone()[0] == (
+        snapshot_count + 1
+    )
+    assert repository.get(first.snapshot_id) == first_snapshot
+    assert repository.members(first.snapshot_id) == first_members
+    assert repository.get(first.snapshot_id).content_digest == first_snapshot.content_digest
+    assert repository.get(first.snapshot_id).coverage_evidence == (
+        first_snapshot.coverage_evidence
+    )
+    second_members = repository.members(second.snapshot_id)
+    expected_dates = [
+        day
+        for day in calendar.trading_days(provider.listing_date, next_cutoff)
+        if day != provider.omitted_date
+    ]
+    assert [member.bar.trade_date for member in second_members] == expected_dates
+    assert second.snapshot.content_digest == content_digest(
+        [member.bar.content_hash for member in second_members]
+    )
+
+
+def test_verified_provider_snapshot_rechecks_full_window_after_correction_change(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    desired = calendar.sessions_ending(as_of, 250)
+    provider = FixedStartCoverageDailyProvider(
+        calendar,
+        listing_date=desired[0],
+        omitted_date=date(1990, 1, 1),
+    )
+    service, _, _, _ = make_service(connection, daily_provider=provider)
+    repository = HistorySnapshotRepository(connection)
+    first = service.backfill_daily("run-covered-v1", "600000", as_of)
+    first_snapshot = first.snapshot
+    first_members = repository.members(first.snapshot_id)
+    snapshot_count = connection.execute(
+        "SELECT COUNT(*) FROM history_snapshots"
+    ).fetchone()[0]
+    assert first_snapshot.completeness == "verified_provider_window"
+    assert first_snapshot.is_usable(as_of=as_of, expected_rows=250)
+    provider.calls.clear()
+    provider.coverage_calls.clear()
+    provider.revisions[as_of] = 12.0
+    provider.evidence_source = "fixed_start_full_window_v2"
+
+    second = service.backfill_daily("run-covered-v2", "600000", as_of)
+
+    last_five = desired[-5:]
+    assert provider.coverage_calls == [
+        ("600000", last_five[0], last_five[-1], "forward"),
+        ("600000", desired[0], desired[-1], "forward"),
+    ]
+    assert second.snapshot_id != first.snapshot_id
+    assert second.provider_calls == 2
+    assert second.rows_received == 255
+    assert second.rows_written == 1
+    assert second.snapshot.completeness == "verified_provider_window"
+    assert second.snapshot.coverage_evidence is not None
+    assert second.snapshot.coverage_evidence.source == "fixed_start_full_window_v2"
+    assert repository.members(second.snapshot_id)[-1].bar.close == 12.0
+    assert connection.execute("SELECT COUNT(*) FROM history_snapshots").fetchone()[0] == (
+        snapshot_count + 1
+    )
+    assert repository.get(first.snapshot_id) == first_snapshot
+    assert repository.members(first.snapshot_id) == first_members
+
+
+def test_verified_provider_snapshot_excludes_bar_removed_by_complete_window(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    desired = calendar.sessions_ending(as_of, 250)
+    provider = FixedStartCoverageDailyProvider(
+        calendar,
+        listing_date=desired[0],
+        omitted_date=date(1990, 1, 1),
+    )
+    service, _, _, _ = make_service(connection, daily_provider=provider)
+    repository = HistorySnapshotRepository(connection)
+    first = service.backfill_daily("run-covered-present", "600000", as_of)
+    first_snapshot = first.snapshot
+    first_members = repository.members(first.snapshot_id)
+    snapshot_count = connection.execute(
+        "SELECT COUNT(*) FROM history_snapshots"
+    ).fetchone()[0]
+    assert first_snapshot.completeness == "verified_provider_window"
+    assert first_snapshot.row_count == 250
+    assert first_snapshot.is_usable(as_of=as_of, expected_rows=250)
+    provider.calls.clear()
+    provider.coverage_calls.clear()
+    provider.omitted_date = as_of
+    provider.evidence_source = "fixed_start_removed_cutoff_v2"
+
+    second = service.backfill_daily("run-covered-removed", "600000", as_of)
+
+    last_five = desired[-5:]
+    assert provider.coverage_calls == [
+        ("600000", last_five[0], last_five[-1], "forward"),
+        ("600000", desired[0], desired[-1], "forward"),
+    ]
+    assert second.snapshot_id != first.snapshot_id
+    assert second.provider_calls == 2
+    assert second.rows_received == 253
+    assert second.rows_written == 0
+    assert second.snapshot.completeness == "verified_provider_window"
+    assert second.snapshot.row_count == 249
+    assert second.snapshot.data_end == calendar.previous_trading_day(as_of)
+    assert second.snapshot.coverage_evidence is not None
+    assert second.snapshot.coverage_evidence.source == "fixed_start_removed_cutoff_v2"
+    assert second.snapshot.is_usable(as_of=as_of, expected_rows=250)
+    second_members = repository.members(second.snapshot_id)
+    assert [member.bar.trade_date for member in second_members] == desired[:-1]
+    assert second.snapshot.content_digest == content_digest(
+        [member.bar.content_hash for member in second_members]
+    )
+    assert connection.execute("SELECT COUNT(*) FROM history_snapshots").fetchone()[0] == (
+        snapshot_count + 1
+    )
+    assert repository.get(first.snapshot_id) == first_snapshot
+    assert repository.members(first.snapshot_id) == first_members
+
+
+def test_verified_provider_snapshot_does_not_reuse_incomplete_correction_observation(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    as_of = date(2026, 7, 13)
+    desired = calendar.sessions_ending(as_of, 250)
+    provider = FixedStartCoverageDailyProvider(
+        calendar,
+        listing_date=desired[0],
+        omitted_date=date(1990, 1, 1),
+    )
+    service, _, _, _ = make_service(connection, daily_provider=provider)
+    repository = HistorySnapshotRepository(connection)
+    first = service.backfill_daily("run-covered-complete", "600000", as_of)
+    first_snapshot = first.snapshot
+    first_members = repository.members(first.snapshot_id)
+    snapshot_count = connection.execute(
+        "SELECT COUNT(*) FROM history_snapshots"
+    ).fetchone()[0]
+    last_five = desired[-5:]
+    provider.calls.clear()
+    provider.coverage_calls.clear()
+    provider.incomplete_ranges.add((last_five[0], last_five[-1]))
+    provider.evidence_source = "fixed_start_reproof_v2"
+
+    second = service.backfill_daily("run-covered-reproof", "600000", as_of)
+
+    assert provider.coverage_calls == [
+        ("600000", last_five[0], last_five[-1], "forward"),
+        ("600000", desired[0], desired[-1], "forward"),
+    ]
+    assert second.snapshot_id != first.snapshot_id
+    assert second.provider_calls == 2
+    assert second.rows_received == 255
+    assert second.rows_written == 0
+    assert second.snapshot.completeness == "verified_provider_window"
+    assert second.snapshot.coverage_evidence is not None
+    assert second.snapshot.coverage_evidence.complete_request_window is True
+    assert second.snapshot.coverage_evidence.source == "fixed_start_reproof_v2"
+    assert connection.execute("SELECT COUNT(*) FROM history_snapshots").fetchone()[0] == (
+        snapshot_count + 1
+    )
+    assert repository.get(first.snapshot_id) == first_snapshot
+    assert repository.members(first.snapshot_id) == first_members
 
 
 def test_provider_window_evidence_allows_no_bar_on_cutoff_session(connection) -> None:

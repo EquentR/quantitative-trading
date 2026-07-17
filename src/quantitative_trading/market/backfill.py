@@ -8,6 +8,8 @@ from typing import Generic, TypeVar
 from quantitative_trading.market.adapters import (
     DailyBarCoverageProvider,
     DailyBarProvider,
+    DailyBarProviderRouter,
+    MarketProviderError,
     MoneyFlowProvider,
 )
 from quantitative_trading.market.calendar import XSHGTradingCalendar
@@ -79,6 +81,21 @@ class CreatedDatasetSnapshot(Generic[SnapshotT]):
     @property
     def row_count(self) -> int:
         return self.snapshot.row_count
+
+
+class BackfillProviderCaptureError(MarketProviderError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        provider_calls: int,
+        rows_received: int,
+        rows_written: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.provider_calls = provider_calls
+        self.rows_received = rows_received
+        self.rows_written = rows_written
 
 
 @dataclass(frozen=True)
@@ -217,22 +234,93 @@ class HeavyDataBackfillService:
                 desired,
             )
         }
+        daily_provider = self._daily_provider_for(symbol)
+        provider_calls = 0
+        rows_received = 0
+        force_full_coverage = False
+        prior = self.history_snapshot_repository.latest_usable_for_symbol(
+            symbol,
+            as_of=as_of,
+            expected_rows=self.DAILY_WINDOW,
+        )
+        if (
+            prior is not None
+            and prior.snapshot.completeness
+            is HistoryCompleteness.VERIFIED_PROVIDER_WINDOW
+            and isinstance(daily_provider, DailyBarCoverageProvider)
+        ):
+            correction_start = desired[-self.CORRECTION_WINDOW]
+            provider_calls += 1
+            try:
+                correction_result = daily_provider.get_daily_bars_with_coverage(
+                    symbol,
+                    correction_start,
+                    desired[-1],
+                    "forward",
+                )
+            except MarketProviderError as exc:
+                raise BackfillProviderCaptureError(
+                    str(exc),
+                    provider_calls=provider_calls,
+                    rows_received=rows_received,
+                ) from exc
+            correction_bars = list(correction_result.bars)
+            self._validate_daily_fetch(
+                symbol,
+                correction_start,
+                desired[-1],
+                correction_bars,
+                correction_result.coverage_evidence,
+            )
+            rows_received += len(correction_bars)
+            prior_correction = {
+                member.bar.trade_date: member.bar.content_hash
+                for member in self.history_snapshot_repository.members(
+                    prior.snapshot_id
+                )
+                if member.bar.trade_date >= correction_start
+            }
+            returned_correction = {
+                bar.trade_date: bar.content_hash for bar in correction_bars
+            }
+            correction_changed = returned_correction != prior_correction
+            if (
+                correction_result.coverage_evidence.complete_request_window
+                and not correction_changed
+            ):
+                return CreatedDatasetSnapshot(
+                    prior.snapshot_id,
+                    prior.snapshot,
+                    provider_calls=provider_calls,
+                    rows_received=rows_received,
+                    rows_written=0,
+                )
+            force_full_coverage = True
+
         ranges = (
             [(desired[0], desired[-1])]
-            if isinstance(self.daily_provider, DailyBarCoverageProvider)
-            and len(existing) < len(desired)
+            if isinstance(daily_provider, DailyBarCoverageProvider)
+            and (force_full_coverage or len(existing) < len(desired))
             else self._fetch_ranges(desired, set(existing))
         )
         fetched: list[DailyBar] = []
         coverage_evidence: DailyBarCoverageEvidence | None = None
         for start, end in ranges:
-            if isinstance(self.daily_provider, DailyBarCoverageProvider):
-                result = self.daily_provider.get_daily_bars_with_coverage(
-                    symbol,
-                    start,
-                    end,
-                    "forward",
-                )
+            provider_calls += 1
+            if isinstance(daily_provider, DailyBarCoverageProvider):
+                try:
+                    result = daily_provider.get_daily_bars_with_coverage(
+                        symbol,
+                        start,
+                        end,
+                        "forward",
+                    )
+                except MarketProviderError as exc:
+                    raise BackfillProviderCaptureError(
+                        str(exc),
+                        provider_calls=provider_calls,
+                        rows_received=rows_received,
+                    ) from exc
                 bars = list(result.bars)
                 self._validate_daily_fetch(
                     symbol,
@@ -244,19 +332,28 @@ class HeavyDataBackfillService:
                 if start == desired[0] and end == desired[-1]:
                     coverage_evidence = result.coverage_evidence
             else:
-                bars = list(
-                    self.daily_provider.get_daily_bars(
-                        symbol,
-                        start,
-                        end,
-                        "forward",
+                try:
+                    bars = list(
+                        daily_provider.get_daily_bars(
+                            symbol,
+                            start,
+                            end,
+                            "forward",
+                        )
                     )
-                )
+                except MarketProviderError as exc:
+                    raise BackfillProviderCaptureError(
+                        str(exc),
+                        provider_calls=provider_calls,
+                        rows_received=rows_received,
+                    ) from exc
             fetched.extend(bars)
+            rows_received += len(bars)
         connection = self.daily_repository.connection
         connection.execute("SAVEPOINT daily_backfill_dataset")
         try:
             rows_written = 0
+            authoritative_member_ids: dict[date, int] = {}
             for bar in fetched:
                 if bar.trade_date in desired:
                     known = connection.execute(
@@ -270,13 +367,33 @@ class HeavyDataBackfillService:
                             bar.content_hash,
                         ),
                     ).fetchone()
-                    self.daily_repository.save(bar, commit=False)
+                    member_id = self.daily_repository.save(bar, commit=False)
                     rows_written += int(known is None)
-            current = _current_daily_window(
-                self.daily_repository,
-                symbol,
-                desired,
-            )
+                    if (
+                        coverage_evidence is not None
+                        and coverage_evidence.complete_request_window
+                    ):
+                        authoritative_member_ids[bar.trade_date] = member_id
+            if (
+                coverage_evidence is not None
+                and coverage_evidence.complete_request_window
+            ):
+                current = [
+                    stored
+                    for trade_day in sorted(authoritative_member_ids)
+                    if (
+                        stored := self.daily_repository.get(
+                            authoritative_member_ids[trade_day]
+                        )
+                    )
+                    is not None
+                ]
+            else:
+                current = _current_daily_window(
+                    self.daily_repository,
+                    symbol,
+                    desired,
+                )
             fetched_at = self._fetched_at()
             complete = len(current) == len(desired)
             completeness = HistoryCompleteness.UNVERIFIABLE
@@ -333,10 +450,15 @@ class HeavyDataBackfillService:
         return CreatedDatasetSnapshot(
             snapshot_id,
             snapshot,
-            provider_calls=len(ranges),
-            rows_received=len(fetched),
+            provider_calls=provider_calls,
+            rows_received=rows_received,
             rows_written=rows_written,
         )
+
+    def _daily_provider_for(self, symbol: str) -> DailyBarProvider:
+        if isinstance(self.daily_provider, DailyBarProviderRouter):
+            return self.daily_provider.daily_bar_provider_for(symbol)
+        return self.daily_provider
 
     @staticmethod
     def _validate_daily_fetch(
@@ -355,6 +477,9 @@ class HeavyDataBackfillService:
             for bar in bars
         ):
             raise ValueError("daily provider returned bars outside requested scope")
+        dates = [bar.trade_date for bar in bars]
+        if dates != sorted(dates) or len(dates) != len(set(dates)):
+            raise ValueError("daily provider returned duplicate or unordered bars")
         earliest = None if not bars else min(bar.trade_date for bar in bars)
         if evidence.complete_request_window and evidence.earliest_available_date != earliest:
             raise ValueError("daily coverage earliest date does not match returned bars")

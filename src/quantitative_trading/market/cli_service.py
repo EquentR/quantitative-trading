@@ -12,20 +12,20 @@ from quantitative_trading.instrument.models import InstrumentMetadata, Instrumen
 from quantitative_trading.instrument.repository import InstrumentRepository
 from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.market.adapters import (
-    DailyBarCoverageProvider,
-    DailyBarFetchResult,
     DailyBarProvider,
     MarketProviderError,
     MoneyFlowProvider,
 )
-from quantitative_trading.market.backfill import HeavyDataBackfillService
+from quantitative_trading.market.backfill import (
+    BackfillProviderCaptureError,
+    HeavyDataBackfillService,
+)
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
     CaptureDataset,
     CaptureResultStatus,
     CaptureRunAlreadyActiveError,
     CaptureRunStatus,
-    DailyBarCoverageEvidence,
     MarketCaptureResult,
     MarketCaptureRun,
     listing_date_evidence_from_metadata,
@@ -524,6 +524,12 @@ class MarketCliService:
             if not isinstance(exc, MarketProviderError):
                 raise
             summary = safe_error_summary(exc)
+            calls = 1
+            received = written = 0
+            if isinstance(exc, BackfillProviderCaptureError):
+                calls = exc.provider_calls
+                received = exc.rows_received
+                written = exc.rows_written
             return (
                 MarketCaptureResult(
                     run_id=run_id,
@@ -537,9 +543,9 @@ class MarketCliService:
                     warning=summary,
                     error_summary=summary,
                 ),
-                1,
-                0,
-                0,
+                calls,
+                received,
+                written,
             )
 
     def _policy_result(
@@ -628,37 +634,8 @@ class _RoutedDailyProvider:
         provider = self._provider(symbol)
         return provider.get_daily_bars(symbol, start_date, end_date, adjustment)
 
-    def get_daily_bars_with_coverage(
-        self,
-        symbol,
-        start_date,
-        end_date,
-        adjustment,
-    ) -> DailyBarFetchResult:
-        provider = self._provider(symbol)
-        if isinstance(provider, DailyBarCoverageProvider):
-            return provider.get_daily_bars_with_coverage(
-                symbol,
-                start_date,
-                end_date,
-                adjustment,
-            )
-        bars = tuple(
-            provider.get_daily_bars(symbol, start_date, end_date, adjustment)
-        )
-        dates = [bar.trade_date for bar in bars]
-        return DailyBarFetchResult(
-            bars=bars,
-            coverage_evidence=DailyBarCoverageEvidence(
-                requested_start=start_date,
-                requested_end=end_date,
-                observed_start=None if not dates else min(dates),
-                observed_end=None if not dates else max(dates),
-                earliest_available_date=None if not dates else min(dates),
-                complete_request_window=False,
-                source="legacy_daily_provider_unverified",
-            ),
-        )
+    def daily_bar_provider_for(self, symbol: str) -> DailyBarProvider:
+        return self._provider(symbol)
 
     def _provider(self, symbol: str) -> DailyBarProvider:
         instrument = self.metadata.get(symbol)

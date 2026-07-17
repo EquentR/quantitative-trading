@@ -45,6 +45,7 @@ from quantitative_trading.market.repositories import (
     HistorySnapshotRepository,
     MarketCaptureRunRepository,
     MoneyFlowRepository,
+    MoneyFlowSnapshotRepository,
     IntradayStrengthSnapshotRepository,
     MarketCaptureResultRepository,
     MinuteBarRepository,
@@ -123,6 +124,54 @@ class CalendarDailyProvider:
             )
             for index, day in enumerate(days)
         ]
+
+
+class FailingFullReproofDailyProvider(CalendarDailyProvider):
+    def __init__(self, calendar: XSHGTradingCalendar) -> None:
+        super().__init__(calendar)
+        self.coverage_calls = []
+        self.revision_date: date | None = None
+        self.fail_full_reproof = False
+
+    def get_daily_bars(self, symbol, start_date, end_date, adjustment):
+        bars = super().get_daily_bars(symbol, start_date, end_date, adjustment)
+        return [
+            bar.model_copy(
+                update={
+                    "high": max(bar.high, 12.0),
+                    "close": 12.0,
+                    "amount": bar.volume * 12.0,
+                }
+            )
+            if bar.trade_date == self.revision_date
+            else bar
+            for bar in bars
+        ]
+
+    def get_daily_bars_with_coverage(
+        self,
+        symbol,
+        start_date,
+        end_date,
+        adjustment,
+    ) -> DailyBarFetchResult:
+        self.coverage_calls.append((symbol, start_date, end_date, adjustment))
+        requested_days = self.calendar.trading_days(start_date, end_date)
+        if self.fail_full_reproof and len(requested_days) > 5:
+            raise MarketProviderError("synthetic full-window reproof outage")
+        bars = tuple(self.get_daily_bars(symbol, start_date, end_date, adjustment))
+        return DailyBarFetchResult(
+            bars=bars,
+            coverage_evidence=DailyBarCoverageEvidence(
+                requested_start=start_date,
+                requested_end=end_date,
+                observed_start=start_date,
+                observed_end=end_date,
+                earliest_available_date=bars[0].trade_date,
+                complete_request_window=True,
+                source="failing_full_reproof_provider",
+            ),
+        )
 
 
 class CalendarFlowProvider:
@@ -1300,6 +1349,56 @@ def test_decision_workflow_exposes_idempotent_backfill_and_cleanup(tmp_path) -> 
     assert cleanup_again.reused is True
 
 
+def test_backfill_reuses_completed_non_empty_cutoff_scope_without_provider_calls(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "backfill-scope-reuse.db")
+    calendar = XSHGTradingCalendar()
+    daily_provider = CalendarDailyProvider(calendar)
+    flow_provider = CalendarFlowProvider(calendar)
+    metadata = InstrumentMetadata(
+        symbol="600000",
+        name="浦发银行",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="test-directory",
+        metadata_checked_at=NOW,
+        rule_version="test-rules-v1",
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        InstrumentRepository(connection).replace_catalog([metadata])
+        seed_account(connection)
+        workflow = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=RecordingQuoteProvider(),
+            daily_provider=daily_provider,
+            money_flow_provider=flow_provider,
+            intraday_provider=NoopIntradayProvider(),
+            now=lambda: NOW,
+        )
+
+        first = workflow.run_backfill(TRADE_DATE, symbols=[metadata.symbol])
+        daily_calls = list(daily_provider.calls)
+        flow_calls = list(flow_provider.calls)
+        second = workflow.run_backfill(TRADE_DATE, symbols=[metadata.symbol])
+        persisted = MarketCaptureRunRepository(connection).get(first.run_id)
+
+    assert first.reused is False
+    assert second.reused is True
+    assert second.run_id == first.run_id
+    assert second.results == first.results
+    assert daily_provider.calls == daily_calls
+    assert flow_provider.calls == flow_calls
+    assert persisted is not None
+    assert persisted.provider_calls == first.provider_calls == second.provider_calls == 2
+    assert persisted.rows_received == first.rows_received == second.rows_received
+    assert persisted.rows_written == first.rows_written == second.rows_written
+
+
 def test_backfill_routes_etf_daily_marks_flow_not_applicable_and_skips_unknown(
     tmp_path,
 ) -> None:
@@ -1382,6 +1481,200 @@ def test_backfill_routes_etf_daily_marks_flow_not_applicable_and_skips_unknown(
     assert by_symbol_dataset[("900001", CaptureDataset.MONEY_FLOW)].status is CaptureResultStatus.FAILED
 
 
+@pytest.mark.parametrize("entrypoint", ["cli", "close"])
+def test_legacy_daily_provider_routes_only_real_gap_and_correction_ranges(
+    tmp_path,
+    entrypoint,
+) -> None:
+    settings = Settings(database_path=tmp_path / f"legacy-gap-{entrypoint}.db")
+    calendar = XSHGTradingCalendar()
+    daily_provider = CalendarDailyProvider(calendar)
+    flow_provider = CalendarFlowProvider(calendar)
+    desired = calendar.sessions_ending(TRADE_DATE, 250)
+    old_gap = desired[20]
+    last_five = desired[-5:]
+    metadata = InstrumentMetadata(
+        symbol="600000",
+        name="浦发银行",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="test-directory",
+        metadata_checked_at=NOW,
+        rule_version="test-rules-v1",
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        instrument_repository = InstrumentRepository(connection)
+        instrument_repository.replace_catalog([metadata])
+        seed_account(connection)
+        for bar in daily_provider.get_daily_bars(
+            metadata.symbol,
+            desired[0],
+            desired[-1],
+            "forward",
+        ):
+            if bar.trade_date != old_gap:
+                DailyBarRepository(connection).save(bar)
+        daily_provider.calls.clear()
+
+        if entrypoint == "cli":
+            summary = MarketCliService(
+                connection,
+                calendar=calendar,
+                daily_provider=daily_provider,
+                money_flow_provider=flow_provider,
+                now=lambda: NOW,
+            ).backfill(TRADE_DATE)
+            provider_calls = summary.provider_calls
+        else:
+            loader = lambda symbols: {
+                symbol: loaded
+                for symbol in symbols
+                if (loaded := instrument_repository.get(symbol)) is not None
+            }
+            result = DecisionWorkflow(
+                connection,
+                calendar=calendar,
+                quote_provider=RecordingQuoteProvider(),
+                daily_provider=daily_provider,
+                money_flow_provider=flow_provider,
+                intraday_provider=NoopIntradayProvider(),
+                instrument_metadata_loader=loader,
+                now=lambda: NOW,
+            ).run_close(TRADE_DATE)
+            run = MarketCaptureRunRepository(connection).get(result.run_id)
+            assert run is not None
+            provider_calls = run.provider_calls
+
+    assert daily_provider.calls == [
+        (metadata.symbol, old_gap, old_gap, "forward"),
+        (metadata.symbol, last_five[0], last_five[-1], "forward"),
+    ]
+    assert provider_calls == (3 if entrypoint == "cli" else 4)
+
+
+@pytest.mark.parametrize("entrypoint", ["cli", "close"])
+def test_reproof_failure_preserves_partial_provider_metrics_and_frozen_history(
+    tmp_path,
+    entrypoint,
+) -> None:
+    settings = Settings(database_path=tmp_path / f"reproof-failure-{entrypoint}.db")
+    calendar = XSHGTradingCalendar()
+    provider = FailingFullReproofDailyProvider(calendar)
+    metadata = InstrumentMetadata(
+        symbol="510300",
+        name="沪深300ETF",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.ETF,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="test-directory",
+        metadata_checked_at=NOW,
+        rule_version="test-rules-v1",
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        instrument_repository = InstrumentRepository(connection)
+        instrument_repository.replace_catalog([metadata])
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol=metadata.symbol,
+                name=metadata.name,
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=date(2026, 7, 1),
+            ),
+            now=NOW,
+        )
+        CashAccountRepository(connection).initialize(50_000, now=NOW, note="initial")
+        history_repository = HistorySnapshotRepository(connection)
+        first = HeavyDataBackfillService(
+            calendar=calendar,
+            daily_provider=provider,
+            money_flow_provider=UnexpectedProvider(),
+            daily_repository=DailyBarRepository(connection),
+            money_flow_repository=MoneyFlowRepository(connection),
+            history_snapshot_repository=history_repository,
+            money_flow_snapshot_repository=MoneyFlowSnapshotRepository(connection),
+            now=lambda: NOW,
+        ).backfill_daily("seed-provider-window", metadata.symbol, TRADE_DATE)
+        first_snapshot = first.snapshot
+        first_members = history_repository.members(first.snapshot_id)
+        fact_count = connection.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
+        snapshot_count = connection.execute(
+            "SELECT COUNT(*) FROM history_snapshots"
+        ).fetchone()[0]
+        provider.calls.clear()
+        provider.coverage_calls.clear()
+        provider.revision_date = TRADE_DATE
+        provider.fail_full_reproof = True
+
+        if entrypoint == "cli":
+            summary = MarketCliService(
+                connection,
+                calendar=calendar,
+                daily_provider=UnexpectedProvider(),
+                etf_daily_provider=provider,
+                money_flow_provider=UnexpectedProvider(),
+                now=lambda: NOW,
+            ).backfill(TRADE_DATE, symbols=[metadata.symbol])
+            run = MarketCaptureRunRepository(connection).get(summary.run_id)
+            provider_calls = summary.provider_calls
+            rows_received = summary.rows_received
+            rows_written = summary.rows_written
+        else:
+            loader = lambda symbols: {
+                symbol: loaded
+                for symbol in symbols
+                if (loaded := instrument_repository.get(symbol)) is not None
+            }
+            result = DecisionWorkflow(
+                connection,
+                calendar=calendar,
+                quote_provider=UnexpectedProvider(),
+                etf_quote_provider=RecordingQuoteProvider(),
+                daily_provider=UnexpectedProvider(),
+                etf_daily_provider=provider,
+                money_flow_provider=UnexpectedProvider(),
+                intraday_provider=NoopIntradayProvider(),
+                instrument_metadata_loader=loader,
+                now=lambda: NOW,
+            ).run_close(TRADE_DATE)
+            run = MarketCaptureRunRepository(connection).get(result.run_id)
+            assert run is not None
+            provider_calls = run.provider_calls
+            rows_received = run.rows_received
+            rows_written = run.rows_written
+
+        final_fact_count = connection.execute(
+            "SELECT COUNT(*) FROM daily_bars"
+        ).fetchone()[0]
+        final_snapshot_count = connection.execute(
+            "SELECT COUNT(*) FROM history_snapshots"
+        ).fetchone()[0]
+        final_snapshot = history_repository.get(first.snapshot_id)
+        final_members = history_repository.members(first.snapshot_id)
+
+    desired = calendar.sessions_ending(TRADE_DATE, 250)
+    last_five = desired[-5:]
+    assert provider.coverage_calls == [
+        (metadata.symbol, last_five[0], last_five[-1], "forward"),
+        (metadata.symbol, desired[0], desired[-1], "forward"),
+    ]
+    assert provider_calls == (2 if entrypoint == "cli" else 3)
+    assert rows_received == (5 if entrypoint == "cli" else 6)
+    assert rows_written == (0 if entrypoint == "cli" else 1)
+    assert run is not None
+    assert run.failure_count == 1
+    assert final_fact_count == fact_count
+    assert final_snapshot_count == snapshot_count
+    assert final_snapshot == first_snapshot
+    assert final_members == first_members
+
+
 @pytest.mark.parametrize(
     ("provider_kind", "expected_completeness", "coverage_complete"),
     [
@@ -1445,8 +1738,11 @@ def test_market_cli_preserves_optional_daily_coverage_evidence(
     assert summary.status is CaptureRunStatus.DEGRADED
     assert history is not None
     assert history.completeness == expected_completeness
-    assert history.coverage_evidence is not None
-    assert history.coverage_evidence.complete_request_window is coverage_complete
+    if coverage_complete:
+        assert history.coverage_evidence is not None
+        assert history.coverage_evidence.complete_request_window is True
+    else:
+        assert history.coverage_evidence is None
 
 
 def test_market_cli_persists_listing_evidence_for_legacy_short_history(tmp_path) -> None:

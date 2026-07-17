@@ -122,13 +122,13 @@ AkShare 只提供行情报价和公开市场数据，不提供真实持仓、成
 
 `verified_provider_window` 只能通过原不可变 `HistorySnapshot` 的 ID、members、digest 和 coverage evidence 整体复用；不得把 provider evidence 复制到本地重新物化的快照，也不得在事实修正后用新 members 冒充原 provider 快照。按指定快照 ID 复用时必须同时校验 symbol、cutoff 可用性、成员序列、范围和 digest，失败后不得改为搜索同标的另一份可用快照。
 
-adapter 必须完成第三方字段映射、数值和单位统一、六位股票代码校验、时区和交易日校验，只返回项目内部模型。日历使用 `exchange-calendars` 的 `XSHG`；下一交易日、交易分钟、午休、stale 计算和保留期边界都不得用自然日或简单周一至周五近似。
+adapter 必须完成第三方字段映射、数值和单位统一、六位股票代码校验、时区和交易日校验，只返回项目内部模型。日 K provider 路由必须按 symbol 暴露实际底层 provider 及其完整窗口 coverage 能力；路由层不得因自己具有转发方法，就把不支持 coverage 的旧 provider 伪装成支持。日历使用 `exchange-calendars` 的 `XSHG`；下一交易日、交易分钟、午休、stale 计算和保留期边界都不得用自然日或简单周一至周五近似。
 
 ### 8.3 前复权日 K
 
-每个决策启用标的首次补齐最近 250 个 `XSHG` 交易日，之后增量采集并刷新最近 5 个交易日的校正窗口。数据统一为 `adjustment=forward`，未经复权或后复权数据不得混入同一特征窗口。
+每个决策启用标的首次补齐最近 250 个 `XSHG` 交易日，之后只请求窗口内真实缺口和最近 5 个交易日的校正窗口。对同一 cutoff 已有可用 `verified_provider_window` 快照时，先执行 5 日校正；内容未变必须复用原 snapshot ID、members、digest 和 evidence，内容变化或 cutoff 前进时才重新请求完整窗口取得新 evidence。显式 CLI backfill 和 close workflow 都保留这一校正语义。数据统一为 `adjustment=forward`，未经复权或后复权数据不得混入同一特征窗口。
 
-日 K 事实按 `symbol + trade_date + adjustment + content_hash` 追加版本；provider 修正历史值时新增版本，不覆盖旧事实。每次收盘或回填创建不可变 `history_snapshot` 及 members，引用当轮实际使用的事实版本。日 K 和历史快照本期不自动删除，API 默认最多返回最近 250 个交易日。
+日 K 事实按 `symbol + trade_date + adjustment + content_hash` 追加版本；provider 修正历史值时新增版本，不覆盖旧事实。收盘或回填在成员版本或完整性证据变化时创建不可变 `history_snapshot` 及 members；同 cutoff 校正无变化时复用原不可变快照。日 K 和历史快照本期不自动删除，API 默认最多返回最近 250 个交易日。
 
 ### 8.4 完整资金流
 

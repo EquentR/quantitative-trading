@@ -25,6 +25,11 @@ class DailyBarProvider(Protocol):
     ) -> Sequence[DailyBar]: ...
 
 
+@runtime_checkable
+class DailyBarProviderRouter(Protocol):
+    def daily_bar_provider_for(self, symbol: str) -> DailyBarProvider: ...
+
+
 @dataclass(frozen=True)
 class DailyBarFetchResult:
     bars: tuple[DailyBar, ...]
