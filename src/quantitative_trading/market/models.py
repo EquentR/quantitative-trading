@@ -48,6 +48,11 @@ class CaptureRunStatus(StrEnum):
     FAILED = "failed"
 
 
+class CaptureExecutionMode(StrEnum):
+    DECISION = "decision"
+    DISPLAY_ONLY = "display_only"
+
+
 class CaptureRunAlreadyActiveError(RuntimeError):
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
@@ -68,6 +73,12 @@ class CaptureResultStatus(StrEnum):
     FAILED = "failed"
     STALE = "stale"
     NOT_APPLICABLE = "not_applicable"
+
+
+class HistoryCompleteness(StrEnum):
+    UNVERIFIABLE = "unverifiable"
+    VERIFIED_PROVIDER_WINDOW = "verified_provider_window"
+    VERIFIED_LISTING_DATE = "verified_listing_date"
 
 
 class StrengthLabel(StrEnum):
@@ -287,9 +298,14 @@ class MarketCaptureRun(BaseModel):
 
     run_id: str = Field(min_length=1)
     workflow_type: str = Field(pattern="^(close|intraday|backfill|cleanup)$")
+    mode: CaptureExecutionMode | None = None
     trade_date: date
+    effective_trade_date: date | None = None
+    history_cutoff_date: date | None = None
     period_start: datetime | None = None
     period_end: datetime | None = None
+    requested_symbol_scope: list[str] = Field(default_factory=list, max_length=500)
+    lease_expires_at: datetime | None = None
     idempotency_key: str = Field(min_length=1)
     status: CaptureRunStatus
     started_at: datetime
@@ -310,10 +326,35 @@ class MarketCaptureRun(BaseModel):
     failure_count: int = Field(default=0, ge=0)
     error_summary: str = ""
 
-    @field_validator("period_start", "period_end", "started_at", "finished_at")
+    @model_validator(mode="before")
+    @classmethod
+    def legacy_intraday_defaults_to_decision(cls, value):
+        if isinstance(value, dict) and value.get("workflow_type") == "intraday":
+            if value.get("mode") is None:
+                value = {**value, "mode": CaptureExecutionMode.DECISION}
+        return value
+
+    @field_validator(
+        "period_start", "period_end", "lease_expires_at", "started_at", "finished_at"
+    )
     @classmethod
     def run_times_must_be_timezone_aware(cls, value: datetime | None) -> datetime | None:
         return _must_be_timezone_aware(value)
+
+    @field_validator("requested_symbol_scope")
+    @classmethod
+    def requested_scope_must_be_canonical(cls, value: list[str]) -> list[str]:
+        if any(len(symbol) != 6 or not symbol.isascii() or not symbol.isdigit() for symbol in value):
+            raise ValueError("requested symbol scope must contain six ASCII digits")
+        if value != sorted(set(value)):
+            raise ValueError("requested symbol scope must be sorted and unique")
+        return value
+
+    @model_validator(mode="after")
+    def mode_must_match_workflow(self) -> "MarketCaptureRun":
+        if self.workflow_type != "intraday" and self.mode is not None:
+            raise ValueError("execution mode is only valid for intraday runs")
+        return self
 
     @computed_field
     @property
@@ -365,8 +406,78 @@ class DatasetSnapshotBase(BaseModel):
         return _must_be_timezone_aware(value)  # type: ignore[return-value]
 
 
+class DailyBarCoverageEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    requested_start: date
+    requested_end: date
+    observed_start: date | None = None
+    observed_end: date | None = None
+    earliest_available_date: date | None = None
+    complete_request_window: bool = False
+    source: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def date_ranges_must_be_consistent(self) -> "DailyBarCoverageEvidence":
+        if self.requested_start > self.requested_end:
+            raise ValueError("coverage requested range is invalid")
+        if (self.observed_start is None) != (self.observed_end is None):
+            raise ValueError("coverage observed range must be complete")
+        observed_start = self.observed_start
+        observed_end = self.observed_end
+        if observed_start is not None and observed_end is not None:
+            if observed_start > observed_end:
+                raise ValueError("coverage observed range is invalid")
+            if observed_start < self.requested_start:
+                raise ValueError("coverage observed range precedes request")
+            if observed_end > self.requested_end:
+                raise ValueError("coverage observed range exceeds request")
+        if self.complete_request_window and (
+            observed_start != self.requested_start
+            or observed_end != self.requested_end
+        ):
+            raise ValueError("complete coverage requires the full observed range")
+        if self.earliest_available_date is not None and not (
+            self.requested_start
+            <= self.earliest_available_date
+            <= self.requested_end
+        ):
+            raise ValueError("earliest available date must fall within request")
+        return self
+
+
+class ListingDateEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    listing_date: date
+    source: str = Field(min_length=1)
+
+
 class HistorySnapshot(DatasetSnapshotBase):
     adjustment: str = Field(default="forward", pattern="^forward$")
+    completeness: HistoryCompleteness = HistoryCompleteness.UNVERIFIABLE
+    coverage_evidence: DailyBarCoverageEvidence | None = None
+    listing_evidence: ListingDateEvidence | None = None
+
+    @model_validator(mode="after")
+    def verified_completeness_requires_evidence(self) -> "HistorySnapshot":
+        if self.completeness is HistoryCompleteness.VERIFIED_PROVIDER_WINDOW:
+            if (
+                self.coverage_evidence is None
+                or not self.coverage_evidence.complete_request_window
+            ):
+                raise ValueError("verified provider history requires complete coverage evidence")
+            if (
+                self.row_count > 0
+                and self.data_start != self.coverage_evidence.earliest_available_date
+            ):
+                raise ValueError("history start must match earliest coverage evidence")
+        if self.completeness is HistoryCompleteness.VERIFIED_LISTING_DATE:
+            if self.listing_evidence is None:
+                raise ValueError("verified listing history requires listing evidence")
+            if self.data_start is not None and self.data_start < self.listing_evidence.listing_date:
+                raise ValueError("history cannot start before verified listing date")
+        return self
 
 
 class MoneyFlowSnapshot(DatasetSnapshotBase):
@@ -448,6 +559,9 @@ class MarketInputSnapshot(BaseModel):
     )
     thresholds: dict[str, float] = Field(default_factory=dict)
     capture_run_id: str | None = Field(default=None, min_length=1)
+    mode: CaptureExecutionMode | None = None
+    effective_trade_date: date | None = None
+    history_cutoff_date: date | None = None
     data_time: datetime | None = None
     fetched_at: datetime
     warnings: list[str]

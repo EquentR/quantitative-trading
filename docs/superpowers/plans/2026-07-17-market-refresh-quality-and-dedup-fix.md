@@ -29,12 +29,12 @@
 
 **步骤：**
 
-- [ ] Cycle 1A：RED/GREEN `MarketCaptureRun`/`MarketInputSnapshot` 保存 mode、dates、requested scope、lease；旧 JSON/DB 行有保守默认。运行 `pytest -q tests/test_market_heavy_models.py tests/test_market_heavy_repository.py`。
-- [ ] Cycle 1B：RED/GREEN `HistorySnapshot` 保存版本化 completeness/coverage evidence，旧 payload 默认为 unverifiable，repository round-trip 保留。运行同一组 heavy model/repository 测试。
-- [ ] Cycle 1C：RED/GREEN migration 创建 `notification_canonical_groups(canonical_key PK, notification_id UNIQUE FK RESTRICT)` 和 `recommendation_notification_links(recommendation_id PK, notification_id/canonical_key FK RESTRICT)` 及 notification ID 索引；增加 `condition_fingerprint_version` 兼容字段。运行 `pytest -q tests/test_sqlite_storage.py tests/test_notification_service.py`。
-- [ ] Cycle 1D：RED/GREEN 旧数据库升级、migration 注入失败回滚、服务重启后 run list/detail 可读取旧 run/input/history，枚举和 API status 投影兼容。运行 `pytest -q tests/test_sqlite_storage.py tests/test_api_market_read.py`。
-- [ ] VERIFY：运行上述四个测试文件和 `git diff --check`。
-- [ ] REVIEW：后台 agent 检查 migration 兼容、系统告警不受影响、无敏感数据字段。
+- [x] Cycle 1A：RED/GREEN `MarketCaptureRun`/`MarketInputSnapshot` 保存 mode、dates、requested scope、lease；旧 JSON/DB 行有保守默认。运行 `pytest -q tests/test_market_heavy_models.py tests/test_market_heavy_repository.py`。
+- [x] Cycle 1B：RED/GREEN `HistorySnapshot` 保存版本化 completeness/coverage evidence，旧 payload 默认为 unverifiable，repository round-trip 保留。运行同一组 heavy model/repository 测试。
+- [x] Cycle 1C：RED/GREEN migration 创建 `notification_canonical_groups(canonical_key PK, notification_id UNIQUE FK RESTRICT)` 和 `recommendation_notification_links(recommendation_id PK, notification_id/canonical_key FK RESTRICT)` 及 notification ID 索引；增加 `condition_fingerprint_version` 兼容字段。运行 `pytest -q tests/test_sqlite_storage.py tests/test_notification_service.py`。
+- [x] Cycle 1D：RED/GREEN 旧数据库升级、migration 注入失败回滚、服务重启后 run list/detail 可读取旧 run/input/history，枚举和 API status 投影兼容。运行 `pytest -q tests/test_sqlite_storage.py tests/test_api_market_read.py`。
+- [x] VERIFY：运行上述测试文件和 `git diff --check`。
+- [x] REVIEW：后台 agent 检查 migration 兼容、系统告警不受影响、无敏感数据字段。
 
 ## Task 2：通知 canonical 去重、迁移和 current/history 查询
 

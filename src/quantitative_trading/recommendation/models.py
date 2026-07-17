@@ -93,6 +93,7 @@ class Recommendation(BaseModel):
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
+    condition_fingerprint_version: int | None = Field(default=None, ge=1)
     dedup_key: str | None = Field(default=None, min_length=1, max_length=500)
     audit_id: str | None = Field(default=None, min_length=1)
     condition_context: dict[str, Any] = Field(default_factory=dict)

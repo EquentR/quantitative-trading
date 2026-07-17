@@ -3,6 +3,8 @@ from datetime import UTC, date, datetime
 
 import pytest
 
+import quantitative_trading.market.models as market_models
+
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
     CaptureDataset,
@@ -136,6 +138,37 @@ def test_dataset_snapshot_members_remain_bound_to_original_fact_versions(connect
         )
 
 
+def test_history_snapshot_repository_round_trips_coverage_evidence(connection) -> None:
+    daily = DailyBarRepository(connection)
+    daily_id = daily.save(daily_bar(10.5))
+    evidence = market_models.DailyBarCoverageEvidence(
+        requested_start=date(2025, 7, 1),
+        requested_end=date(2026, 7, 10),
+        observed_start=date(2025, 7, 1),
+        observed_end=date(2026, 7, 10),
+        earliest_available_date=date(2026, 7, 10),
+        complete_request_window=True,
+        source="fake_daily_full_window",
+    )
+    snapshot = HistorySnapshot(
+        run_id="run-evidence",
+        symbol="600000",
+        data_start=date(2026, 7, 10),
+        data_end=date(2026, 7, 10),
+        row_count=1,
+        content_digest=content_digest([daily_bar(10.5).content_hash]),
+        status=CaptureResultStatus.DEGRADED,
+        completeness="verified_provider_window",
+        coverage_evidence=evidence,
+        fetched_at=FETCHED_AT,
+    )
+    repository = HistorySnapshotRepository(connection)
+
+    snapshot_id = repository.save(snapshot, [daily_id])
+
+    assert repository.get(snapshot_id) == snapshot
+
+
 def test_dataset_snapshot_rejects_forged_digest_range_and_member_order(connection) -> None:
     calendar = XSHGTradingCalendar()
     days = calendar.sessions_ending(date(2026, 7, 13), 2)
@@ -256,6 +289,31 @@ def test_capture_run_get_or_create_reuses_idempotency_key_and_update_persists_me
     assert reused.run_id == "run-1"
     assert repository.get("run-1") == finished
     assert repository.get("run-1").duration_ms == 60_000
+
+
+def test_capture_run_repository_round_trips_execution_context(connection) -> None:
+    repository = MarketCaptureRunRepository(connection)
+    lease_expires_at = datetime(2026, 7, 13, 7, 11, tzinfo=UTC)
+    run = MarketCaptureRun(
+        run_id="intraday-display-20260713-1510",
+        workflow_type="intraday",
+        mode="display_only",
+        trade_date=date(2026, 7, 13),
+        effective_trade_date=date(2026, 7, 13),
+        history_cutoff_date=date(2026, 7, 10),
+        requested_symbol_scope=["512480", "600000"],
+        lease_expires_at=lease_expires_at,
+        idempotency_key="intraday:display_only:2026-07-13:1510",
+        status=CaptureRunStatus.RUNNING,
+        started_at=FETCHED_AT,
+        requested_symbols=2,
+    )
+
+    stored, created = repository.get_or_create(run)
+
+    assert created is True
+    assert stored == run
+    assert repository.get(run.run_id) == run
 
 
 def test_capture_run_retry_claim_is_atomic_and_failure_only_updates_running(

@@ -27,6 +27,7 @@ class RecommendationRepository:
                 recommendation.symbol,
                 recommendation.action.value,
                 recommendation.condition_fingerprint,
+                recommendation.condition_fingerprint_version,
                 recommendation.audit_id,
                 recommendation.data_time.astimezone(UTC).isoformat(),
                 created_at.astimezone(UTC).isoformat(),
@@ -42,11 +43,13 @@ class RecommendationRepository:
               symbol,
               action,
               condition_fingerprint,
+              condition_fingerprint_version,
               audit_id,
               data_time,
               created_at,
               payload_json
             ) VALUES (
+              ?,
               ?,
               ?,
               ?,

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC
+from datetime import UTC, datetime
 
-from quantitative_trading.notification.models import NotificationStatus, NotificationSummary
+from quantitative_trading.notification.models import (
+    NotificationCanonicalGroup,
+    NotificationStatus,
+    NotificationSummary,
+    RecommendationNotificationLink,
+)
 
 
 class NotificationRepository:
@@ -81,6 +86,121 @@ class NotificationRepository:
         if row is None:
             return None
         return NotificationSummary.model_validate_json(row["payload_json"])
+
+    def save_canonical_group(
+        self,
+        canonical_key: str,
+        notification_id: str,
+        *,
+        created_at: datetime,
+        commit: bool = True,
+    ) -> None:
+        group = NotificationCanonicalGroup(
+            canonical_key=canonical_key,
+            notification_id=notification_id,
+            created_at=created_at,
+        )
+        self.connection.execute(
+            """
+            INSERT INTO notification_canonical_groups (
+              canonical_key, notification_id, created_at
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(canonical_key) DO NOTHING
+            """,
+            (
+                group.canonical_key,
+                group.notification_id,
+                group.created_at.astimezone(UTC).isoformat(),
+            ),
+        )
+        row = self.connection.execute(
+            """
+            SELECT notification_id
+            FROM notification_canonical_groups
+            WHERE canonical_key = ?
+            """,
+            (group.canonical_key,),
+        ).fetchone()
+        if row is None or row["notification_id"] != group.notification_id:
+            raise sqlite3.IntegrityError("canonical notification group conflicts")
+        if commit:
+            self.connection.commit()
+
+    def get_canonical_group(
+        self,
+        canonical_key: str,
+    ) -> NotificationCanonicalGroup | None:
+        row = self.connection.execute(
+            """
+            SELECT canonical_key, notification_id, created_at
+            FROM notification_canonical_groups
+            WHERE canonical_key = ?
+            """,
+            (canonical_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return NotificationCanonicalGroup.model_validate(dict(row))
+
+    def link_recommendation(
+        self,
+        recommendation_id: str,
+        notification_id: str,
+        canonical_key: str,
+        *,
+        created_at: datetime,
+        commit: bool = True,
+    ) -> RecommendationNotificationLink:
+        link = RecommendationNotificationLink(
+            recommendation_id=recommendation_id,
+            notification_id=notification_id,
+            canonical_key=canonical_key,
+            created_at=created_at,
+        )
+        self.connection.execute(
+            """
+            INSERT INTO recommendation_notification_links (
+              recommendation_id, notification_id, canonical_key, created_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(recommendation_id) DO NOTHING
+            """,
+            (
+                link.recommendation_id,
+                link.notification_id,
+                link.canonical_key,
+                link.created_at.astimezone(UTC).isoformat(),
+            ),
+        )
+        stored = self.get_link(recommendation_id)
+        if stored is None or (
+            stored.recommendation_id,
+            stored.notification_id,
+            stored.canonical_key,
+        ) != (
+            link.recommendation_id,
+            link.notification_id,
+            link.canonical_key,
+        ):
+            raise sqlite3.IntegrityError("recommendation notification link conflicts")
+        if commit:
+            self.connection.commit()
+        return stored
+
+    def get_link(
+        self,
+        recommendation_id: str,
+    ) -> RecommendationNotificationLink | None:
+        row = self.connection.execute(
+            """
+            SELECT recommendation_id, notification_id, canonical_key, created_at
+            FROM recommendation_notification_links
+            WHERE recommendation_id = ?
+            """,
+            (recommendation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return RecommendationNotificationLink.model_validate(dict(row))
 
     def list_recent(self, *, limit: int = 50) -> list[NotificationSummary]:
         return self.list(limit=limit)

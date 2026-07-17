@@ -901,6 +901,55 @@ def test_market_run_list_detail_results_and_missing_error(tmp_path) -> None:
     assert missing.json()["error"]["code"] == "market_run_not_found"
 
 
+def test_market_run_list_and_detail_preserve_display_execution_context(tmp_path) -> None:
+    client, headers, settings = authenticated_client(tmp_path)
+    lease_expires_at = datetime(2026, 7, 13, 8, 10, tzinfo=UTC)
+    with connect(settings) as connection:
+        MarketCaptureRunRepository(connection).get_or_create(
+            MarketCaptureRun(
+                run_id="intraday-display-20260713-1600",
+                workflow_type="intraday",
+                mode="display_only",
+                trade_date=date(2026, 7, 13),
+                effective_trade_date=date(2026, 7, 13),
+                history_cutoff_date=date(2026, 7, 10),
+                requested_symbol_scope=["512480", "600000"],
+                lease_expires_at=lease_expires_at,
+                period_start=datetime(2026, 7, 13, 16, 0, tzinfo=SHANGHAI),
+                period_end=datetime(2026, 7, 13, 16, 3, tzinfo=SHANGHAI),
+                idempotency_key="intraday:display_only:2026-07-13:1600",
+                status=CaptureRunStatus.SUCCEEDED,
+                started_at=datetime(2026, 7, 13, 8, 0, tzinfo=UTC),
+                finished_at=datetime(2026, 7, 13, 8, 1, tzinfo=UTC),
+                requested_symbols=2,
+                processed_symbols=2,
+            )
+        )
+
+    listed = client.get("/api/v1/market/runs?page=1&page_size=10", headers=headers)
+    detail = client.get(
+        "/api/v1/market/runs/intraday-display-20260713-1600",
+        headers=headers,
+    )
+
+    expected = {
+        "mode": "display_only",
+        "effective_trade_date": "2026-07-13",
+        "history_cutoff_date": "2026-07-10",
+        "requested_symbol_scope": ["512480", "600000"],
+        "lease_expires_at": lease_expires_at.isoformat().replace("+00:00", "Z"),
+    }
+    assert listed.status_code == 200
+    assert detail.status_code == 200
+    listed_run = next(
+        item
+        for item in listed.json()["items"]
+        if item["run_id"] == "intraday-display-20260713-1600"
+    )
+    assert {key: listed_run[key] for key in expected} == expected
+    assert {key: detail.json()[key] for key in expected} == expected
+
+
 def test_market_run_counts_money_flow_not_applicable(tmp_path) -> None:
     client, headers, settings = authenticated_client(tmp_path)
     seed_market_data(settings)

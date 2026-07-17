@@ -207,6 +207,9 @@ CREATE TABLE IF NOT EXISTS recommendations (
   symbol TEXT NOT NULL,
   action TEXT NOT NULL CHECK (action IN ('buy', 'sell', 'add', 'reduce', 'hold', 'watch', 'avoid')),
   condition_fingerprint TEXT,
+  condition_fingerprint_version INTEGER CHECK (
+    condition_fingerprint_version IS NULL OR condition_fingerprint_version >= 1
+  ),
   audit_id TEXT,
   data_time TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -240,6 +243,31 @@ CREATE TABLE IF NOT EXISTS notifications (
   payload_json TEXT NOT NULL,
   CHECK (symbol GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]')
 );
+"""
+
+
+NOTIFICATION_CANONICAL_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS notification_canonical_groups (
+  canonical_key TEXT PRIMARY KEY NOT NULL,
+  notification_id TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  UNIQUE (canonical_key, notification_id),
+  FOREIGN KEY (notification_id) REFERENCES notifications(notification_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS recommendation_notification_links (
+  recommendation_id TEXT PRIMARY KEY NOT NULL,
+  notification_id TEXT NOT NULL,
+  canonical_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (recommendation_id) REFERENCES recommendations(recommendation_id) ON DELETE RESTRICT,
+  FOREIGN KEY (notification_id) REFERENCES notifications(notification_id) ON DELETE RESTRICT,
+  FOREIGN KEY (canonical_key, notification_id)
+    REFERENCES notification_canonical_groups(canonical_key, notification_id)
+    ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_recommendation_notification_links_notification
+  ON recommendation_notification_links(notification_id);
 """
 
 
@@ -349,6 +377,7 @@ SCHEMA_STATEMENTS = [
     RECOMMENDATIONS_SCHEMA_SQL,
     AUDIT_LOGS_SCHEMA_SQL,
     NOTIFICATIONS_SCHEMA_SQL,
+    NOTIFICATION_CANONICAL_SCHEMA_SQL,
     SMTP_SETTINGS_SCHEMA_SQL,
     EMAIL_DELIVERIES_SCHEMA_SQL,
     EXECUTION_FEEDBACK_SCHEMA_SQL,
@@ -376,46 +405,50 @@ def connect(settings: Settings) -> Iterator[sqlite3.Connection]:
 
 
 def migrate(connection: sqlite3.Connection) -> None:
-    connection.executescript(SCHEMA_SQL)
-    _disable_unverified_watch_items(connection)
-    _ensure_market_capture_result_status_constraint(connection)
-    _ensure_trading_plan_status_constraint(connection)
-    _ensure_scheduler_state_columns(connection)
-    _ensure_instrument_catalog_state_columns(connection)
-    _ensure_notification_columns(connection)
-    _ensure_recommendation_columns(connection)
-    _ensure_market_capture_run_columns(connection)
-    _fail_duplicate_running_workflows(connection)
-    _supersede_duplicate_active_plans(connection)
-    connection.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedup_key
-        ON notifications(dedup_key)
-        WHERE dedup_key IS NOT NULL
-        """
-    )
-    connection.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_market_capture_runs_running_workflow
-        ON market_capture_runs(workflow_type)
-        WHERE status = 'running'
-        """
-    )
-    connection.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_recommendations_dedup_key
-        ON recommendations(dedup_key)
-        WHERE dedup_key IS NOT NULL
-        """
-    )
-    connection.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_trading_plans_one_active_day
-        ON trading_plans(trading_day)
-        WHERE status = 'active'
-        """
-    )
-    connection.commit()
+    try:
+        connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_SQL)
+        _disable_unverified_watch_items(connection)
+        _ensure_market_capture_result_status_constraint(connection)
+        _ensure_trading_plan_status_constraint(connection)
+        _ensure_scheduler_state_columns(connection)
+        _ensure_instrument_catalog_state_columns(connection)
+        _ensure_notification_columns(connection)
+        _ensure_recommendation_columns(connection)
+        _ensure_market_capture_run_columns(connection)
+        _fail_duplicate_running_workflows(connection)
+        _supersede_duplicate_active_plans(connection)
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedup_key
+            ON notifications(dedup_key)
+            WHERE dedup_key IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_market_capture_runs_running_workflow
+            ON market_capture_runs(workflow_type)
+            WHERE status = 'running'
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_recommendations_dedup_key
+            ON recommendations(dedup_key)
+            WHERE dedup_key IS NOT NULL
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_trading_plans_one_active_day
+            ON trading_plans(trading_day)
+            WHERE status = 'active'
+            """
+        )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
 
 
 def _disable_unverified_watch_items(connection: sqlite3.Connection) -> None:
@@ -512,7 +545,7 @@ def _ensure_trading_plan_status_constraint(connection: sqlite3.Connection) -> No
         return
 
     connection.execute("ALTER TABLE trading_plans RENAME TO trading_plans_legacy")
-    connection.executescript(TRADING_PLANS_SCHEMA_SQL)
+    connection.execute(TRADING_PLANS_SCHEMA_SQL)
     connection.execute(
         """
         INSERT INTO trading_plans (
@@ -575,6 +608,10 @@ def _ensure_recommendation_columns(connection: sqlite3.Connection) -> None:
     for name in ("dedup_key", "condition_fingerprint", "audit_id"):
         if name not in existing:
             connection.execute(f"ALTER TABLE recommendations ADD COLUMN {name} TEXT")
+    if "condition_fingerprint_version" not in existing:
+        connection.execute(
+            "ALTER TABLE recommendations ADD COLUMN condition_fingerprint_version INTEGER"
+        )
 
 
 def _supersede_duplicate_active_plans(connection: sqlite3.Connection) -> None:
@@ -615,6 +652,11 @@ def _ensure_market_capture_run_columns(connection: sqlite3.Connection) -> None:
         for row in connection.execute("PRAGMA table_info(market_capture_runs)").fetchall()
     }
     columns = {
+        "mode": "TEXT CHECK (mode IN ('decision','display_only'))",
+        "effective_trade_date": "TEXT",
+        "history_cutoff_date": "TEXT",
+        "requested_symbol_scope_json": "TEXT NOT NULL DEFAULT '[]'",
+        "lease_expires_at": "TEXT",
         "provider_duration_ms": "REAL NOT NULL DEFAULT 0 CHECK (provider_duration_ms >= 0)",
         "cleaned_rows": "INTEGER NOT NULL DEFAULT 0 CHECK (cleaned_rows >= 0)",
         "plan_count": "INTEGER NOT NULL DEFAULT 0 CHECK (plan_count >= 0)",

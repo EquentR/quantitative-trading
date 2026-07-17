@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, date, datetime, timedelta, timezone
 from typing import Annotated, Literal
@@ -1297,7 +1298,10 @@ def list_market_runs(
         rows = connection.execute(
             """
             SELECT
-              run_id, workflow_type, trade_date, period_start, period_end,
+              run_id, workflow_type, mode, trade_date,
+              effective_trade_date, history_cutoff_date,
+              period_start, period_end, requested_symbol_scope_json,
+              lease_expires_at,
               idempotency_key, status, started_at, finished_at,
               requested_symbols, processed_symbols, provider_calls,
               provider_duration_ms, rows_received, rows_written, cleaned_rows,
@@ -1313,7 +1317,11 @@ def list_market_runs(
         run_repository = MarketCaptureResultRepository(connection)
         items = []
         for row in rows:
-            run = MarketCaptureRun.model_validate(dict(row))
+            run_payload = dict(row)
+            run_payload["requested_symbol_scope"] = json.loads(
+                run_payload.pop("requested_symbol_scope_json")
+            )
+            run = MarketCaptureRun.model_validate(run_payload)
             results = run_repository.list_for_run(run.run_id)
             items.append(
                 MarketRunSummary(

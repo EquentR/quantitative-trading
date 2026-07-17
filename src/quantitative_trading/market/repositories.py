@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -441,14 +442,17 @@ class MarketCaptureRunRepository:
         try:
             self.connection.execute(
                 """INSERT INTO market_capture_runs (
-                     run_id, workflow_type, trade_date, period_start, period_end,
+                     run_id, workflow_type, mode, trade_date,
+                     effective_trade_date, history_cutoff_date,
+                     period_start, period_end, requested_symbol_scope_json,
+                     lease_expires_at,
                      idempotency_key, status, started_at, finished_at,
                      requested_symbols, processed_symbols, provider_calls,
                      provider_duration_ms, rows_received, rows_written, cleaned_rows,
                      plan_count, recommendation_count, notification_count,
                      email_outbox_count, retry_count, warning_count, failure_count,
                      error_summary
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 self._values(run),
             )
             self.connection.commit()
@@ -508,7 +512,10 @@ class MarketCaptureRunRepository:
     def update(self, run: MarketCaptureRun) -> None:
         cursor = self.connection.execute(
             """UPDATE market_capture_runs SET
-                 workflow_type=?, trade_date=?, period_start=?, period_end=?,
+                 workflow_type=?, mode=?, trade_date=?,
+                 effective_trade_date=?, history_cutoff_date=?,
+                 period_start=?, period_end=?, requested_symbol_scope_json=?,
+                 lease_expires_at=?,
                  idempotency_key=?, status=?, started_at=?, finished_at=?,
                  requested_symbols=?, processed_symbols=?, provider_calls=?,
                  provider_duration_ms=?, rows_received=?, rows_written=?, cleaned_rows=?,
@@ -530,7 +537,10 @@ class MarketCaptureRunRepository:
     ) -> None:
         cursor = self.connection.execute(
             """UPDATE market_capture_runs SET
-                 workflow_type=?, trade_date=?, period_start=?, period_end=?,
+                 workflow_type=?, mode=?, trade_date=?,
+                 effective_trade_date=?, history_cutoff_date=?,
+                 period_start=?, period_end=?, requested_symbol_scope_json=?,
+                 lease_expires_at=?,
                  idempotency_key=?, status=?, started_at=?, finished_at=?,
                  requested_symbols=?, processed_symbols=?, provider_calls=?,
                  provider_duration_ms=?, rows_received=?, rows_written=?, cleaned_rows=?,
@@ -629,9 +639,14 @@ class MarketCaptureRunRepository:
         return (
             run.run_id,
             run.workflow_type,
+            None if run.mode is None else run.mode.value,
             run.trade_date.isoformat(),
+            None if run.effective_trade_date is None else run.effective_trade_date.isoformat(),
+            None if run.history_cutoff_date is None else run.history_cutoff_date.isoformat(),
             None if run.period_start is None else run.period_start.isoformat(),
             None if run.period_end is None else run.period_end.isoformat(),
+            json.dumps(run.requested_symbol_scope, separators=(",", ":")),
+            None if run.lease_expires_at is None else run.lease_expires_at.isoformat(),
             run.idempotency_key,
             run.status.value,
             run.started_at.isoformat(),
@@ -659,9 +674,14 @@ class MarketCaptureRunRepository:
             {
                 "run_id": row["run_id"],
                 "workflow_type": row["workflow_type"],
+                "mode": row["mode"],
                 "trade_date": row["trade_date"],
+                "effective_trade_date": row["effective_trade_date"],
+                "history_cutoff_date": row["history_cutoff_date"],
                 "period_start": row["period_start"],
                 "period_end": row["period_end"],
+                "requested_symbol_scope": json.loads(row["requested_symbol_scope_json"]),
+                "lease_expires_at": row["lease_expires_at"],
                 "idempotency_key": row["idempotency_key"],
                 "status": row["status"],
                 "started_at": row["started_at"],

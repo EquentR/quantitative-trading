@@ -3,6 +3,8 @@ from datetime import UTC, date, datetime, timezone, timedelta
 import pytest
 from pydantic import ValidationError
 
+import quantitative_trading.market.models as market_models
+
 from quantitative_trading.market.models import (
     CaptureDataset,
     CaptureResultStatus,
@@ -160,6 +162,129 @@ def test_capture_run_result_and_dataset_snapshots_validate_contract() -> None:
     assert flow.row_count == 1
 
 
+def test_history_snapshot_preserves_coverage_evidence_and_legacy_is_unverifiable() -> None:
+    evidence = market_models.DailyBarCoverageEvidence(
+        requested_start=date(2025, 7, 1),
+        requested_end=date(2026, 7, 10),
+        observed_start=date(2025, 7, 1),
+        observed_end=date(2026, 7, 10),
+        earliest_available_date=date(2026, 4, 1),
+        complete_request_window=True,
+        source="akshare_daily_full_window",
+    )
+    verified = HistorySnapshot(
+        run_id="run-short-history",
+        symbol="603459",
+        data_start=date(2026, 4, 1),
+        data_end=date(2026, 7, 10),
+        row_count=68,
+        content_digest="a" * 64,
+        status=CaptureResultStatus.DEGRADED,
+        completeness="verified_provider_window",
+        coverage_evidence=evidence,
+        fetched_at=FETCHED_AT,
+    )
+    legacy = HistorySnapshot.model_validate(
+        {
+            "run_id": "legacy-history",
+            "symbol": "600000",
+            "data_start": date(2026, 7, 10),
+            "data_end": date(2026, 7, 10),
+            "row_count": 1,
+            "content_digest": "b" * 64,
+            "status": CaptureResultStatus.DEGRADED,
+            "fetched_at": FETCHED_AT,
+        }
+    )
+
+    assert verified.coverage_evidence == evidence
+    assert verified.completeness == "verified_provider_window"
+    assert legacy.completeness == "unverifiable"
+    assert legacy.coverage_evidence is None
+
+
+def test_verified_history_rejects_missing_or_inconsistent_evidence() -> None:
+    with pytest.raises(ValidationError, match="observed range"):
+        market_models.DailyBarCoverageEvidence(
+            requested_start=date(2025, 7, 1),
+            requested_end=date(2026, 7, 10),
+            complete_request_window=True,
+            source="fake",
+        )
+
+    incomplete = market_models.DailyBarCoverageEvidence(
+        requested_start=date(2025, 7, 1),
+        requested_end=date(2026, 7, 10),
+        observed_start=date(2026, 4, 1),
+        observed_end=date(2026, 7, 10),
+        earliest_available_date=date(2026, 4, 1),
+        complete_request_window=False,
+        source="fake",
+    )
+    payload = {
+        "run_id": "run-invalid-evidence",
+        "symbol": "603459",
+        "data_start": date(2026, 4, 1),
+        "data_end": date(2026, 7, 10),
+        "row_count": 68,
+        "content_digest": "c" * 64,
+        "status": CaptureResultStatus.DEGRADED,
+        "fetched_at": FETCHED_AT,
+    }
+    with pytest.raises(ValidationError, match="complete coverage"):
+        HistorySnapshot(
+            **payload,
+            completeness="verified_provider_window",
+            coverage_evidence=incomplete,
+        )
+    with pytest.raises(ValidationError, match="listing evidence"):
+        HistorySnapshot(**payload, completeness="verified_listing_date")
+
+    listing_evidence = market_models.ListingDateEvidence(
+        listing_date=date(2026, 3, 31),
+        source="exchange_directory",
+    )
+    listed = HistorySnapshot(
+        **payload,
+        completeness="verified_listing_date",
+        listing_evidence=listing_evidence,
+    )
+    assert listed.listing_evidence == listing_evidence
+
+
+def test_intraday_capture_context_is_explicit_and_legacy_defaults_to_decision() -> None:
+    lease_expires_at = datetime(2026, 7, 13, 7, 11, tzinfo=UTC)
+    display_run = MarketCaptureRun(
+        run_id="intraday-display-20260713-1510",
+        workflow_type="intraday",
+        mode="display_only",
+        trade_date=date(2026, 7, 13),
+        effective_trade_date=date(2026, 7, 13),
+        history_cutoff_date=date(2026, 7, 10),
+        requested_symbol_scope=["512480", "600000"],
+        lease_expires_at=lease_expires_at,
+        idempotency_key="intraday:display_only:2026-07-13:1510",
+        status=CaptureRunStatus.RUNNING,
+        started_at=FETCHED_AT,
+        requested_symbols=2,
+    )
+    legacy_run = MarketCaptureRun(
+        run_id="intraday-20260713-1000",
+        workflow_type="intraday",
+        trade_date=date(2026, 7, 13),
+        idempotency_key="intraday:2026-07-13:1000",
+        status=CaptureRunStatus.RUNNING,
+        started_at=FETCHED_AT,
+    )
+
+    assert display_run.mode == "display_only"
+    assert display_run.effective_trade_date == date(2026, 7, 13)
+    assert display_run.history_cutoff_date == date(2026, 7, 10)
+    assert display_run.requested_symbol_scope == ["512480", "600000"]
+    assert display_run.lease_expires_at == lease_expires_at
+    assert legacy_run.mode == "decision"
+
+
 def test_money_flow_and_strength_models_reject_non_finite_or_naive_data() -> None:
     with pytest.raises(ValidationError):
         DailyMoneyFlow(
@@ -212,6 +337,21 @@ def test_market_input_snapshot_accepts_run_link_and_dataset_quality_defaults() -
     assert legacy.capture_run_id is None
     assert legacy.dataset_quality == {}
     assert linked.dataset_quality["600000"][CaptureDataset.DAILY_BAR].actual_rows == 1
+
+    display = MarketInputSnapshot(
+        universe_snapshot_id=1,
+        quote_snapshot_refs={},
+        history_snapshot_refs={},
+        money_flow_snapshot_refs={},
+        intraday_strength_snapshot_refs={},
+        mode="display_only",
+        effective_trade_date=date(2026, 7, 13),
+        history_cutoff_date=date(2026, 7, 10),
+        fetched_at=FETCHED_AT,
+        warnings=[],
+    )
+    assert display.mode == "display_only"
+    assert legacy.mode is None
 
     with pytest.raises(ValidationError, match="timezone-aware"):
         IntradayStrengthSnapshot(

@@ -1,8 +1,10 @@
 from collections.abc import Iterator
 from datetime import UTC, datetime
 import json
+import sqlite3
 
 import pytest
+from pydantic import ValidationError
 
 from quantitative_trading.audit.models import AuditLog
 from quantitative_trading.config import Settings
@@ -11,6 +13,7 @@ from quantitative_trading.notification.models import NotificationStatus
 from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.notification.service import NotificationService
 from quantitative_trading.recommendation.models import Recommendation, RecommendationAction
+from quantitative_trading.recommendation.repository import RecommendationRepository
 from quantitative_trading.storage.sqlite import connect, migrate
 
 
@@ -173,6 +176,97 @@ def test_notification_condition_key_deduplicates_only_identical_conditions(tmp_p
         assert duplicate == first
         assert changed.notification_id == "notif-2"
         assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 2
+
+
+def test_recommendation_fingerprint_version_and_notification_link_round_trip(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "notification-link.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        rec = recommendation(
+            condition_fingerprint="a" * 64,
+            condition_fingerprint_version=2,
+        )
+        saved = RecommendationRepository(connection).save_many(
+            [rec],
+            created_at=NOW,
+        )[0]
+        notifications = NotificationRepository(connection)
+        summary = NotificationService(
+            notifications,
+            id_factory=lambda: "notif-link",
+        ).create_from_recommendation(rec, audit_log(), now=NOW)
+
+        notifications.save_canonical_group(
+            "canonical-key",
+            summary.notification_id,
+            created_at=NOW,
+        )
+        link = notifications.link_recommendation(
+            rec.recommendation_id,
+            summary.notification_id,
+            "canonical-key",
+            created_at=NOW,
+        )
+
+        assert saved.condition_fingerprint_version == 2
+        assert connection.execute(
+            "SELECT condition_fingerprint_version FROM recommendations"
+        ).fetchone()[0] == 2
+        assert link.recommendation_id == rec.recommendation_id
+        assert link.notification_id == summary.notification_id
+        assert notifications.get_link(rec.recommendation_id) == link
+        retried_link = notifications.link_recommendation(
+            rec.recommendation_id,
+            summary.notification_id,
+            "canonical-key",
+            created_at=LATER,
+        )
+        assert retried_link == link
+        assert retried_link.created_at == NOW
+        group = notifications.get_canonical_group("canonical-key")
+        assert group is not None
+        assert group.notification_id == summary.notification_id
+
+        second_rec = recommendation(
+            recommendation_id="rec-2",
+            condition_fingerprint="b" * 64,
+            condition_fingerprint_version=2,
+        )
+        RecommendationRepository(connection).save_many([second_rec], created_at=NOW)
+        second_summary = summary.model_copy(
+            update={
+                "notification_id": "notif-2",
+                "recommendation_id": second_rec.recommendation_id,
+            }
+        )
+        notifications.save(second_summary)
+        with pytest.raises(sqlite3.IntegrityError):
+            notifications.link_recommendation(
+                second_rec.recommendation_id,
+                second_summary.notification_id,
+                "canonical-key",
+                created_at=NOW,
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM notifications WHERE notification_id = ?",
+                (summary.notification_id,),
+            )
+
+        with pytest.raises(ValidationError):
+            notifications.save_canonical_group(
+                "",
+                summary.notification_id,
+                created_at=NOW,
+            )
+        with pytest.raises(ValidationError, match="timezone-aware"):
+            notifications.save_canonical_group(
+                "naive-time-key",
+                summary.notification_id,
+                created_at=datetime(2026, 7, 9, 2, 30),
+            )
 
 
 def test_jsonl_writer_sanitizes_sensitive_keys_and_configured_secret_text(tmp_path) -> None:

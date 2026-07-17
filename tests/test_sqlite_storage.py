@@ -4,8 +4,158 @@ import json
 
 import pytest
 
+import quantitative_trading.storage.sqlite as sqlite_storage
 from quantitative_trading.config import Settings
+from quantitative_trading.market.repositories import MarketCaptureRunRepository
 from quantitative_trading.storage.sqlite import connect, migrate
+
+
+def test_notification_canonical_schema_has_strict_keys_and_fingerprint_version(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "notification-canonical.db")
+    with connect(settings) as connection:
+        migrate(connection)
+        groups = {
+            row["name"]: row
+            for row in connection.execute(
+                "PRAGMA table_info(notification_canonical_groups)"
+            ).fetchall()
+        }
+        links = {
+            row["name"]: row
+            for row in connection.execute(
+                "PRAGMA table_info(recommendation_notification_links)"
+            ).fetchall()
+        }
+        group_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(notification_canonical_groups)"
+        ).fetchall()
+        group_indexes = connection.execute(
+            "PRAGMA index_list(notification_canonical_groups)"
+        ).fetchall()
+        link_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(recommendation_notification_links)"
+        ).fetchall()
+        indexes = connection.execute(
+            "PRAGMA index_list(recommendation_notification_links)"
+        ).fetchall()
+        recommendation_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(recommendations)").fetchall()
+        }
+
+    assert groups["canonical_key"]["pk"] == 1
+    assert groups["notification_id"]["notnull"] == 1
+    assert any(row["unique"] == 1 for row in group_indexes)
+    assert links["recommendation_id"]["pk"] == 1
+    assert links["notification_id"]["notnull"] == 1
+    assert links["canonical_key"]["notnull"] == 1
+    assert {(row["table"], row["on_delete"]) for row in group_foreign_keys} == {
+        ("notifications", "RESTRICT")
+    }
+    assert {(row["table"], row["on_delete"]) for row in link_foreign_keys} == {
+        ("recommendations", "RESTRICT"),
+        ("notifications", "RESTRICT"),
+        ("notification_canonical_groups", "RESTRICT"),
+    }
+    assert any(row["name"] == "idx_recommendation_notification_links_notification" for row in indexes)
+    assert "condition_fingerprint_version" in recommendation_columns
+
+
+def test_migration_rolls_back_schema_when_an_upgrade_step_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(database_path=tmp_path / "failed-migration.db")
+    with connect(settings) as connection:
+        connection.execute(
+            """
+            CREATE TABLE market_capture_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT NOT NULL UNIQUE,
+              workflow_type TEXT NOT NULL,
+              trade_date TEXT NOT NULL,
+              period_start TEXT,
+              period_end TEXT,
+              idempotency_key TEXT NOT NULL UNIQUE,
+              status TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              finished_at TEXT,
+              requested_symbols INTEGER NOT NULL DEFAULT 0,
+              processed_symbols INTEGER NOT NULL DEFAULT 0,
+              provider_calls INTEGER NOT NULL DEFAULT 0,
+              rows_received INTEGER NOT NULL DEFAULT 0,
+              rows_written INTEGER NOT NULL DEFAULT 0,
+              warning_count INTEGER NOT NULL DEFAULT 0,
+              failure_count INTEGER NOT NULL DEFAULT 0,
+              error_summary TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE trading_plans (
+              plan_id TEXT PRIMARY KEY NOT NULL,
+              trading_day TEXT NOT NULL,
+              generated_at TEXT NOT NULL,
+              valid_until TEXT NOT NULL,
+              status TEXT NOT NULL CHECK (status IN ('draft', 'active', 'expired', 'stale')),
+              payload_json TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO trading_plans (
+              plan_id, trading_day, generated_at, valid_until, status, payload_json
+            ) VALUES (
+              'legacy-plan', '2026-07-13', '2026-07-12T07:00:00+00:00',
+              '2026-07-13T15:00:00+08:00', 'active', '{"status":"active"}'
+            )
+            """
+        )
+        connection.commit()
+
+        def fail_upgrade(_connection) -> None:
+            raise RuntimeError("injected migration failure")
+
+        monkeypatch.setattr(
+            sqlite_storage,
+            "_ensure_recommendation_columns",
+            fail_upgrade,
+        )
+        with pytest.raises(RuntimeError, match="injected migration failure"):
+            migrate(connection)
+
+        canonical_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='notification_canonical_groups'
+            """
+        ).fetchone()
+        capture_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(market_capture_runs)"
+            ).fetchall()
+        }
+        plan_rows = connection.execute(
+            "SELECT plan_id, status FROM trading_plans"
+        ).fetchall()
+        legacy_plan_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='trading_plans_legacy'
+            """
+        ).fetchone()
+
+    assert canonical_table is None
+    assert "mode" not in capture_columns
+    assert [(row["plan_id"], row["status"]) for row in plan_rows] == [
+        ("legacy-plan", "active")
+    ]
+    assert legacy_plan_table is None
 
 
 def test_migration_repairs_legacy_duplicate_active_plans_before_unique_index(
@@ -1188,6 +1338,17 @@ def test_migrate_adds_market_capture_observability_columns_to_existing_db(
             )
             """
         )
+        connection.execute(
+            """
+            INSERT INTO market_capture_runs (
+              run_id, workflow_type, trade_date, idempotency_key, status, started_at
+            ) VALUES (
+              'legacy-intraday', 'intraday', '2026-07-13',
+              'intraday:2026-07-13:1000', 'succeeded',
+              '2026-07-13T02:00:00+00:00'
+            )
+            """
+        )
 
         migrate(connection)
         migrate(connection)
@@ -1200,6 +1361,9 @@ def test_migrate_adds_market_capture_observability_columns_to_existing_db(
         row = connection.execute(
             "SELECT * FROM market_capture_runs WHERE run_id='legacy-run'"
         ).fetchone()
+        legacy_intraday = MarketCaptureRunRepository(connection).get(
+            "legacy-intraday"
+        )
 
     expected = {
         "provider_duration_ms",
@@ -1209,6 +1373,11 @@ def test_migrate_adds_market_capture_observability_columns_to_existing_db(
         "notification_count",
         "email_outbox_count",
         "retry_count",
+        "mode",
+        "effective_trade_date",
+        "history_cutoff_date",
+        "requested_symbol_scope_json",
+        "lease_expires_at",
     }
     assert expected <= columns
     assert {name: row[name] for name in expected} == {
@@ -1219,4 +1388,15 @@ def test_migrate_adds_market_capture_observability_columns_to_existing_db(
         "notification_count": 0,
         "email_outbox_count": 0,
         "retry_count": 0,
+        "mode": None,
+        "effective_trade_date": None,
+        "history_cutoff_date": None,
+        "requested_symbol_scope_json": "[]",
+        "lease_expires_at": None,
     }
+    assert legacy_intraday is not None
+    assert legacy_intraday.mode == "decision"
+    assert legacy_intraday.requested_symbol_scope == []
+    assert legacy_intraday.effective_trade_date is None
+    assert legacy_intraday.history_cutoff_date is None
+    assert legacy_intraday.lease_expires_at is None

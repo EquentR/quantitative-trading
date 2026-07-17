@@ -39,3 +39,30 @@ class NotificationSummary(BaseModel):
     @classmethod
     def datetimes_must_be_timezone_aware(cls, value: datetime, info) -> datetime:
         return _require_timezone_aware(value, info.field_name)
+
+
+class RecommendationNotificationLink(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    recommendation_id: str = Field(min_length=1)
+    notification_id: str = Field(min_length=1)
+    canonical_key: str = Field(min_length=1, max_length=500)
+    created_at: datetime
+
+    @field_validator("created_at")
+    @classmethod
+    def created_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        return _require_timezone_aware(value, "created_at")
+
+
+class NotificationCanonicalGroup(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    canonical_key: str = Field(min_length=1, max_length=500)
+    notification_id: str = Field(min_length=1)
+    created_at: datetime
+
+    @field_validator("created_at")
+    @classmethod
+    def created_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        return _require_timezone_aware(value, "created_at")
