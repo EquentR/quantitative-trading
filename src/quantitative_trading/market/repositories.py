@@ -29,6 +29,12 @@ class StoredDailyBar:
 
 
 @dataclass(frozen=True)
+class StoredHistorySnapshot:
+    snapshot_id: int
+    snapshot: HistorySnapshot
+
+
+@dataclass(frozen=True)
 class StoredMoneyFlow:
     id: int
     flow: DailyMoneyFlow
@@ -81,13 +87,28 @@ class DailyBarRepository:
             int(row["id"]), DailyBar.model_validate_json(row["payload_json"])
         )
 
-    def current(self, symbol: str, *, limit: int | None = None) -> list[StoredDailyBar]:
-        query = """SELECT id, payload_json FROM daily_bars
-                   WHERE id IN (
-                     SELECT MAX(id) FROM daily_bars
-                     WHERE symbol=? AND adjustment='forward' GROUP BY trade_date
-                   ) ORDER BY trade_date DESC"""
+    def current(
+        self,
+        symbol: str,
+        *,
+        limit: int | None = None,
+        since: date | None = None,
+        through: date | None = None,
+    ) -> list[StoredDailyBar]:
+        range_filter = ""
         params: list[object] = [symbol]
+        if since is not None:
+            range_filter += " AND trade_date>=?"
+            params.append(since.isoformat())
+        if through is not None:
+            range_filter += " AND trade_date<=?"
+            params.append(through.isoformat())
+        query = f"""SELECT id, payload_json FROM daily_bars
+                    WHERE id IN (
+                      SELECT MAX(id) FROM daily_bars
+                      WHERE symbol=? AND adjustment='forward'{range_filter}
+                      GROUP BY trade_date
+                    ) ORDER BY trade_date DESC"""
         if limit is not None:
             query += " LIMIT ?"
             params.append(limit)
@@ -305,6 +326,88 @@ class HistorySnapshotRepository(_DatasetSnapshotRepository[HistorySnapshot, Stor
     member_column = "daily_bar_id"
     fact_table = "daily_bars"
     snapshot_model = HistorySnapshot
+
+    def latest_usable_for_symbol(
+        self,
+        symbol: str,
+        *,
+        as_of: date,
+        expected_rows: int,
+    ) -> StoredHistorySnapshot | None:
+        rows = self.connection.execute(
+            """SELECT id, payload_json FROM history_snapshots
+               WHERE symbol=? ORDER BY id DESC""",
+            (symbol,),
+        ).fetchall()
+        for row in rows:
+            snapshot_id = int(row["id"])
+            snapshot = HistorySnapshot.model_validate_json(row["payload_json"])
+            if not snapshot.is_usable(as_of=as_of, expected_rows=expected_rows):
+                continue
+            self._validate_usable_snapshot_members(snapshot_id, snapshot, symbol=symbol)
+            return StoredHistorySnapshot(snapshot_id=snapshot_id, snapshot=snapshot)
+        return None
+
+    def usable_by_id_for_symbol(
+        self,
+        snapshot_id: int,
+        symbol: str,
+        *,
+        as_of: date,
+        expected_rows: int,
+    ) -> StoredHistorySnapshot | None:
+        row = self.connection.execute(
+            "SELECT payload_json FROM history_snapshots WHERE id=? AND symbol=?",
+            (snapshot_id, symbol),
+        ).fetchone()
+        if row is None:
+            return None
+        snapshot = HistorySnapshot.model_validate_json(row["payload_json"])
+        if not snapshot.is_usable(as_of=as_of, expected_rows=expected_rows):
+            return None
+        self._validate_usable_snapshot_members(snapshot_id, snapshot, symbol=symbol)
+        return StoredHistorySnapshot(snapshot_id=snapshot_id, snapshot=snapshot)
+
+    def _validate_usable_snapshot_members(
+        self,
+        snapshot_id: int,
+        snapshot: HistorySnapshot,
+        *,
+        symbol: str,
+    ) -> None:
+        sequences = [
+            int(row["sequence"])
+            for row in self.connection.execute(
+                """SELECT sequence FROM history_snapshot_members
+                   WHERE snapshot_id=? ORDER BY sequence""",
+                (snapshot_id,),
+            ).fetchall()
+        ]
+        if len(sequences) != snapshot.row_count:
+            raise sqlite3.IntegrityError("history snapshot members do not match payload")
+        if sequences != list(range(snapshot.row_count)):
+            raise sqlite3.IntegrityError("history snapshot member sequence is invalid")
+        members = self.members(snapshot_id)
+        if snapshot.symbol != symbol or len(members) != snapshot.row_count:
+            raise sqlite3.IntegrityError("history snapshot members do not match payload")
+        dates = [member.bar.trade_date for member in members]
+        if dates != sorted(dates) or len(dates) != len(set(dates)):
+            raise sqlite3.IntegrityError("history snapshot members are not ordered")
+        if any(
+            member.bar.symbol != snapshot.symbol
+            or member.bar.adjustment != snapshot.adjustment
+            for member in members
+        ):
+            raise sqlite3.IntegrityError("history snapshot members have invalid scope")
+        if (
+            snapshot.data_start != (None if not dates else dates[0])
+            or snapshot.data_end != (None if not dates else dates[-1])
+        ):
+            raise sqlite3.IntegrityError("history snapshot members have invalid range")
+        if snapshot.content_digest != content_digest(
+            [member.bar.content_hash for member in members]
+        ):
+            raise sqlite3.IntegrityError("history snapshot members have invalid digest")
 
 
 class MoneyFlowSnapshotRepository(_DatasetSnapshotRepository[MoneyFlowSnapshot, StoredMoneyFlow]):

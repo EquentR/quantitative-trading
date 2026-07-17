@@ -32,6 +32,7 @@ from quantitative_trading.market.models import (
     CaptureRunStatus,
     CaptureRunAlreadyActiveError,
     DailyBarCoverageEvidence,
+    HistorySnapshot,
     LimitStatus,
     QuoteSnapshot,
     QuoteStatus,
@@ -47,6 +48,7 @@ from quantitative_trading.market.repositories import (
     IntradayStrengthSnapshotRepository,
     MarketCaptureResultRepository,
     MinuteBarRepository,
+    content_digest,
 )
 from quantitative_trading.market.repository import MarketInputSnapshotRepository
 from quantitative_trading.notification.repository import NotificationRepository
@@ -1848,6 +1850,668 @@ class TwentyOneDayGapDailyProvider(CalendarDailyProvider):
         return [*bars[:10], *bars[11:]]
 
 
+def save_suspended_provider_history(
+    connection,
+    *,
+    calendar: XSHGTradingCalendar,
+    symbol: str,
+    cutoff: date,
+) -> tuple[int, HistorySnapshot, list[int]]:
+    member_days = calendar.sessions_ending(cutoff, 21)[:-1]
+    daily = DailyBarRepository(connection)
+    member_ids = [
+        daily.save(
+            DailyBar(
+                symbol=symbol,
+                trade_date=trade_day,
+                open=10,
+                high=11,
+                low=9,
+                close=10 + index * 0.001,
+                volume=100_000,
+                amount=1_000_000,
+                source="provider-frozen",
+                fetched_at=NOW,
+            )
+        )
+        for index, trade_day in enumerate(member_days)
+    ]
+    requested_start = calendar.sessions_ending(cutoff, 250)[0]
+    evidence = DailyBarCoverageEvidence(
+        requested_start=requested_start,
+        requested_end=cutoff,
+        observed_start=requested_start,
+        observed_end=cutoff,
+        earliest_available_date=member_days[0],
+        complete_request_window=True,
+        source="provider-full-window",
+    )
+    members = [daily.get(member_id) for member_id in member_ids]
+    snapshot = HistorySnapshot(
+        run_id="backfill-provider-frozen",
+        symbol=symbol,
+        data_start=member_days[0],
+        data_end=member_days[-1],
+        row_count=len(member_ids),
+        content_digest=content_digest([member.bar.content_hash for member in members]),
+        status=CaptureResultStatus.DEGRADED,
+        warning="provider observed the complete request window",
+        fetched_at=NOW,
+        completeness="verified_provider_window",
+        coverage_evidence=evidence,
+    )
+    snapshot_id = HistorySnapshotRepository(connection).save(snapshot, member_ids)
+    return snapshot_id, snapshot, member_ids
+
+
+def test_intraday_without_plan_reuses_frozen_etf_history_snapshot(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-local-etf-history.db")
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    metadata = etf_name_variant_metadata(now=clock.value, trade_date=cutoff)
+    with connect(settings) as connection:
+        migrate(connection)
+        instrument_repository = InstrumentRepository(connection)
+        instrument_repository.replace_catalog([metadata])
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol=metadata.symbol,
+                name=metadata.name,
+                quantity=1000,
+                available_quantity=1000,
+                cost_price=7,
+                opened_at=date(2026, 7, 1),
+            ),
+            now=NOW,
+        )
+        CashAccountRepository(connection).initialize(50_000, now=NOW, note="initial")
+        source_id, source_snapshot, source_member_ids = save_suspended_provider_history(
+            connection,
+            calendar=calendar,
+            symbol=metadata.symbol,
+            cutoff=cutoff,
+        )
+        original_members = HistorySnapshotRepository(connection).members(source_id)
+        corrected = original_members[5].bar.model_copy(
+            update={"close": 10.5, "amount": original_members[5].bar.volume * 10.5}
+        )
+        DailyBarRepository(connection).save(corrected)
+        snapshot_count = connection.execute(
+            "SELECT COUNT(*) FROM history_snapshots"
+        ).fetchone()[0]
+        loader = lambda symbols: {
+            symbol: loaded
+            for symbol in symbols
+            if (loaded := instrument_repository.get(symbol)) is not None
+        }
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=UnexpectedProvider(),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=UnexpectedProvider(),
+            intraday_provider=NoopIntradayProvider(),
+            etf_quote_provider=ClockQuoteProvider(clock),
+            etf_daily_provider=UnexpectedProvider(),
+            etf_intraday_provider=RisingIntradayProvider(calendar, clock),
+            instrument_metadata_loader=loader,
+            now=clock.now,
+        ).run_intraday()
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+        capture_results = {
+            item.dataset: item
+            for item in MarketCaptureResultRepository(connection).list_for_run(result.run_id)
+            if item.symbol == metadata.symbol
+        }
+        members_after = HistorySnapshotRepository(connection).members(source_id)
+        snapshot_after = HistorySnapshotRepository(connection).get(source_id)
+        snapshot_count_after = connection.execute(
+            "SELECT COUNT(*) FROM history_snapshots"
+        ).fetchone()[0]
+
+    assert market_input is not None
+    assert market_input.history_snapshot_refs[metadata.symbol] == source_id
+    assert market_input.effective_trade_date == clock.value.date()
+    assert market_input.history_cutoff_date == cutoff
+    quality = market_input.dataset_quality[metadata.symbol][CaptureDataset.DAILY_BAR]
+    assert quality.status is CaptureResultStatus.DEGRADED
+    assert quality.data_start == source_snapshot.data_start
+    assert quality.data_end == source_snapshot.data_end
+    assert quality.expected_rows == 250
+    assert quality.actual_rows == source_snapshot.row_count
+    assert quality.source == "local_history_snapshot"
+    daily_result = capture_results[CaptureDataset.DAILY_BAR]
+    assert daily_result.status is CaptureResultStatus.DEGRADED
+    assert daily_result.data_start == source_snapshot.data_start
+    assert daily_result.data_end == source_snapshot.data_end
+    assert daily_result.expected_rows == 250
+    assert daily_result.actual_rows == source_snapshot.row_count
+    assert daily_result.source == "local_history_snapshot"
+    assert daily_result.fetched_at == source_snapshot.fetched_at
+    assert run is not None
+    assert run.effective_trade_date == clock.value.date()
+    assert run.history_cutoff_date == cutoff
+    assert run.provider_calls == 2
+    assert source_snapshot.data_end < cutoff
+    assert snapshot_after == source_snapshot
+    assert members_after == original_members
+    assert [member.id for member in original_members] == source_member_ids
+    assert snapshot_count_after == snapshot_count
+
+
+def test_intraday_without_plan_materializes_verified_listing_history(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-local-listing-history.db")
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    listing_date = calendar.sessions_ending(cutoff, 20)[0]
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    metadata = InstrumentMetadata(
+        symbol="600000",
+        name="浦发银行",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.1,
+        listing_date=listing_date,
+        metadata_source="distinctive-intraday-listing-directory",
+        metadata_checked_at=clock.value,
+        rule_version="test-rules-v1",
+    )
+    with connect(settings) as connection:
+        migrate(connection)
+        instrument_repository = InstrumentRepository(connection)
+        instrument_repository.replace_catalog([metadata])
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol=metadata.symbol,
+                name=metadata.name,
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=listing_date,
+            ),
+            now=NOW,
+        )
+        CashAccountRepository(connection).initialize(50_000, now=NOW, note="initial")
+        for bar in TwentyDayDailyProvider(calendar).get_daily_bars(
+            metadata.symbol,
+            calendar.sessions_ending(cutoff, 250)[0],
+            cutoff,
+            "forward",
+        ):
+            DailyBarRepository(connection).save(bar)
+        loader = lambda symbols: {
+            symbol: loaded
+            for symbol in symbols
+            if (loaded := instrument_repository.get(symbol)) is not None
+        }
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=UnexpectedProvider(),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            instrument_metadata_loader=loader,
+            now=clock.now,
+        ).run_intraday()
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        history_id = market_input.history_snapshot_refs[metadata.symbol]
+        history = HistorySnapshotRepository(connection).get(history_id)
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+        daily_result = next(
+            item
+            for item in MarketCaptureResultRepository(connection).list_for_run(result.run_id)
+            if item.symbol == metadata.symbol and item.dataset is CaptureDataset.DAILY_BAR
+        )
+
+    assert history is not None
+    assert history.run_id == result.run_id
+    assert history.data_start == listing_date
+    assert history.data_end == cutoff
+    assert history.fetched_at == clock.value
+    assert history.completeness == "verified_listing_date"
+    assert history.listing_evidence is not None
+    assert history.listing_evidence.listing_date == listing_date
+    assert history.listing_evidence.source == metadata.metadata_source
+    assert history.is_usable(as_of=cutoff, expected_rows=250)
+    quality = market_input.dataset_quality[metadata.symbol][CaptureDataset.DAILY_BAR]
+    assert quality.status is CaptureResultStatus.DEGRADED
+    assert quality.actual_rows == 20
+    assert quality.source == "local_history_snapshot"
+    assert daily_result.status is CaptureResultStatus.DEGRADED
+    assert daily_result.actual_rows == 20
+    assert daily_result.source == "local_history_snapshot"
+    assert daily_result.fetched_at == history.fetched_at
+    assert market_input.effective_trade_date == clock.value.date()
+    assert market_input.history_cutoff_date == cutoff
+    assert run is not None
+    assert run.effective_trade_date == clock.value.date()
+    assert run.history_cutoff_date == cutoff
+    assert run.provider_calls == 2
+
+
+def test_intraday_without_plan_persists_failed_empty_history_reference(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-local-empty-history.db")
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=UnexpectedProvider(),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday()
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        history_id = market_input.history_snapshot_refs["600000"]
+        history = HistorySnapshotRepository(connection).get(history_id)
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+        daily_result = next(
+            item
+            for item in MarketCaptureResultRepository(connection).list_for_run(result.run_id)
+            if item.symbol == "600000" and item.dataset is CaptureDataset.DAILY_BAR
+        )
+
+    assert history is not None
+    assert history.row_count == 0
+    assert history.data_start is None
+    assert history.data_end is None
+    assert history.fetched_at == clock.value
+    assert history.status is CaptureResultStatus.DEGRADED
+    assert history.completeness == "unverifiable"
+    assert history.listing_evidence is None
+    assert not history.is_usable(as_of=cutoff, expected_rows=250)
+    quality = market_input.dataset_quality["600000"][CaptureDataset.DAILY_BAR]
+    assert quality.status is CaptureResultStatus.FAILED
+    assert quality.actual_rows == 0
+    assert quality.source == "local_history_snapshot"
+    assert quality.warning == history.warning
+    assert daily_result.status is CaptureResultStatus.FAILED
+    assert daily_result.expected_rows == 250
+    assert daily_result.actual_rows == 0
+    assert daily_result.source == "local_history_snapshot"
+    assert daily_result.warning == history.warning
+    assert daily_result.fetched_at == history.fetched_at
+    assert market_input.effective_trade_date == clock.value.date()
+    assert market_input.history_cutoff_date == cutoff
+    assert run is not None
+    assert run.effective_trade_date == clock.value.date()
+    assert run.history_cutoff_date == cutoff
+    assert run.provider_calls == 2
+
+
+@pytest.mark.parametrize(
+    (
+        "stored_effective_trade_date",
+        "stored_history_cutoff_date",
+        "expected_effective_trade_date",
+        "expected_history_cutoff_date",
+    ),
+    [
+        (None, None, date(2026, 7, 14), date(2026, 7, 13)),
+        (
+            date(2026, 7, 13),
+            date(2026, 7, 10),
+            date(2026, 7, 13),
+            date(2026, 7, 10),
+        ),
+    ],
+    ids=("fills_missing_provenance", "preserves_existing_provenance"),
+)
+def test_intraday_retry_persists_legacy_run_provenance(
+    tmp_path,
+    stored_effective_trade_date,
+    stored_history_cutoff_date,
+    expected_effective_trade_date,
+    expected_history_cutoff_date,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-legacy-retry.db")
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    period_start = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        MarketCaptureRunRepository(connection).get_or_create(
+            MarketCaptureRun(
+                run_id="intraday-20260714-1000",
+                workflow_type="intraday",
+                trade_date=date(2026, 7, 14),
+                effective_trade_date=stored_effective_trade_date,
+                history_cutoff_date=stored_history_cutoff_date,
+                period_start=period_start,
+                period_end=period_start + timedelta(minutes=3),
+                idempotency_key="intraday:2026-07-14:1000",
+                status=CaptureRunStatus.FAILED,
+                started_at=period_start - timedelta(minutes=1),
+                finished_at=period_start - timedelta(seconds=30),
+                failure_count=1,
+                error_summary="legacy failure",
+            )
+        )
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=UnexpectedProvider(),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday()
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+
+    assert run is not None
+    assert run.retry_count == 1
+    assert run.effective_trade_date == expected_effective_trade_date
+    assert run.history_cutoff_date == expected_history_cutoff_date
+    assert market_input is not None
+    assert market_input.effective_trade_date == expected_effective_trade_date
+    assert market_input.history_cutoff_date == expected_history_cutoff_date
+
+
+def test_intraday_active_plan_keeps_frozen_history_and_materializes_external_symbol(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-plan-mixed-history.db")
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    clock = MutableClock(NOW)
+    metadata = [
+        InstrumentMetadata(
+            symbol="600000",
+            name="浦发银行",
+            exchange=Exchange.SH,
+            instrument_type=InstrumentType.A_SHARE,
+            settlement_cycle=SettlementCycle.T1,
+            price_limit_ratio=0.10,
+            metadata_source="test-directory",
+            metadata_checked_at=NOW,
+            rule_version="test-rules-v1",
+        ),
+        InstrumentMetadata(
+            symbol="000001",
+            name="平安银行",
+            exchange=Exchange.SZ,
+            instrument_type=InstrumentType.A_SHARE,
+            settlement_cycle=SettlementCycle.T1,
+            price_limit_ratio=0.10,
+            metadata_source="test-directory",
+            metadata_checked_at=NOW,
+            rule_version="test-rules-v1",
+        ),
+    ]
+    with connect(settings) as connection:
+        migrate(connection)
+        instrument_repository = InstrumentRepository(connection)
+        instrument_repository.replace_catalog(metadata)
+        loader = lambda symbols: {
+            symbol: loaded
+            for symbol in symbols
+            if (loaded := instrument_repository.get(symbol)) is not None
+        }
+        seed_account(connection)
+        close = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=NoopIntradayProvider(),
+            instrument_metadata_loader=loader,
+            now=clock.now,
+        ).run_close(cutoff)
+        close_input = MarketInputSnapshotRepository(connection).get(
+            close.market_input_snapshot_id
+        )
+        assert close_input is not None
+        frozen_plan_history_id = close_input.history_snapshot_refs["600000"]
+        frozen_plan_history = HistorySnapshotRepository(connection).get(
+            frozen_plan_history_id
+        )
+        newer_plan_history_id, newer_plan_history, _ = save_suspended_provider_history(
+            connection,
+            calendar=calendar,
+            symbol="600000",
+            cutoff=cutoff,
+        )
+        assert newer_plan_history.is_usable(as_of=cutoff, expected_rows=250)
+        external_daily = CalendarDailyProvider(calendar)
+        for bar in external_daily.get_daily_bars(
+            "000001",
+            calendar.sessions_ending(cutoff, 250)[0],
+            cutoff,
+            "forward",
+        ):
+            DailyBarRepository(connection).save(bar)
+        WatchPinnedRepository(connection).upsert(
+            WatchPinnedInput(
+                symbol="000001",
+                name="平安银行",
+                rank=1,
+                plan_enabled=True,
+            ),
+            source=WatchPinnedSource.MANUAL,
+            now=clock.value,
+        )
+        snapshot_count_before = connection.execute(
+            "SELECT COUNT(*) FROM history_snapshots"
+        ).fetchone()[0]
+
+        clock.value = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=UnexpectedProvider(),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            instrument_metadata_loader=loader,
+            now=clock.now,
+        ).run_intraday()
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        assert market_input is not None
+        external_history_id = market_input.history_snapshot_refs.get("000001")
+        external_history = (
+            None
+            if external_history_id is None
+            else HistorySnapshotRepository(connection).get(external_history_id)
+        )
+        capture_results = MarketCaptureResultRepository(connection).list_for_run(
+            result.run_id
+        )
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+        snapshot_count_after = connection.execute(
+            "SELECT COUNT(*) FROM history_snapshots"
+        ).fetchone()[0]
+
+    assert newer_plan_history_id != frozen_plan_history_id
+    assert market_input.history_snapshot_refs["600000"] == frozen_plan_history_id
+    assert frozen_plan_history is not None
+    assert external_history_id is not None
+    assert external_history is not None
+    assert external_history_id not in {frozen_plan_history_id, newer_plan_history_id}
+    assert snapshot_count_after == snapshot_count_before + 1
+    frozen_quality = market_input.dataset_quality["600000"][CaptureDataset.DAILY_BAR]
+    assert frozen_quality.status is CaptureResultStatus.COMPLETE
+    assert frozen_quality.source == "frozen_plan_history_snapshot"
+    assert frozen_quality.data_start == frozen_plan_history.data_start
+    assert frozen_quality.data_end == frozen_plan_history.data_end
+    assert frozen_quality.expected_rows == 250
+    assert frozen_quality.actual_rows == frozen_plan_history.row_count == 250
+    external_quality = market_input.dataset_quality["000001"][CaptureDataset.DAILY_BAR]
+    assert external_quality.status is CaptureResultStatus.COMPLETE
+    assert external_quality.source == "local_history_snapshot"
+    assert external_quality.data_start == external_history.data_start
+    assert external_quality.data_end == external_history.data_end
+    assert external_quality.expected_rows == 250
+    assert external_quality.actual_rows == external_history.row_count == 250
+    daily_results = {
+        item.symbol: item
+        for item in capture_results
+        if item.dataset is CaptureDataset.DAILY_BAR
+    }
+    assert set(daily_results) == {"000001", "600000"}
+    assert daily_results["000001"].status is CaptureResultStatus.COMPLETE
+    assert daily_results["000001"].source == "local_history_snapshot"
+    assert daily_results["000001"].fetched_at == clock.value
+    assert daily_results["000001"].data_start == external_history.data_start
+    assert daily_results["000001"].data_end == external_history.data_end
+    assert daily_results["000001"].expected_rows == 250
+    assert daily_results["000001"].actual_rows == 250
+    assert daily_results["600000"].status is CaptureResultStatus.COMPLETE
+    assert daily_results["600000"].source == "frozen_plan_history_snapshot"
+    assert daily_results["600000"].expected_rows == 250
+    assert daily_results["600000"].actual_rows == 250
+    assert daily_results["600000"].data_start == frozen_plan_history.data_start
+    assert daily_results["600000"].data_end == frozen_plan_history.data_end
+    assert daily_results["600000"].fetched_at == frozen_plan_history.fetched_at
+    assert market_input.effective_trade_date == date(2026, 7, 14)
+    assert market_input.history_cutoff_date == cutoff
+    assert run is not None
+    assert run.effective_trade_date == date(2026, 7, 14)
+    assert run.history_cutoff_date == cutoff
+    assert run.provider_calls == 3
+
+
+@pytest.mark.parametrize(
+    "broken_reference",
+    ["missing", "dangling", "corrupt_members"],
+)
+def test_intraday_active_plan_does_not_replace_invalid_frozen_history(
+    tmp_path,
+    broken_reference,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-invalid-plan-history.db")
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    clock = MutableClock(NOW)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        close = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=NoopIntradayProvider(),
+            now=clock.now,
+        ).run_close(cutoff)
+        close_input_repository = MarketInputSnapshotRepository(connection)
+        close_input = close_input_repository.get(close.market_input_snapshot_id)
+        assert close_input is not None
+        frozen_history_id = close_input.history_snapshot_refs["600000"]
+        if broken_reference == "missing":
+            broken_input = close_input.model_copy(update={"history_snapshot_refs": {}})
+            connection.execute(
+                "UPDATE market_input_snapshots SET payload_json=? WHERE id=?",
+                (broken_input.model_dump_json(), close.market_input_snapshot_id),
+            )
+        elif broken_reference == "dangling":
+            broken_input = close_input.model_copy(
+                update={"history_snapshot_refs": {"600000": 999_999}}
+            )
+            connection.execute(
+                "UPDATE market_input_snapshots SET payload_json=? WHERE id=?",
+                (broken_input.model_dump_json(), close.market_input_snapshot_id),
+            )
+        else:
+            connection.execute(
+                "DELETE FROM history_snapshot_members "
+                "WHERE snapshot_id=? AND sequence=0",
+                (frozen_history_id,),
+            )
+        connection.commit()
+        if broken_reference == "corrupt_members":
+            with pytest.raises(
+                sqlite3.IntegrityError,
+                match="members do not match payload",
+            ):
+                HistorySnapshotRepository(connection).latest_usable_for_symbol(
+                    "600000",
+                    as_of=cutoff,
+                    expected_rows=250,
+                )
+        newer_history_id, newer_history, _ = save_suspended_provider_history(
+            connection,
+            calendar=calendar,
+            symbol="600000",
+            cutoff=cutoff,
+        )
+        assert newer_history.is_usable(as_of=cutoff, expected_rows=250)
+
+        clock.value = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=UnexpectedProvider(),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday()
+        market_input = close_input_repository.get(result.market_input_snapshot_id)
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+        daily_results = {
+            item.symbol: item
+            for item in MarketCaptureResultRepository(connection).list_for_run(
+                result.run_id
+            )
+            if item.dataset is CaptureDataset.DAILY_BAR
+        }
+
+    assert market_input is not None
+    assert "600000" not in market_input.history_snapshot_refs
+    assert newer_history_id not in market_input.history_snapshot_refs.values()
+    quality = market_input.dataset_quality["600000"][CaptureDataset.DAILY_BAR]
+    assert quality.status is CaptureResultStatus.FAILED
+    assert quality.source == "frozen_plan_history_snapshot"
+    assert "frozen plan history" in quality.warning
+    assert quality.data_start is None
+    assert quality.data_end is None
+    assert quality.expected_rows == 250
+    assert quality.actual_rows == 0
+    assert "600000" in daily_results
+    daily_result = daily_results["600000"]
+    assert daily_result.status is CaptureResultStatus.FAILED
+    assert daily_result.source == "frozen_plan_history_snapshot"
+    assert daily_result.warning == quality.warning
+    assert daily_result.data_start is None
+    assert daily_result.data_end is None
+    assert daily_result.expected_rows == 250
+    assert daily_result.actual_rows == 0
+    assert daily_result.fetched_at == clock.value
+    assert market_input.effective_trade_date == date(2026, 7, 14)
+    assert market_input.history_cutoff_date == cutoff
+    assert run is not None
+    assert run.effective_trade_date == date(2026, 7, 14)
+    assert run.history_cutoff_date == cutoff
+    assert run.provider_calls == 2
+
+
 class PartialAccountQuoteProvider(ClockQuoteProvider):
     def get_quotes(self, symbols):
         quotes = super().get_quotes(symbols)
@@ -1981,7 +2645,7 @@ def test_intraday_workflow_consumes_plan_and_is_idempotent_per_three_minute_cycl
     assert quote_reference["source"] == "fake"
     assert quote_reference["data_time"] == clock.value.isoformat()
     history_reference = recommendations[0].data_references["history"]
-    assert history_reference["source"] == "daily_provider"
+    assert history_reference["source"] == "frozen_plan_history_snapshot"
     assert history_reference["data_start"]
     assert history_reference["data_end"] == TRADE_DATE.isoformat()
     assert recommendations[0].data_references["money_flow"]["source"] == (

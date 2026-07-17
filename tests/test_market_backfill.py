@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -374,6 +374,64 @@ def test_backfill_uses_250_and_60_trading_day_baselines_then_five_day_correction
     assert second_daily.rows_written == 0
     assert second_flow.rows_received == 5
     assert second_flow.rows_written == 0
+
+
+def test_backfill_filters_off_session_fact_before_materializing_history(
+    connection,
+) -> None:
+    service, calendar, daily_provider, _flow_provider = make_service(connection)
+    as_of = date(2026, 7, 13)
+    desired = calendar.sessions_ending(as_of, service.DAILY_WINDOW)
+    daily = DailyBarRepository(connection)
+    for trade_day in desired:
+        daily.save(
+            DailyBar(
+                symbol="600000",
+                trade_date=trade_day,
+                open=10,
+                high=11,
+                low=9,
+                close=10,
+                volume=100,
+                amount=1_000,
+                source="fake",
+                fetched_at=FETCHED_AT,
+            )
+        )
+    off_session = desired[0]
+    while calendar.is_trading_day(off_session):
+        off_session += timedelta(days=1)
+    assert desired[0] < off_session < as_of
+    daily.save(
+        DailyBar(
+            symbol="600000",
+            trade_date=off_session,
+            open=10,
+            high=11,
+            low=9,
+            close=10,
+            volume=100,
+            amount=1_000,
+            source="synthetic-off-session",
+            fetched_at=FETCHED_AT,
+        )
+    )
+
+    result = service.backfill_daily("run-off-session", "600000", as_of)
+    member_dates = [
+        member.bar.trade_date
+        for member in HistorySnapshotRepository(connection).members(result.snapshot_id)
+    ]
+    last_five = calendar.sessions_ending(as_of, service.CORRECTION_WINDOW)
+
+    assert daily_provider.calls == [
+        ("600000", last_five[0], as_of, "forward")
+    ]
+    assert result.rows_written == 0
+    assert member_dates == desired
+    assert result.snapshot.row_count == service.DAILY_WINDOW
+    assert result.snapshot.status == "complete"
+    assert result.snapshot.is_usable(as_of=as_of, expected_rows=service.DAILY_WINDOW)
 
 
 def test_backfill_requests_old_gap_and_correction_as_separate_ranges(connection) -> None:

@@ -31,6 +31,41 @@ from quantitative_trading.market.repositories import (
 
 
 SnapshotT = TypeVar("SnapshotT", HistorySnapshot, MoneyFlowSnapshot)
+DAILY_HISTORY_WINDOW = 250
+
+
+def _current_daily_window(
+    repository: DailyBarRepository,
+    symbol: str,
+    desired: list[date],
+) -> list[StoredDailyBar]:
+    if not desired:
+        return []
+    desired_set = set(desired)
+    return [
+        stored
+        for stored in repository.current(
+            symbol,
+            since=desired[0],
+            through=desired[-1],
+        )
+        if stored.bar.trade_date in desired_set
+    ]
+
+
+def _listing_window_is_complete(
+    calendar: XSHGTradingCalendar,
+    current: list[StoredDailyBar],
+    *,
+    listing_evidence: ListingDateEvidence,
+    as_of: date,
+) -> bool:
+    expected = calendar.trading_days(
+        listing_evidence.listing_date,
+        as_of,
+    )
+    actual = [stored.bar.trade_date for stored in current]
+    return bool(expected) and actual == expected
 
 
 @dataclass(frozen=True)
@@ -46,8 +81,101 @@ class CreatedDatasetSnapshot(Generic[SnapshotT]):
         return self.snapshot.row_count
 
 
+@dataclass(frozen=True)
+class MaterializedHistorySnapshot:
+    snapshot_id: int
+    snapshot: HistorySnapshot
+
+
+class LocalHistoryMaterializer:
+    DAILY_WINDOW = DAILY_HISTORY_WINDOW
+
+    def __init__(
+        self,
+        *,
+        calendar: XSHGTradingCalendar,
+        daily_repository: DailyBarRepository,
+        history_snapshot_repository: HistorySnapshotRepository,
+    ) -> None:
+        if daily_repository.connection is not history_snapshot_repository.connection:
+            raise ValueError("history repositories must share the same connection")
+        self.calendar = calendar
+        self.daily_repository = daily_repository
+        self.history_snapshot_repository = history_snapshot_repository
+
+    def materialize(
+        self,
+        *,
+        run_id: str,
+        symbol: str,
+        cutoff: date,
+        fetched_at: datetime,
+        listing_evidence: ListingDateEvidence | None = None,
+        commit: bool = True,
+    ) -> MaterializedHistorySnapshot:
+        desired = self.calendar.sessions_ending(cutoff, self.DAILY_WINDOW)
+        current = _current_daily_window(self.daily_repository, symbol, desired)
+        complete = [stored.bar.trade_date for stored in current] == desired
+        verified_listing_evidence = (
+            listing_evidence
+            if listing_evidence is not None
+            and _listing_window_is_complete(
+                self.calendar,
+                current,
+                listing_evidence=listing_evidence,
+                as_of=cutoff,
+            )
+            else None
+        )
+        snapshot = HistorySnapshot(
+            run_id=run_id,
+            symbol=symbol,
+            data_start=None if not current else current[0].bar.trade_date,
+            data_end=None if not current else current[-1].bar.trade_date,
+            row_count=len(current),
+            content_digest=content_digest(
+                [stored.bar.content_hash for stored in current]
+            ),
+            status=(
+                CaptureResultStatus.COMPLETE
+                if complete
+                else CaptureResultStatus.DEGRADED
+            ),
+            warning=(
+                ""
+                if complete
+                else (
+                    f"local history has {len(current)} rows through "
+                    f"{cutoff.isoformat()}; verified from listing date "
+                    f"{verified_listing_evidence.listing_date.isoformat()}"
+                )
+                if verified_listing_evidence is not None
+                else (
+                    f"local history has {len(current)} rows through "
+                    f"{cutoff.isoformat()}; completeness is unverified"
+                )
+            ),
+            fetched_at=fetched_at,
+            completeness=(
+                HistoryCompleteness.VERIFIED_LISTING_DATE
+                if verified_listing_evidence is not None
+                else HistoryCompleteness.UNVERIFIABLE
+            ),
+            listing_evidence=verified_listing_evidence,
+        )
+        snapshot_id = self.history_snapshot_repository.save(
+            snapshot,
+            [stored.id for stored in current],
+            commit=commit,
+        )
+        return MaterializedHistorySnapshot(
+            snapshot_id=snapshot_id,
+            snapshot=snapshot,
+        )
+
+
 class HeavyDataBackfillService:
-    DAILY_WINDOW = 250
+    DAILY_WINDOW = DAILY_HISTORY_WINDOW
     MONEY_FLOW_WINDOW = 60
     CORRECTION_WINDOW = 5
 
@@ -83,8 +211,11 @@ class HeavyDataBackfillService:
         desired = self.calendar.sessions_ending(as_of, self.DAILY_WINDOW)
         existing = {
             stored.bar.trade_date: stored
-            for stored in self.daily_repository.current(symbol)
-            if stored.bar.trade_date in desired
+            for stored in _current_daily_window(
+                self.daily_repository,
+                symbol,
+                desired,
+            )
         }
         ranges = (
             [(desired[0], desired[-1])]
@@ -141,11 +272,11 @@ class HeavyDataBackfillService:
                     ).fetchone()
                     self.daily_repository.save(bar, commit=False)
                     rows_written += int(known is None)
-            current = [
-                stored
-                for stored in self.daily_repository.current(symbol, limit=self.DAILY_WINDOW)
-                if stored.bar.trade_date in desired
-            ]
+            current = _current_daily_window(
+                self.daily_repository,
+                symbol,
+                desired,
+            )
             fetched_at = self._fetched_at()
             complete = len(current) == len(desired)
             completeness = HistoryCompleteness.UNVERIFIABLE
@@ -155,7 +286,8 @@ class HeavyDataBackfillService:
                 and coverage_evidence.complete_request_window
             ):
                 completeness = HistoryCompleteness.VERIFIED_PROVIDER_WINDOW
-            elif listing_evidence is not None and self._listing_window_is_complete(
+            elif listing_evidence is not None and _listing_window_is_complete(
+                self.calendar,
                 current,
                 listing_evidence=listing_evidence,
                 as_of=as_of,
@@ -226,20 +358,6 @@ class HeavyDataBackfillService:
         earliest = None if not bars else min(bar.trade_date for bar in bars)
         if evidence.complete_request_window and evidence.earliest_available_date != earliest:
             raise ValueError("daily coverage earliest date does not match returned bars")
-
-    def _listing_window_is_complete(
-        self,
-        current: list[StoredDailyBar],
-        *,
-        listing_evidence: ListingDateEvidence,
-        as_of: date,
-    ) -> bool:
-        expected = self.calendar.trading_days(
-            listing_evidence.listing_date,
-            as_of,
-        )
-        actual = [stored.bar.trade_date for stored in current]
-        return bool(expected) and actual == expected
 
     @staticmethod
     def _short_history_warning(

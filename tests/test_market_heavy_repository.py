@@ -1,9 +1,10 @@
 import sqlite3
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
 import quantitative_trading.market.models as market_models
+import quantitative_trading.market.backfill as market_backfill
 
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
@@ -83,6 +84,24 @@ def money_flow(amount: float) -> DailyMoneyFlow:
     )
 
 
+def save_daily_window(
+    connection: sqlite3.Connection,
+    *,
+    calendar: XSHGTradingCalendar,
+    cutoff: date,
+    count: int,
+) -> tuple[list[date], list[int]]:
+    days = calendar.sessions_ending(cutoff, count)
+    repository = DailyBarRepository(connection)
+    ids = [
+        repository.save(
+            daily_bar(10 + index * 0.001, trade_date=trade_day)
+        )
+        for index, trade_day in enumerate(days)
+    ]
+    return days, ids
+
+
 def test_daily_and_money_flow_facts_append_corrections_and_select_latest(connection) -> None:
     daily = DailyBarRepository(connection)
     flows = MoneyFlowRepository(connection)
@@ -98,6 +117,444 @@ def test_daily_and_money_flow_facts_append_corrections_and_select_latest(connect
     assert daily.current("600000")[-1].bar.close == 10.6
     assert corrected_flow_id != first_flow_id
     assert flows.current("600000")[-1].flow.main_net_amount == 200
+
+
+def test_daily_current_applies_cutoff_before_limit_and_selects_corrections(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    days, _ = save_daily_window(
+        connection,
+        calendar=calendar,
+        cutoff=cutoff,
+        count=251,
+    )
+    repository = DailyBarRepository(connection)
+    corrected_id = repository.save(daily_bar(20, trade_date=cutoff))
+    repository.save(
+        daily_bar(21, trade_date=calendar.next_trading_day(cutoff))
+    )
+
+    current = repository.current("600000", limit=250, through=cutoff)
+
+    assert [item.bar.trade_date for item in current] == days[-250:]
+    assert current[-1].id == corrected_id
+    assert all(item.bar.trade_date <= cutoff for item in current)
+
+
+def test_local_history_materializer_freezes_latest_complete_fact_versions(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    days, original_ids = save_daily_window(
+        connection,
+        calendar=calendar,
+        cutoff=cutoff,
+        count=250,
+    )
+    daily = DailyBarRepository(connection)
+    correction_index = 125
+    corrected_id = daily.save(
+        daily_bar(20, trade_date=days[correction_index])
+    )
+    daily.save(daily_bar(21, trade_date=calendar.next_trading_day(cutoff)))
+    snapshots = HistorySnapshotRepository(connection)
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+    materializer = materializer_type(
+        calendar=calendar,
+        daily_repository=daily,
+        history_snapshot_repository=snapshots,
+    )
+    frozen_at = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
+
+    result = materializer.materialize(
+        run_id="intraday-local-history",
+        symbol="600000",
+        cutoff=cutoff,
+        fetched_at=frozen_at,
+    )
+    persisted = snapshots.get(result.snapshot_id)
+    members = snapshots.members(result.snapshot_id)
+    expected_ids = [*original_ids]
+    expected_ids[correction_index] = corrected_id
+
+    assert result.snapshot == persisted
+    assert result.snapshot.run_id == "intraday-local-history"
+    assert result.snapshot.fetched_at == frozen_at
+    assert result.snapshot.data_start == days[0]
+    assert result.snapshot.data_end == cutoff
+    assert result.snapshot.row_count == 250
+    assert result.snapshot.status is CaptureResultStatus.COMPLETE
+    assert result.snapshot.completeness == "unverifiable"
+    assert result.snapshot.coverage_evidence is None
+    assert result.snapshot.listing_evidence is None
+    assert result.snapshot.warning == ""
+    assert result.snapshot.is_usable(as_of=cutoff, expected_rows=250)
+    assert [member.id for member in members] == expected_ids
+    assert result.snapshot.content_digest == content_digest(
+        [member.bar.content_hash for member in members]
+    )
+
+
+def test_local_history_materialization_is_immutable_across_later_corrections(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    days, _ = save_daily_window(
+        connection,
+        calendar=calendar,
+        cutoff=cutoff,
+        count=250,
+    )
+    daily = DailyBarRepository(connection)
+    snapshots = HistorySnapshotRepository(connection)
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+    materializer = materializer_type(
+        calendar=calendar,
+        daily_repository=daily,
+        history_snapshot_repository=snapshots,
+    )
+    first = materializer.materialize(
+        run_id="intraday-local-history-v1",
+        symbol="600000",
+        cutoff=cutoff,
+        fetched_at=FETCHED_AT,
+    )
+    first_members = snapshots.members(first.snapshot_id)
+    corrected_id = daily.save(daily_bar(20, trade_date=days[-1]))
+
+    second = materializer.materialize(
+        run_id="intraday-local-history-v2",
+        symbol="600000",
+        cutoff=cutoff,
+        fetched_at=datetime(2026, 7, 13, 7, 2, tzinfo=UTC),
+    )
+
+    assert snapshots.members(first.snapshot_id) == first_members
+    assert snapshots.get(first.snapshot_id).content_digest == first.snapshot.content_digest
+    assert snapshots.members(second.snapshot_id)[-1].id == corrected_id
+    assert second.snapshot.content_digest != first.snapshot.content_digest
+
+
+def test_local_history_materializer_does_not_fill_window_gap_with_older_fact(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    days = calendar.sessions_ending(cutoff, 251)
+    desired = days[-250:]
+    omitted = desired[100]
+    daily = DailyBarRepository(connection)
+    for index, trade_day in enumerate(
+        [days[0], *(day for day in desired if day != omitted)]
+    ):
+        daily.save(daily_bar(10 + index * 0.001, trade_date=trade_day))
+    snapshots = HistorySnapshotRepository(connection)
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+    materializer = materializer_type(
+        calendar=calendar,
+        daily_repository=daily,
+        history_snapshot_repository=snapshots,
+    )
+
+    result = materializer.materialize(
+        run_id="intraday-local-history-gap",
+        symbol="600000",
+        cutoff=cutoff,
+        fetched_at=FETCHED_AT,
+    )
+    member_dates = [
+        member.bar.trade_date for member in snapshots.members(result.snapshot_id)
+    ]
+
+    assert member_dates == [day for day in desired if day != omitted]
+    assert result.snapshot.row_count == 249
+    assert result.snapshot.status is CaptureResultStatus.DEGRADED
+    assert result.snapshot.completeness == "unverifiable"
+    assert result.snapshot.coverage_evidence is None
+    assert result.snapshot.listing_evidence is None
+    assert not result.snapshot.is_usable(as_of=cutoff, expected_rows=250)
+
+
+def test_local_history_materializer_filters_off_session_fact_before_window_limit(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    desired, _ = save_daily_window(
+        connection,
+        calendar=calendar,
+        cutoff=cutoff,
+        count=250,
+    )
+    off_session = desired[0]
+    while calendar.is_trading_day(off_session):
+        off_session += timedelta(days=1)
+    assert desired[0] < off_session < cutoff
+    daily = DailyBarRepository(connection)
+    daily.save(daily_bar(20, trade_date=off_session))
+    snapshots = HistorySnapshotRepository(connection)
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+    materializer = materializer_type(
+        calendar=calendar,
+        daily_repository=daily,
+        history_snapshot_repository=snapshots,
+    )
+
+    result = materializer.materialize(
+        run_id="intraday-local-history-off-session",
+        symbol="600000",
+        cutoff=cutoff,
+        fetched_at=FETCHED_AT,
+    )
+    member_dates = [
+        member.bar.trade_date for member in snapshots.members(result.snapshot_id)
+    ]
+
+    assert member_dates == desired
+    assert result.snapshot.row_count == 250
+    assert result.snapshot.status is CaptureResultStatus.COMPLETE
+    assert result.snapshot.is_usable(as_of=cutoff, expected_rows=250)
+
+
+def test_local_history_materializer_verifies_contiguous_listing_window(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    days, _ = save_daily_window(
+        connection,
+        calendar=calendar,
+        cutoff=cutoff,
+        count=market_models.MIN_HISTORY_ROWS,
+    )
+    daily = DailyBarRepository(connection)
+    snapshots = HistorySnapshotRepository(connection)
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+    materializer = materializer_type(
+        calendar=calendar,
+        daily_repository=daily,
+        history_snapshot_repository=snapshots,
+    )
+    evidence = market_models.ListingDateEvidence(
+        listing_date=days[0],
+        source="distinctive-listing-directory",
+    )
+
+    result = materializer.materialize(
+        run_id="intraday-local-listing-history",
+        symbol="600000",
+        cutoff=cutoff,
+        fetched_at=FETCHED_AT,
+        listing_evidence=evidence,
+    )
+
+    assert result.snapshot.row_count == market_models.MIN_HISTORY_ROWS
+    assert result.snapshot.status is CaptureResultStatus.DEGRADED
+    assert result.snapshot.completeness == "verified_listing_date"
+    assert result.snapshot.listing_evidence == evidence
+    assert result.snapshot.coverage_evidence is None
+    assert result.snapshot.is_usable(as_of=cutoff, expected_rows=250)
+    assert snapshots.get(result.snapshot_id) == result.snapshot
+
+
+def test_local_history_materializer_rejects_listing_evidence_with_internal_gap(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    days = calendar.sessions_ending(cutoff, market_models.MIN_HISTORY_ROWS + 1)
+    omitted = days[10]
+    daily = DailyBarRepository(connection)
+    for index, trade_day in enumerate(day for day in days if day != omitted):
+        daily.save(daily_bar(10 + index * 0.001, trade_date=trade_day))
+    snapshots = HistorySnapshotRepository(connection)
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+    materializer = materializer_type(
+        calendar=calendar,
+        daily_repository=daily,
+        history_snapshot_repository=snapshots,
+    )
+
+    result = materializer.materialize(
+        run_id="intraday-local-listing-gap",
+        symbol="600000",
+        cutoff=cutoff,
+        fetched_at=FETCHED_AT,
+        listing_evidence=market_models.ListingDateEvidence(
+            listing_date=days[0],
+            source="distinctive-listing-directory",
+        ),
+    )
+
+    assert result.snapshot.row_count == market_models.MIN_HISTORY_ROWS
+    assert result.snapshot.completeness == "unverifiable"
+    assert result.snapshot.listing_evidence is None
+    assert result.snapshot.coverage_evidence is None
+    assert not result.snapshot.is_usable(as_of=cutoff, expected_rows=250)
+
+
+def test_local_history_materializer_preserves_verified_listing_below_strategy_minimum(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    days, _ = save_daily_window(
+        connection,
+        calendar=calendar,
+        cutoff=cutoff,
+        count=market_models.MIN_HISTORY_ROWS - 1,
+    )
+    daily = DailyBarRepository(connection)
+    snapshots = HistorySnapshotRepository(connection)
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+    materializer = materializer_type(
+        calendar=calendar,
+        daily_repository=daily,
+        history_snapshot_repository=snapshots,
+    )
+
+    evidence = market_models.ListingDateEvidence(
+        listing_date=days[0],
+        source="distinctive-listing-directory",
+    )
+    result = materializer.materialize(
+        run_id="intraday-local-listing-too-short",
+        symbol="600000",
+        cutoff=cutoff,
+        fetched_at=FETCHED_AT,
+        listing_evidence=evidence,
+    )
+
+    assert result.snapshot.row_count == market_models.MIN_HISTORY_ROWS - 1
+    assert result.snapshot.completeness == "verified_listing_date"
+    assert result.snapshot.listing_evidence == evidence
+    assert not result.snapshot.is_usable(as_of=cutoff, expected_rows=250)
+
+
+def test_local_history_materializer_does_not_attach_listing_evidence_to_empty_history(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    daily = DailyBarRepository(connection)
+    snapshots = HistorySnapshotRepository(connection)
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+    materializer = materializer_type(
+        calendar=calendar,
+        daily_repository=daily,
+        history_snapshot_repository=snapshots,
+    )
+
+    result = materializer.materialize(
+        run_id="intraday-local-listing-empty",
+        symbol="600000",
+        cutoff=cutoff,
+        fetched_at=FETCHED_AT,
+        listing_evidence=market_models.ListingDateEvidence(
+            listing_date=cutoff,
+            source="distinctive-listing-directory",
+        ),
+    )
+
+    assert result.snapshot.row_count == 0
+    assert result.snapshot.completeness == "unverifiable"
+    assert result.snapshot.listing_evidence is None
+    assert not result.snapshot.is_usable(as_of=cutoff, expected_rows=250)
+
+
+def test_local_history_materializer_persists_explicit_empty_snapshot(connection) -> None:
+    calendar = XSHGTradingCalendar()
+    daily = DailyBarRepository(connection)
+    snapshots = HistorySnapshotRepository(connection)
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+    materializer = materializer_type(
+        calendar=calendar,
+        daily_repository=daily,
+        history_snapshot_repository=snapshots,
+    )
+
+    result = materializer.materialize(
+        run_id="intraday-local-history-empty",
+        symbol="600000",
+        cutoff=date(2026, 7, 13),
+        fetched_at=FETCHED_AT,
+    )
+
+    assert snapshots.get(result.snapshot_id) == result.snapshot
+    assert snapshots.members(result.snapshot_id) == []
+    assert result.snapshot.row_count == 0
+    assert result.snapshot.content_digest == content_digest([])
+    assert result.snapshot.status is CaptureResultStatus.DEGRADED
+    assert result.snapshot.completeness == "unverifiable"
+    assert result.snapshot.coverage_evidence is None
+    assert result.snapshot.listing_evidence is None
+    assert not result.snapshot.is_usable(as_of=date(2026, 7, 13), expected_rows=250)
+
+
+def test_local_history_materialization_rolls_back_snapshot_on_member_failure(
+    connection,
+) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    save_daily_window(
+        connection,
+        calendar=calendar,
+        cutoff=cutoff,
+        count=250,
+    )
+    daily = DailyBarRepository(connection)
+    snapshots = HistorySnapshotRepository(connection)
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+    materializer = materializer_type(
+        calendar=calendar,
+        daily_repository=daily,
+        history_snapshot_repository=snapshots,
+    )
+    fact_count = connection.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0]
+    connection.execute(
+        """
+        CREATE TRIGGER reject_local_history_member
+        BEFORE INSERT ON history_snapshot_members
+        BEGIN
+          SELECT RAISE(ABORT, 'synthetic member failure');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="synthetic member failure"):
+        materializer.materialize(
+            run_id="intraday-local-history-failed",
+            symbol="600000",
+            cutoff=cutoff,
+            fetched_at=FETCHED_AT,
+        )
+
+    assert connection.execute("SELECT COUNT(*) FROM history_snapshots").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM history_snapshot_members").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM daily_bars").fetchone()[0] == fact_count
+
+
+def test_local_history_materializer_rejects_repository_connection_mismatch(
+    connection,
+) -> None:
+    other = sqlite3.connect(":memory:")
+    other.row_factory = sqlite3.Row
+    other.execute("PRAGMA foreign_keys = ON")
+    other.executescript(MARKET_DECISION_SCHEMA_SQL)
+    calendar = XSHGTradingCalendar()
+    materializer_type = getattr(market_backfill, "LocalHistoryMaterializer")
+
+    with pytest.raises(ValueError, match="same connection"):
+        materializer_type(
+            calendar=calendar,
+            daily_repository=DailyBarRepository(connection),
+            history_snapshot_repository=HistorySnapshotRepository(other),
+        )
+    other.close()
 
 
 def test_dataset_snapshot_members_remain_bound_to_original_fact_versions(connection) -> None:
@@ -167,6 +624,248 @@ def test_history_snapshot_repository_round_trips_coverage_evidence(connection) -
     snapshot_id = repository.save(snapshot, [daily_id])
 
     assert repository.get(snapshot_id) == snapshot
+
+
+def save_provider_history_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    cutoff: date,
+    row_count: int = market_models.MIN_HISTORY_ROWS,
+) -> tuple[int, HistorySnapshot, list[int]]:
+    calendar = XSHGTradingCalendar()
+    member_days = calendar.sessions_ending(cutoff, row_count + 1)[:row_count]
+    daily = DailyBarRepository(connection)
+    member_ids = [
+        daily.save(daily_bar(10 + index * 0.001, trade_date=trade_day))
+        for index, trade_day in enumerate(member_days)
+    ]
+    requested_start = calendar.sessions_ending(cutoff, 250)[0]
+    evidence = market_models.DailyBarCoverageEvidence(
+        requested_start=requested_start,
+        requested_end=cutoff,
+        observed_start=requested_start,
+        observed_end=cutoff,
+        earliest_available_date=member_days[0],
+        complete_request_window=True,
+        source="provider-full-window",
+    )
+    snapshot = HistorySnapshot(
+        run_id=run_id,
+        symbol="600000",
+        data_start=member_days[0],
+        data_end=member_days[-1],
+        row_count=row_count,
+        content_digest=content_digest(
+            [daily.get(member_id).bar.content_hash for member_id in member_ids]
+        ),
+        status=CaptureResultStatus.DEGRADED,
+        warning="verified provider window",
+        fetched_at=FETCHED_AT,
+        completeness="verified_provider_window",
+        coverage_evidence=evidence,
+    )
+    snapshot_id = HistorySnapshotRepository(connection).save(snapshot, member_ids)
+    return snapshot_id, snapshot, member_ids
+
+
+def test_history_repository_reuses_provider_snapshot_across_suspension_and_correction(
+    connection,
+) -> None:
+    cutoff = date(2026, 7, 13)
+    repository = HistorySnapshotRepository(connection)
+    snapshot_id, snapshot, member_ids = save_provider_history_snapshot(
+        connection,
+        run_id="provider-suspension",
+        cutoff=cutoff,
+    )
+    assert snapshot.data_end < cutoff
+    original_members = repository.members(snapshot_id)
+    DailyBarRepository(connection).save(
+        daily_bar(20, trade_date=original_members[5].bar.trade_date)
+    )
+    snapshot_count = connection.execute(
+        "SELECT COUNT(*) FROM history_snapshots"
+    ).fetchone()[0]
+
+    stored = repository.latest_usable_for_symbol(
+        "600000",
+        as_of=cutoff,
+        expected_rows=250,
+    )
+
+    assert stored is not None
+    assert stored.snapshot_id == snapshot_id
+    assert stored.snapshot == snapshot
+    assert repository.members(stored.snapshot_id) == original_members
+    assert [member.id for member in original_members] == member_ids
+    assert stored.snapshot.content_digest == snapshot.content_digest
+    assert stored.snapshot.coverage_evidence == snapshot.coverage_evidence
+    assert connection.execute("SELECT COUNT(*) FROM history_snapshots").fetchone()[0] == (
+        snapshot_count
+    )
+
+
+def test_history_repository_skips_newer_unusable_snapshots_stably(connection) -> None:
+    calendar = XSHGTradingCalendar()
+    cutoff = date(2026, 7, 13)
+    repository = HistorySnapshotRepository(connection)
+    usable_id, usable, member_ids = save_provider_history_snapshot(
+        connection,
+        run_id="provider-usable",
+        cutoff=cutoff,
+    )
+    repository.save(
+        usable.model_copy(
+            update={
+                "run_id": "newer-unverifiable",
+                "completeness": market_models.HistoryCompleteness.UNVERIFIABLE,
+                "coverage_evidence": None,
+            }
+        ),
+        member_ids,
+    )
+    prior_cutoff = calendar.previous_trading_day(cutoff)
+    save_provider_history_snapshot(
+        connection,
+        run_id="newer-wrong-cutoff",
+        cutoff=prior_cutoff,
+    )
+    save_provider_history_snapshot(
+        connection,
+        run_id="newer-below-minimum",
+        cutoff=cutoff,
+        row_count=market_models.MIN_HISTORY_ROWS - 1,
+    )
+
+    stored = repository.latest_usable_for_symbol(
+        "600000",
+        as_of=cutoff,
+        expected_rows=250,
+    )
+
+    assert stored is not None
+    assert stored.snapshot_id == usable_id
+    assert stored.snapshot == usable
+    assert (
+        repository.latest_usable_for_symbol(
+            "600000",
+            as_of=calendar.next_trading_day(cutoff),
+            expected_rows=250,
+        )
+        is None
+    )
+    assert (
+        repository.latest_usable_for_symbol(
+            "000001",
+            as_of=cutoff,
+            expected_rows=250,
+        )
+        is None
+    )
+
+
+def test_history_repository_exact_lookup_rejects_symbol_mismatch(connection) -> None:
+    cutoff = date(2026, 7, 13)
+    repository = HistorySnapshotRepository(connection)
+    snapshot_id, _snapshot, _member_ids = save_provider_history_snapshot(
+        connection,
+        run_id="provider-exact-symbol",
+        cutoff=cutoff,
+    )
+
+    assert (
+        repository.usable_by_id_for_symbol(
+            snapshot_id,
+            "000001",
+            as_of=cutoff,
+            expected_rows=250,
+        )
+        is None
+    )
+
+
+def test_history_repository_exact_lookup_does_not_replace_unusable_snapshot(
+    connection,
+) -> None:
+    cutoff = date(2026, 7, 13)
+    repository = HistorySnapshotRepository(connection)
+    usable_id, usable, member_ids = save_provider_history_snapshot(
+        connection,
+        run_id="provider-exact-usable",
+        cutoff=cutoff,
+    )
+    unusable_id = repository.save(
+        usable.model_copy(
+            update={
+                "run_id": "provider-exact-unusable",
+                "completeness": market_models.HistoryCompleteness.UNVERIFIABLE,
+                "coverage_evidence": None,
+            }
+        ),
+        member_ids,
+    )
+
+    assert (
+        repository.usable_by_id_for_symbol(
+            unusable_id,
+            "600000",
+            as_of=cutoff,
+            expected_rows=250,
+        )
+        is None
+    )
+    latest = repository.latest_usable_for_symbol(
+        "600000",
+        as_of=cutoff,
+        expected_rows=250,
+    )
+    assert latest is not None
+    assert latest.snapshot_id == usable_id
+
+
+def test_history_repository_rejects_corrupt_usable_snapshot_members(connection) -> None:
+    cutoff = date(2026, 7, 13)
+    repository = HistorySnapshotRepository(connection)
+    snapshot_id, _snapshot, _member_ids = save_provider_history_snapshot(
+        connection,
+        run_id="provider-corrupt",
+        cutoff=cutoff,
+    )
+    connection.execute(
+        "DELETE FROM history_snapshot_members WHERE snapshot_id=? AND sequence=5",
+        (snapshot_id,),
+    )
+    connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="history snapshot members"):
+        repository.latest_usable_for_symbol(
+            "600000",
+            as_of=cutoff,
+            expected_rows=250,
+        )
+
+
+def test_history_repository_rejects_corrupt_member_sequence(connection) -> None:
+    cutoff = date(2026, 7, 13)
+    repository = HistorySnapshotRepository(connection)
+    snapshot_id, _snapshot, _member_ids = save_provider_history_snapshot(
+        connection,
+        run_id="provider-corrupt-sequence",
+        cutoff=cutoff,
+    )
+    connection.execute(
+        "UPDATE history_snapshot_members SET sequence=sequence+100 WHERE snapshot_id=?",
+        (snapshot_id,),
+    )
+    connection.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="history snapshot member sequence"):
+        repository.latest_usable_for_symbol(
+            "600000",
+            as_of=cutoff,
+            expected_rows=250,
+        )
 
 
 def test_dataset_snapshot_rejects_forged_digest_range_and_member_order(connection) -> None:
@@ -507,6 +1206,9 @@ def test_market_decision_schema_is_idempotent_and_exposes_normalized_fact_column
     minute_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(minute_bars)")
     }
+    history_index_columns = connection.execute(
+        "PRAGMA index_xinfo(idx_history_snapshots_symbol_id)"
+    ).fetchall()
 
     assert {"open", "high", "low", "close", "volume", "amount"} <= daily_columns
     assert {
@@ -522,3 +1224,8 @@ def test_market_decision_schema_is_idempotent_and_exposes_normalized_fact_column
         "small_net_pct",
     } <= flow_columns
     assert {"open", "high", "low", "close", "volume", "amount"} <= minute_columns
+    assert [
+        (column["name"], column["desc"])
+        for column in history_index_columns
+        if column["key"] == 1
+    ] == [("symbol", 0), ("id", 1)]

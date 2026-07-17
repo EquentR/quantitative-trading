@@ -157,6 +157,10 @@
 
 `run_id`、`market_input_snapshot_id` 和 `plan_id` 将建议连接到实际执行轮次、固化的行情输入和活动计划。`data_references` 必须包含 `ledger`、`account`、`quote`、`history`、`money_flow`、`intraday` 和 `plan`；每项至少包含稳定 `status`，可用时附实际引用 ID、数据时间或覆盖区间、获取时间和来源，不可用时必须明确 `missing/failed/stale`，不能省略后让调用方猜测。ETF 的 `money_flow.status=not_applicable` 是额外的合法数据集状态，不表示失败、缺失或成功采集，也不能作为资金流确认。
 
+盘中 `history.source` 使用两种稳定值：活动计划内标的精确复用计划冻结的收盘历史时为 `frozen_plan_history_snapshot`，无活动计划或计划外采集的仅展示观察标的复用/物化本地历史时为 `local_history_snapshot`。冻结引用缺失、悬空、不可用或成员损坏时，`history` 不得引用其他快照；对应质量和 capture result 必须为 `failed`、空覆盖区间、`expected_rows=250`、`actual_rows=0`，获取时间为本轮检测时间。
+
+当前 decision intraday 的 run 与 `MarketInputSnapshot` 必须保存一致的 `effective_trade_date` 和 `history_cutoff_date`；正常盘中历史 cutoff 为前一 `XSHG` 交易日。legacy retry 只补齐缺失值并保留已有非空 provenance，调用方不得从 `fetched_at` 或自然日自行推导替代值。
+
 `data_quality` 保存总体质量、逐数据集状态、warnings 和实际生效的 stale/降级语义。总体质量仍只使用 `complete/degraded/failed/stale`；ETF 合法的资金流不适用本身不降低总体质量。`position_constraint` 保存建议仓位区间、建议数量以及经过现金、单票、总仓位、证券交易制度、手动可用数量和流动性裁决后真正生效的上限。所有这些字段由后端生成，前端不得补算。
 
 ## 4. 首版实现约束

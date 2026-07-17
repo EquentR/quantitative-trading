@@ -109,6 +109,8 @@ CREATE TABLE IF NOT EXISTS history_snapshots (
   fetched_at TEXT NOT NULL,
   payload_json TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_history_snapshots_symbol_id
+  ON history_snapshots(symbol ASC, id DESC);
 CREATE TABLE IF NOT EXISTS history_snapshot_members (
   snapshot_id INTEGER NOT NULL REFERENCES history_snapshots(id) ON DELETE RESTRICT,
   sequence INTEGER NOT NULL CHECK (sequence >= 0),

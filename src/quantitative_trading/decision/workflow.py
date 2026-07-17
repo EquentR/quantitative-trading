@@ -21,7 +21,11 @@ from quantitative_trading.market.adapters import (
     MarketProviderError,
     MoneyFlowProvider,
 )
-from quantitative_trading.market.backfill import HeavyDataBackfillService
+from quantitative_trading.market.backfill import (
+    DAILY_HISTORY_WINDOW,
+    HeavyDataBackfillService,
+    LocalHistoryMaterializer,
+)
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.cli_service import (
     MarketBackfillSummary,
@@ -915,6 +919,7 @@ class DecisionWorkflow:
         if not self.calendar.is_trading_day(trade_date):
             raise ValueError("intraday workflow requires an XSHG trading day")
         period_minute = local_now.minute - local_now.minute % 3
+        history_cutoff_date = self.calendar.previous_trading_day(trade_date)
         period_start = local_now.replace(minute=period_minute, second=0, microsecond=0)
         run_id = f"intraday-{trade_date:%Y%m%d}-{period_start:%H%M}"
         run_repository = MarketCaptureRunRepository(self.connection)
@@ -934,6 +939,8 @@ class DecisionWorkflow:
                     run_id=run_id,
                     workflow_type="intraday",
                     trade_date=trade_date,
+                    effective_trade_date=trade_date,
+                    history_cutoff_date=history_cutoff_date,
                     period_start=period_start,
                     period_end=period_start + timedelta(minutes=3),
                     idempotency_key=f"intraday:{trade_date.isoformat()}:{period_start:%H%M}",
@@ -1011,6 +1018,17 @@ class DecisionWorkflow:
                 stale_after=self.INTRADAY_LEASE,
                 retryable_statuses={CaptureRunStatus.FAILED},
             )
+            provenance_updates = {}
+            if run.effective_trade_date is None:
+                provenance_updates["effective_trade_date"] = trade_date
+            if run.history_cutoff_date is None:
+                provenance_updates["history_cutoff_date"] = history_cutoff_date
+            if provenance_updates:
+                run = run.model_copy(update=provenance_updates)
+                run_repository.update_claimed(
+                    run,
+                    claim_started_at=run.started_at,
+                )
 
         try:
             return self._run_intraday_claimed(
@@ -1140,6 +1158,7 @@ class DecisionWorkflow:
                 )
             )
 
+        daily_repository = DailyBarRepository(self.connection)
         close_input = (
             None
             if plan is None or plan.market_input_snapshot_id is None
@@ -1147,15 +1166,36 @@ class DecisionWorkflow:
                 plan.market_input_snapshot_id
             )
         )
-        history_refs = (
-            {}
-            if close_input is None
-            else {
-                symbol: snapshot_id
-                for symbol, snapshot_id in close_input.history_snapshot_refs.items()
-                if symbol in capture_symbols
-            }
+        history_cutoff = (
+            run.history_cutoff_date
+            or self.calendar.previous_trading_day(trade_date)
         )
+        if plan is None:
+            history_refs, history_warnings = self._local_history_references(
+                run_id=run_id,
+                symbols=capture_symbols,
+                cutoff=history_cutoff,
+                fetched_at=started_at,
+                instrument_metadata=metadata_by_symbol,
+                dataset_quality=dataset_quality,
+                result_repository=result_repository,
+                daily_repository=daily_repository,
+            )
+            warnings.extend(history_warnings)
+        else:
+            history_refs, history_warnings = self._active_plan_history_references(
+                run_id=run_id,
+                plan_symbols=plan_symbols,
+                capture_symbols=capture_symbols,
+                close_input=close_input,
+                cutoff=history_cutoff,
+                fetched_at=started_at,
+                instrument_metadata=metadata_by_symbol,
+                dataset_quality=dataset_quality,
+                result_repository=result_repository,
+                daily_repository=daily_repository,
+            )
+            warnings.extend(history_warnings)
         flow_refs = (
             {}
             if close_input is None
@@ -1167,13 +1207,15 @@ class DecisionWorkflow:
         )
         if close_input is not None:
             for symbol in capture_symbols:
-                for dataset in (CaptureDataset.DAILY_BAR, CaptureDataset.MONEY_FLOW):
-                    quality = close_input.dataset_quality.get(symbol, {}).get(dataset)
-                    if quality is not None:
-                        dataset_quality.setdefault(symbol, {})[dataset] = quality
+                quality = close_input.dataset_quality.get(symbol, {}).get(
+                    CaptureDataset.MONEY_FLOW
+                )
+                if quality is not None:
+                    dataset_quality.setdefault(symbol, {})[
+                        CaptureDataset.MONEY_FLOW
+                    ] = quality
 
         minute_repository = MinuteBarRepository(self.connection)
-        daily_repository = DailyBarRepository(self.connection)
         strength_repository = IntradayStrengthSnapshotRepository(self.connection)
         strength_refs: dict[str, int] = {}
         strength_by_symbol = {}
@@ -1390,6 +1432,8 @@ class DecisionWorkflow:
             },
             dataset_quality=dataset_quality,
             capture_run_id=run_id,
+            effective_trade_date=run.effective_trade_date,
+            history_cutoff_date=run.history_cutoff_date,
             thresholds={
                 "stale_trading_minutes": float(self.stale_trading_minutes),
             },
@@ -2371,6 +2415,189 @@ class DecisionWorkflow:
             if snapshot.capture_run_id == run_id:
                 return int(row["id"])
         raise KeyError(f"market input snapshot not found for run: {run_id}")
+
+    def _local_history_references(
+        self,
+        *,
+        run_id: str,
+        symbols: Sequence[str],
+        cutoff: date,
+        fetched_at: datetime,
+        instrument_metadata: dict[str, InstrumentMetadata],
+        dataset_quality: dict[str, dict[CaptureDataset, DatasetQuality]],
+        result_repository: MarketCaptureResultRepository,
+        daily_repository: DailyBarRepository,
+    ) -> tuple[dict[str, int], list[str]]:
+        snapshot_repository = HistorySnapshotRepository(self.connection)
+        materializer = LocalHistoryMaterializer(
+            calendar=self.calendar,
+            daily_repository=daily_repository,
+            history_snapshot_repository=snapshot_repository,
+        )
+        references: dict[str, int] = {}
+        warnings: list[str] = []
+        for symbol in symbols:
+            stored = snapshot_repository.latest_usable_for_symbol(
+                symbol,
+                as_of=cutoff,
+                expected_rows=DAILY_HISTORY_WINDOW,
+            )
+            if stored is None:
+                materialized = materializer.materialize(
+                    run_id=run_id,
+                    symbol=symbol,
+                    cutoff=cutoff,
+                    fetched_at=fetched_at,
+                    listing_evidence=listing_date_evidence_from_metadata(
+                        instrument_metadata.get(symbol)
+                    ),
+                )
+                snapshot_id = materialized.snapshot_id
+                snapshot = materialized.snapshot
+            else:
+                snapshot_id = stored.snapshot_id
+                snapshot = stored.snapshot
+            references[symbol] = snapshot_id
+            usable = snapshot.is_usable(
+                as_of=cutoff,
+                expected_rows=DAILY_HISTORY_WINDOW,
+            )
+            status = snapshot.status if usable else CaptureResultStatus.FAILED
+            quality = DatasetQuality(
+                status=status,
+                data_start=snapshot.data_start,
+                data_end=snapshot.data_end,
+                expected_rows=DAILY_HISTORY_WINDOW,
+                actual_rows=snapshot.row_count,
+                source="local_history_snapshot",
+                warning=snapshot.warning,
+            )
+            dataset_quality.setdefault(symbol, {})[CaptureDataset.DAILY_BAR] = quality
+            result_repository.upsert(
+                MarketCaptureResult(
+                    run_id=run_id,
+                    symbol=symbol,
+                    dataset=CaptureDataset.DAILY_BAR,
+                    status=status,
+                    data_start=snapshot.data_start,
+                    data_end=snapshot.data_end,
+                    fetched_at=snapshot.fetched_at,
+                    expected_rows=DAILY_HISTORY_WINDOW,
+                    actual_rows=snapshot.row_count,
+                    source="local_history_snapshot",
+                    warning=snapshot.warning,
+                )
+            )
+            if snapshot.warning:
+                warnings.append(f"{symbol} {snapshot.warning}")
+        return references, warnings
+
+    def _active_plan_history_references(
+        self,
+        *,
+        run_id: str,
+        plan_symbols: set[str],
+        capture_symbols: Sequence[str],
+        close_input: MarketInputSnapshot | None,
+        cutoff: date,
+        fetched_at: datetime,
+        instrument_metadata: dict[str, InstrumentMetadata],
+        dataset_quality: dict[str, dict[CaptureDataset, DatasetQuality]],
+        result_repository: MarketCaptureResultRepository,
+        daily_repository: DailyBarRepository,
+    ) -> tuple[dict[str, int], list[str]]:
+        snapshot_repository = HistorySnapshotRepository(self.connection)
+        references: dict[str, int] = {}
+        warnings: list[str] = []
+        for symbol in sorted(plan_symbols & set(capture_symbols)):
+            snapshot_id = (
+                None
+                if close_input is None
+                else close_input.history_snapshot_refs.get(symbol)
+            )
+            stored = None
+            if snapshot_id is not None:
+                try:
+                    stored = snapshot_repository.usable_by_id_for_symbol(
+                        snapshot_id,
+                        symbol,
+                        as_of=cutoff,
+                        expected_rows=DAILY_HISTORY_WINDOW,
+                    )
+                except sqlite3.IntegrityError:
+                    stored = None
+            if stored is None:
+                warning = "frozen plan history snapshot is missing or invalid"
+                quality = DatasetQuality(
+                    status=CaptureResultStatus.FAILED,
+                    expected_rows=DAILY_HISTORY_WINDOW,
+                    actual_rows=0,
+                    source="frozen_plan_history_snapshot",
+                    warning=warning,
+                )
+                dataset_quality.setdefault(symbol, {})[
+                    CaptureDataset.DAILY_BAR
+                ] = quality
+                result_repository.upsert(
+                    MarketCaptureResult(
+                        run_id=run_id,
+                        symbol=symbol,
+                        dataset=CaptureDataset.DAILY_BAR,
+                        status=CaptureResultStatus.FAILED,
+                        fetched_at=fetched_at,
+                        expected_rows=DAILY_HISTORY_WINDOW,
+                        actual_rows=0,
+                        source="frozen_plan_history_snapshot",
+                        warning=warning,
+                    )
+                )
+                warnings.append(f"{symbol} {warning}")
+                continue
+
+            snapshot = stored.snapshot
+            references[symbol] = stored.snapshot_id
+            quality = DatasetQuality(
+                status=snapshot.status,
+                data_start=snapshot.data_start,
+                data_end=snapshot.data_end,
+                expected_rows=DAILY_HISTORY_WINDOW,
+                actual_rows=snapshot.row_count,
+                source="frozen_plan_history_snapshot",
+                warning=snapshot.warning,
+            )
+            dataset_quality.setdefault(symbol, {})[CaptureDataset.DAILY_BAR] = quality
+            result_repository.upsert(
+                MarketCaptureResult(
+                    run_id=run_id,
+                    symbol=symbol,
+                    dataset=CaptureDataset.DAILY_BAR,
+                    status=snapshot.status,
+                    data_start=snapshot.data_start,
+                    data_end=snapshot.data_end,
+                    fetched_at=snapshot.fetched_at,
+                    expected_rows=DAILY_HISTORY_WINDOW,
+                    actual_rows=snapshot.row_count,
+                    source="frozen_plan_history_snapshot",
+                    warning=snapshot.warning,
+                )
+            )
+            if snapshot.warning:
+                warnings.append(f"{symbol} {snapshot.warning}")
+
+        external_symbols = sorted(set(capture_symbols) - plan_symbols)
+        external_references, external_warnings = self._local_history_references(
+            run_id=run_id,
+            symbols=external_symbols,
+            cutoff=cutoff,
+            fetched_at=fetched_at,
+            instrument_metadata=instrument_metadata,
+            dataset_quality=dataset_quality,
+            result_repository=result_repository,
+            daily_repository=daily_repository,
+        )
+        references.update(external_references)
+        warnings.extend(external_warnings)
+        return references, warnings
 
     def _load_instrument_metadata(
         self, symbols: Sequence[str]
