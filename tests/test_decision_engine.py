@@ -18,6 +18,7 @@ from quantitative_trading.instrument.models import (
     InstrumentType,
     SettlementCycle,
 )
+from tests.instrument_fixtures import etf_name_variant_metadata
 
 
 NOW = datetime(2026, 7, 9, 2, 30, tzinfo=UTC)
@@ -97,6 +98,13 @@ def decision_input(**overrides: object) -> DecisionSymbolInput:
         "intraday_strength": "strong",
         "money_flow_confirmed": True,
         "data_quality": "complete",
+        "quote_status": "complete",
+        "quote_usable": True,
+        "history_status": "complete",
+        "history_usable": True,
+        "intraday_status": "complete",
+        "intraday_usable": True,
+        "plan_status": "active",
         "trading_status": "normal",
         "limit_status": "none",
         "position_context": {"source": "manual_ledger", "quantity": 0},
@@ -207,6 +215,8 @@ def test_missing_quote_keeps_holding_in_conservative_management() -> None:
             is_holding=True,
             current_price=None,
             data_quality="failed",
+            quote_status="failed",
+            quote_usable=False,
             position_context={
                 "source": "manual_ledger",
                 "quantity": 1000,
@@ -225,9 +235,92 @@ def test_missing_quote_keeps_holding_in_conservative_management() -> None:
     assert "当前行情不可用，暂停价格触发型动作" in recommendation.reason
 
 
+@pytest.mark.parametrize(
+    ("quality_overrides", "expected_action", "expected_reason", "forbidden_reason"),
+    [
+        (
+            {
+                "data_quality": "failed",
+                "history_status": "failed",
+                "history_usable": False,
+            },
+            RecommendationAction.HOLD,
+            "history_unavailable",
+            "quote_unavailable",
+        ),
+        (
+            {
+                "data_quality": "stale",
+                "quote_status": "stale",
+                "quote_usable": False,
+            },
+            RecommendationAction.HOLD,
+            "quote_unavailable",
+            "stop_loss_break",
+        ),
+        (
+            {
+                "data_quality": "failed",
+                "quote_status": "failed",
+                "quote_usable": False,
+            },
+            RecommendationAction.HOLD,
+            "quote_unavailable",
+            "stop_loss_break",
+        ),
+        (
+            {},
+            RecommendationAction.SELL,
+            "stop_loss_break",
+            "quote_unavailable",
+        ),
+    ],
+)
+def test_holding_decision_uses_dataset_specific_quote_history_quality(
+    quality_overrides,
+    expected_action,
+    expected_reason,
+    forbidden_reason,
+) -> None:
+    recommendation = decide_symbol(
+        decision_input(
+            is_holding=True,
+            current_price=9.2,
+            position_context={
+                "source": "manual_ledger",
+                "quantity": 1000,
+                "available_quantity": 1000,
+                "market_value": 9200,
+            },
+            **quality_overrides,
+        ),
+        account_snapshot=account_snapshot(),
+        risk_config=RiskConfig(),
+        risk_context=RiskContext(),
+        recommendation_id=f"rec-quadrant-{expected_reason}",
+        created_at=NOW,
+    )
+
+    machine_reasons = recommendation.risk["machine_reason"]
+    assert recommendation.action is expected_action
+    assert expected_reason in machine_reasons
+    assert forbidden_reason not in machine_reasons
+    assert recommendation.data_quality["quote_status"] == (
+        quality_overrides.get("quote_status", "complete")
+    )
+    assert recommendation.data_quality["history_status"] == (
+        quality_overrides.get("history_status", "complete")
+    )
+
+
 def test_failed_required_data_avoids_non_holding_symbol() -> None:
     recommendation = decide_symbol(
-        decision_input(current_price=None, data_quality="failed"),
+        decision_input(
+            current_price=None,
+            data_quality="failed",
+            quote_status="failed",
+            quote_usable=False,
+        ),
         account_snapshot=account_snapshot(),
         risk_config=RiskConfig(),
         risk_context=RiskContext(),
@@ -404,3 +497,43 @@ def test_t0_available_quantity_gate_does_not_claim_t1() -> None:
     assert recommendation.action is RecommendationAction.HOLD
     assert all("T+1" not in note for note in recommendation.risk["notes"])
     assert recommendation.instrument == metadata
+
+
+def test_held_512480_with_usable_quote_and_missing_history_is_not_quote_unavailable(
+) -> None:
+    metadata = etf_name_variant_metadata(now=NOW)
+    recommendation = decide_symbol(
+        decision_input(
+            symbol=metadata.symbol,
+            name=metadata.name,
+            instrument=metadata,
+            is_holding=True,
+            current_price=1.23,
+            history_status="failed",
+            history_usable=False,
+            data_quality="failed",
+            plan_id=None,
+            plan_active=False,
+            plan_allows_entry=False,
+            plan_condition_met=False,
+            plan_status="missing",
+            position_context={
+                "source": "manual_ledger",
+                "quantity": 1000,
+                "available_quantity": 0,
+                "market_value": 1230,
+            },
+        ),
+        account_snapshot=account_snapshot(),
+        risk_config=RiskConfig(),
+        risk_context=RiskContext(instrument=metadata),
+        recommendation_id="rec-512480-history-missing",
+        created_at=NOW,
+    )
+
+    assert metadata.name == "半导体ETF国联安"
+    assert recommendation.name == "半导体ETF国联安"
+    assert recommendation.action is RecommendationAction.HOLD
+    assert "history_unavailable" in recommendation.risk["machine_reason"]
+    assert "quote_unavailable" not in recommendation.risk["machine_reason"]
+    assert all("当前行情不可用" not in reason for reason in recommendation.reason)

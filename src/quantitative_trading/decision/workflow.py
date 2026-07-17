@@ -83,7 +83,11 @@ from quantitative_trading.universe.models import (
 from quantitative_trading.universe.repository import UniverseSnapshotRepository
 from quantitative_trading.universe.service import build_universe
 from quantitative_trading.watchlist.repository import WatchPinnedRepository
-from quantitative_trading.instrument.models import InstrumentMetadata, InstrumentType
+from quantitative_trading.instrument.models import (
+    InstrumentMetadata,
+    InstrumentType,
+    SettlementCycle,
+)
 
 
 @dataclass(frozen=True)
@@ -1063,11 +1067,12 @@ class DecisionWorkflow:
         watchlist = WatchPinnedRepository(self.connection).list()
         plan_repository = TradingPlanRepository(self.connection)
         plan = plan_repository.active_for_day(trade_date)
+        plan_reference = plan or plan_repository.latest_for_day(trade_date)
         if plan is not None and started_at > plan.valid_until:
-            plan_repository.mark_expired(plan)
+            plan_reference = plan_repository.mark_expired(plan)
             plan = None
         elif plan is not None and self._plan_authority_context_changed(plan, positions):
-            plan_repository.mark_stale(
+            plan_reference = plan_repository.mark_stale(
                 plan,
                 warning="手动持仓台账或手动资金在计划生成后发生变化",
             )
@@ -1232,22 +1237,33 @@ class DecisionWorkflow:
                     and metadata.instrument_type is InstrumentType.UNKNOWN
                 ) and not (
                     metadata is not None
+                    and metadata.settlement_cycle is SettlementCycle.UNKNOWN
+                ) and not (
+                    metadata is not None
                     and metadata.instrument_type is InstrumentType.ETF
                     and self.etf_intraday_provider is None
                 )
                 if provider_configured:
                     provider_calls += 1
                 provider_started = perf_counter()
+                provider_failure_summary = ""
+                provider_failure_warning = ""
                 try:
-                    fetched_minute_bars = list(
-                        _RoutedIntradayProvider(
-                            metadata_by_symbol,
-                            a_share_provider=self.intraday_provider,
-                            etf_provider=self.etf_intraday_provider,
-                        ).get_minute_bars(
-                            symbol, trade_date, "1m"
+                    try:
+                        fetched_minute_bars = list(
+                            _RoutedIntradayProvider(
+                                metadata_by_symbol,
+                                a_share_provider=self.intraday_provider,
+                                etf_provider=self.etf_intraday_provider,
+                            ).get_minute_bars(
+                                symbol, trade_date, "1m"
+                            )
                         )
-                    )
+                    except MarketProviderError as exc:
+                        if not provider_configured:
+                            raise
+                        fetched_minute_bars = []
+                        provider_failure_summary = safe_error_summary(exc)
                 finally:
                     provider_duration_ms += (
                         perf_counter() - provider_started
@@ -1255,6 +1271,19 @@ class DecisionWorkflow:
                 rows_received += len(fetched_minute_bars)
                 rows_written += minute_repository.upsert_many(fetched_minute_bars)
                 minute_bars = minute_repository.for_trade_date(symbol, trade_date)
+                if provider_failure_summary and any(
+                    bar.minute > started_at for bar in minute_bars
+                ):
+                    raise ValueError(
+                        "same-day minute cache contains future minute data"
+                    )
+                if provider_failure_summary and not minute_bars:
+                    raise MarketProviderError(provider_failure_summary)
+                if provider_failure_summary:
+                    provider_failure_warning = (
+                        "minute provider_failure; reused same-day minute_cache: "
+                        f"{provider_failure_summary}"
+                    )
                 daily_bars = daily_repository.current(symbol, limit=2)
                 previous_daily = (
                     None
@@ -1282,9 +1311,28 @@ class DecisionWorkflow:
                         "thresholds": {
                             **strength.thresholds,
                             "stale_minutes": float(self.stale_trading_minutes),
-                        }
+                        },
+                        **(
+                            {
+                                "degraded": True,
+                                "degradation_reasons": _stable_unique(
+                                    [
+                                        *strength.degradation_reasons,
+                                        provider_failure_warning,
+                                    ]
+                                ),
+                                "source": (
+                                    "minute_cache_after_provider_failure:"
+                                    f"{strength.source}"
+                                ),
+                            }
+                            if provider_failure_warning
+                            else {}
+                        ),
                     }
                 )
+                if provider_failure_warning:
+                    warnings.append(f"{symbol} {provider_failure_warning}")
                 minute_stale = bool(
                     minute_bars
                     and _trading_minute_lag(
@@ -1362,6 +1410,8 @@ class DecisionWorkflow:
             minute_status = (
                 CaptureResultStatus.STALE
                 if minute_stale
+                else CaptureResultStatus.DEGRADED
+                if provider_failure_warning
                 else CaptureResultStatus.COMPLETE
                 if minute_bars
                 else CaptureResultStatus.FAILED
@@ -1370,7 +1420,7 @@ class DecisionWorkflow:
                 CaptureResultStatus.STALE
                 if minute_stale
                 else CaptureResultStatus.DEGRADED
-                if strength.degraded
+                if provider_failure_warning or strength.degraded
                 else CaptureResultStatus.COMPLETE
             )
             dataset_quality.setdefault(symbol, {})[CaptureDataset.MINUTE_BAR] = (
@@ -1380,6 +1430,7 @@ class DecisionWorkflow:
                     expected_rows=self.calendar.expected_minutes_through(started_at),
                     actual_rows=len(minute_bars),
                     source=strength.source,
+                    warning="; ".join(strength.degradation_reasons),
                 )
             )
             dataset_quality[symbol][CaptureDataset.INTRADAY_STRENGTH] = DatasetQuality(
@@ -1387,12 +1438,22 @@ class DecisionWorkflow:
                 data_time=strength.data_time,
                 expected_rows=1,
                 actual_rows=1,
-                source=strength.rule_version,
+                source=f"{strength.rule_version}:{strength.source}",
                 warning="; ".join(strength.degradation_reasons),
             )
-            for dataset, status, actual in (
-                (CaptureDataset.MINUTE_BAR, minute_status, len(minute_bars)),
-                (CaptureDataset.INTRADAY_STRENGTH, strength_status, 1),
+            for dataset, status, actual, source in (
+                (
+                    CaptureDataset.MINUTE_BAR,
+                    minute_status,
+                    len(minute_bars),
+                    strength.source,
+                ),
+                (
+                    CaptureDataset.INTRADAY_STRENGTH,
+                    strength_status,
+                    1,
+                    f"{strength.rule_version}:{strength.source}",
+                ),
             ):
                 result_repository.upsert(
                     MarketCaptureResult(
@@ -1408,7 +1469,7 @@ class DecisionWorkflow:
                             else 1
                         ),
                         actual_rows=actual,
-                        source=strength.source,
+                        source=source,
                         warning="; ".join(strength.degradation_reasons),
                     )
                 )
@@ -1610,6 +1671,41 @@ class DecisionWorkflow:
             else:
                 overall_quality = "complete"
 
+            quote_quality = quality_values.get(CaptureDataset.QUOTE)
+            quote_status = (
+                "missing" if quote_quality is None else quote_quality.status.value
+            )
+            quote_usable = (
+                quote_status in {"complete", "degraded"}
+                and verified_price is not None
+            )
+            history_quality = quality_values.get(CaptureDataset.DAILY_BAR)
+            history_status = (
+                "missing" if history_quality is None else history_quality.status.value
+            )
+            history_usable = (
+                history_status in {"complete", "degraded"}
+                and symbol in history_refs
+            )
+            intraday_quality = quality_values.get(
+                CaptureDataset.INTRADAY_STRENGTH
+            )
+            intraday_status = (
+                "missing"
+                if intraday_quality is None
+                else intraday_quality.status.value
+            )
+            intraday_usable = (
+                intraday_status == "complete"
+                and strength is not None
+                and not strength.degraded
+            )
+            plan_status = (
+                "missing"
+                if plan_reference is None
+                else plan_reference.status.value
+            )
+
             levels = {} if plan is None else plan.key_levels.get(symbol, {})
             position_context: dict[str, Any]
             if position is None:
@@ -1630,7 +1726,10 @@ class DecisionWorkflow:
             data_references = self._decision_references(
                 symbol,
                 market_input,
-                plan_id=None if plan is None else plan.plan_id,
+                plan_id=(
+                    None if plan_reference is None else plan_reference.plan_id
+                ),
+                plan_status=plan_status,
                 account_snapshot_id=account_created.snapshot_id,
                 account_status=(
                     "complete"
@@ -1664,7 +1763,9 @@ class DecisionWorkflow:
                     if plan_context is None
                     else _number(plan_context.trend.get("ma5"))
                 ),
-                plan_id=None if plan is None else plan.plan_id,
+                plan_id=(
+                    None if plan_reference is None else plan_reference.plan_id
+                ),
                 plan_active=plan is not None,
                 plan_allows_entry=plan_allows_entry,
                 plan_condition_met=(
@@ -1672,15 +1773,25 @@ class DecisionWorkflow:
                     if condition_evaluation is None
                     else condition_evaluation.matched
                 ),
-                daily_structure_confirmed=_daily_structure_confirmed(
-                    plan_context,
-                    verified_price,
+                daily_structure_confirmed=(
+                    history_usable
+                    and _daily_structure_confirmed(
+                        plan_context,
+                        verified_price,
+                    )
                 ),
                 intraday_strength=(
                     "neutral" if strength is None else strength.label.value
                 ),
                 money_flow_confirmed=money_flow_confirmed,
                 data_quality=overall_quality,
+                quote_status=quote_status,
+                quote_usable=quote_usable,
+                history_status=history_status,
+                history_usable=history_usable,
+                intraday_status=intraday_status,
+                intraday_usable=intraday_usable,
+                plan_status=plan_status,
                 trading_status=quote.trading_status.value,
                 limit_status=quote.limit_status.value,
                 position_context=position_context,
@@ -1710,8 +1821,8 @@ class DecisionWorkflow:
                 data_time=decision_data_time,
                 fetched_at=market_input.fetched_at,
                 valid_until=(
-                    plan.valid_until
-                    if plan is not None
+                    plan_reference.valid_until
+                    if plan_reference is not None
                     else datetime.combine(
                         trade_date,
                         time(15, 0),
@@ -1767,7 +1878,9 @@ class DecisionWorkflow:
                 recommendation,
                 trade_date=trade_date,
                 period_start=run.period_start or started_at,
-                plan_version=None if plan is None else plan.version,
+                plan_version=(
+                    None if plan_reference is None else plan_reference.version
+                ),
             )
             recommendations.append(recommendation)
             if recommendation.action in {
@@ -1817,7 +1930,11 @@ class DecisionWorkflow:
                 local_dispatches = [
                     transactional_dispatcher.persist_local_recommendation(
                         recommendation,
-                        plan_version=None if plan is None else plan.version,
+                        plan_version=(
+                            None
+                            if plan_reference is None
+                            else plan_reference.version
+                        ),
                         now=started_at,
                         commit=False,
                     )
@@ -1839,7 +1956,11 @@ class DecisionWorkflow:
                 dispatch = transactional_dispatcher.project_recommendation(
                     recommendation,
                     local,
-                    plan_version=None if plan is None else plan.version,
+                    plan_version=(
+                        None
+                        if plan_reference is None
+                        else plan_reference.version
+                    ),
                     now=started_at,
                 )
                 notification_count += int(bool(getattr(dispatch, "created", False)))
@@ -1856,7 +1977,11 @@ class DecisionWorkflow:
             for recommendation in recommendations:
                 dispatch = self.notification_dispatcher.dispatch_recommendation(
                     recommendation,
-                    plan_version=None if plan is None else plan.version,
+                    plan_version=(
+                        None
+                        if plan_reference is None
+                        else plan_reference.version
+                    ),
                     now=started_at,
                 )
                 if dispatch is not None:
@@ -2297,6 +2422,7 @@ class DecisionWorkflow:
                             "condition_fingerprint": (
                                 recommendation.condition_fingerprint
                             ),
+                            "data_quality": recommendation.data_quality,
                         },
                         created_at=created_at,
                     ),
@@ -2323,6 +2449,7 @@ class DecisionWorkflow:
         snapshot: MarketInputSnapshot,
         *,
         plan_id: str | None,
+        plan_status: str,
         account_snapshot_id: int,
         account_status: str,
         account_warnings: list[str],
@@ -2404,7 +2531,7 @@ class DecisionWorkflow:
             ),
             "plan": {
                 "plan_id": plan_id,
-                "status": "missing" if plan_id is None else "active",
+                "status": plan_status,
             },
         }
 
@@ -2680,6 +2807,8 @@ class _RoutedIntradayProvider:
         instrument = self.metadata.get(symbol)
         if instrument is not None and instrument.instrument_type is InstrumentType.UNKNOWN:
             raise MarketProviderError("instrument type is unknown")
+        if instrument is not None and instrument.settlement_cycle is SettlementCycle.UNKNOWN:
+            raise MarketProviderError("instrument settlement cycle is unknown")
         provider = (
             self.etf_provider
             if instrument is not None and instrument.instrument_type is InstrumentType.ETF

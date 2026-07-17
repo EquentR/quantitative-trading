@@ -141,13 +141,13 @@
 
 **步骤：**
 
-- [ ] Cycle 5A：RED/GREEN provider 获取异常 + 同 symbol/同日缓存计算 strength，至少 degraded；lag 超阈值 stale；received/written=0、actual rows/source/warning 正确。
-- [ ] Cycle 5B：RED/GREEN 无同日缓存 failed，跨日/跨 symbol 不复用；缓存校验/计算异常不被 provider catch 吞掉。
-- [ ] Cycle 5C：逐一 RED/GREEN quote usable/history missing、stale quote/history good、failed quote/history good、两者可用四象限，并验证独立 machine reason。
-- [ ] Cycle 5D：RED/GREEN cached degraded/stale strength 不能确认 buy/add；只保留当前已实现且不依赖 history 的硬风险，不新增机械成本止损。`512480` quote usable/history missing/available_quantity=0 保持 HOLD，理由不得是 quote unavailable。
-- [ ] 同步 trading/recommendation 文档并运行 docs tests。
-- [ ] VERIFY：运行 workflow/decision/strategy 定向测试。
-- [ ] REVIEW：后台 agent 核对不跨日、不提升 quote、overall 不再错误阻断所有价格动作。
+- [x] Cycle 5A：RED/GREEN provider 获取异常 + 同 symbol/同日缓存计算 strength，至少 degraded；lag 超阈值 stale；received/written=0、actual rows/source/warning 正确。
+- [x] Cycle 5B：RED/GREEN 无同日缓存 failed，跨日/跨 symbol 不复用；缓存校验/计算异常不被 provider catch 吞掉。
+- [x] Cycle 5C：逐一 RED/GREEN quote usable/history missing、stale quote/history good、failed quote/history good、两者可用四象限，并验证独立 machine reason。
+- [x] Cycle 5D：RED/GREEN cached degraded/stale strength 不能确认 buy/add；只保留当前已实现且不依赖 history 的硬风险，不新增机械成本止损。`512480` quote usable/history missing/available_quantity=0 保持 HOLD，理由不得是 quote unavailable。
+- [x] 同步 trading/recommendation 文档并运行 docs tests。
+- [x] VERIFY：运行 workflow/decision/strategy 定向测试。
+- [x] REVIEW：后台 agent 核对不跨日、不提升 quote、overall 不再错误阻断所有价格动作。
 
 ## Task 6：显式 display-only 工作流与 API/CLI
 

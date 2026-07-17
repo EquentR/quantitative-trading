@@ -90,6 +90,13 @@ def decide_symbol(
             "overall": decision_input.data_quality,
             "warnings": decision_input.warnings,
             "data_time_source": decision_input.data_time_source,
+            "quote_status": decision_input.quote_status,
+            "quote_usable": decision_input.quote_usable,
+            "history_status": decision_input.history_status,
+            "history_usable": decision_input.history_usable,
+            "intraday_status": decision_input.intraday_status,
+            "intraday_usable": decision_input.intraday_usable,
+            "plan_status": decision_input.plan_status,
         },
         position_constraint=position_constraint,
     )
@@ -115,29 +122,28 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
             human_reason="标的停牌或明确不可交易",
         )
 
-    if decision_input.current_price is None or decision_input.data_quality == "failed":
-        if decision_input.is_holding:
-            return _conservative_signal(
-                decision_input,
-                action=StrategyAction.HOLD,
-                machine_reason="quote_unavailable_holding_management",
-                human_reason="当前行情不可用，暂停价格触发型动作",
-            )
-        return planned_entry_signal(
-            symbol=decision_input.symbol,
-            has_position=False,
-            plan_active=decision_input.plan_active,
-            plan_allows_entry=decision_input.plan_allows_entry,
-            plan_condition_met=decision_input.plan_condition_met,
-            daily_structure_confirmed=decision_input.daily_structure_confirmed,
-            intraday_strength=decision_input.intraday_strength,
-            money_flow_confirmed=decision_input.money_flow_confirmed,
-            money_flow_applicable=not (
-                decision_input.instrument is not None
-                and decision_input.instrument.instrument_type is InstrumentType.ETF
+    if not decision_input.quote_usable:
+        return _conservative_signal(
+            decision_input,
+            action=(
+                StrategyAction.HOLD
+                if decision_input.is_holding
+                else StrategyAction.AVOID
             ),
-            data_quality="failed",
-            invalid_if=decision_input.invalid_if,
+            machine_reason="quote_unavailable",
+            human_reason="当前行情不可用，暂停价格触发型动作",
+        )
+
+    if not decision_input.history_usable:
+        return _conservative_signal(
+            decision_input,
+            action=(
+                StrategyAction.HOLD
+                if decision_input.is_holding
+                else StrategyAction.WATCH
+            ),
+            machine_reason="history_unavailable",
+            human_reason="日线历史不可用，暂停依赖日线结构的动作",
         )
 
     if decision_input.is_holding:
@@ -183,11 +189,23 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
                 human_reason="标的处于涨跌停状态，禁止新增买入或加仓",
             )
 
-        if (
+        entry_context_ready = (
             decision_input.plan_active
             and decision_input.plan_allows_entry
             and decision_input.plan_condition_met
             and decision_input.daily_structure_confirmed
+        )
+        if entry_context_ready and not decision_input.intraday_usable:
+            return _conservative_signal(
+                decision_input,
+                action=StrategyAction.HOLD,
+                machine_reason="intraday_data_unusable",
+                human_reason="分时数据仅可展示，不能作为加仓确认",
+            )
+
+        if (
+            entry_context_ready
+            and decision_input.intraday_usable
             and decision_input.intraday_strength == "strong"
             and decision_input.trading_status == "normal"
             and decision_input.limit_status == "none"
@@ -199,7 +217,11 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
                 plan_allows_entry=True,
                 plan_condition_met=True,
                 daily_structure_confirmed=True,
-                intraday_strength=decision_input.intraday_strength,
+                intraday_strength=(
+                    decision_input.intraday_strength
+                    if decision_input.intraday_usable
+                    else "neutral"
+                ),
                 money_flow_confirmed=decision_input.money_flow_confirmed,
                 money_flow_applicable=not (
                     decision_input.instrument is not None
@@ -207,6 +229,9 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
                 ),
                 data_quality=decision_input.data_quality,
                 invalid_if=decision_input.invalid_if,
+                quote_usable=decision_input.quote_usable,
+                history_usable=decision_input.history_usable,
+                intraday_usable=decision_input.intraday_usable,
             )
 
         return _conservative_signal(
@@ -242,7 +267,11 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
         plan_allows_entry=decision_input.plan_allows_entry,
         plan_condition_met=decision_input.plan_condition_met,
         daily_structure_confirmed=decision_input.daily_structure_confirmed,
-        intraday_strength=decision_input.intraday_strength,
+        intraday_strength=(
+            decision_input.intraday_strength
+            if decision_input.intraday_usable
+            else "neutral"
+        ),
         money_flow_confirmed=decision_input.money_flow_confirmed,
         money_flow_applicable=not (
             decision_input.instrument is not None
@@ -250,6 +279,9 @@ def _strategy_signal(decision_input: DecisionSymbolInput) -> StrategySignal:
         ),
         data_quality=decision_input.data_quality,
         invalid_if=decision_input.invalid_if,
+        quote_usable=decision_input.quote_usable,
+        history_usable=decision_input.history_usable,
+        intraday_usable=decision_input.intraday_usable,
     )
 
 

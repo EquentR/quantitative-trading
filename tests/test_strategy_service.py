@@ -193,7 +193,31 @@ def test_planned_entry_signal_downgrades_unconfirmed_opportunity_to_watch(
     assert reason in signal.machine_reason
 
 
-def test_planned_entry_signal_avoids_symbol_with_failed_required_data() -> None:
+@pytest.mark.parametrize("data_quality", ["degraded", "stale", "failed"])
+def test_planned_entry_signal_rejects_unusable_cached_intraday_confirmation(
+    data_quality,
+) -> None:
+    signal = planned_entry_signal(
+        symbol="512480",
+        has_position=False,
+        plan_active=True,
+        plan_allows_entry=True,
+        plan_condition_met=True,
+        daily_structure_confirmed=True,
+        intraday_strength="strong",
+        intraday_usable=False,
+        money_flow_confirmed=None,
+        money_flow_applicable=False,
+        data_quality=data_quality,
+        invalid_if=["跌破计划支撑位"],
+    )
+
+    assert signal.action is StrategyAction.WATCH
+    assert "intraday_data_unusable" in signal.machine_reason
+    assert "intraday_strength_confirmed" not in signal.machine_reason
+
+
+def test_planned_entry_signal_avoids_symbol_with_unusable_quote() -> None:
     signal = planned_entry_signal(
         symbol="600000",
         has_position=False,
@@ -205,7 +229,8 @@ def test_planned_entry_signal_avoids_symbol_with_failed_required_data() -> None:
         money_flow_confirmed=True,
         data_quality="failed",
         invalid_if=["数据恢复前不参与"],
+        quote_usable=False,
     )
 
     assert signal.action is StrategyAction.AVOID
-    assert "required_market_data_failed" in signal.machine_reason
+    assert "quote_unavailable" in signal.machine_reason

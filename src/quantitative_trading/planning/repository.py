@@ -118,6 +118,21 @@ class TradingPlanRepository:
             return None
         return TradingPlan.model_validate_json(row["payload_json"])
 
+    def latest_for_day(self, trading_day: date) -> TradingPlan | None:
+        row = self.connection.execute(
+            """
+            SELECT payload_json
+            FROM trading_plans
+            WHERE trading_day = ?
+            ORDER BY generated_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (trading_day.isoformat(),),
+        ).fetchone()
+        if row is None:
+            return None
+        return TradingPlan.model_validate_json(row["payload_json"])
+
     def mark_stale(self, plan: TradingPlan, *, warning: str) -> TradingPlan:
         if plan.status is not TradingPlanStatus.ACTIVE:
             return plan

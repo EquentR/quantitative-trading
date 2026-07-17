@@ -1890,7 +1890,6 @@ def test_close_accepts_legacy_short_history_with_verified_listing_date(tmp_path)
             for symbol in symbols
             if (loaded := instrument_repository.get(symbol)) is not None
         }
-
         result = DecisionWorkflow(
             connection,
             calendar=calendar,
@@ -1960,7 +1959,6 @@ def test_close_listing_evidence_does_not_hide_internal_history_gap(tmp_path) -> 
             for symbol in symbols
             if (loaded := instrument_repository.get(symbol)) is not None
         }
-
         result = DecisionWorkflow(
             connection,
             calendar=calendar,
@@ -3112,6 +3110,110 @@ def test_intraday_workflow_routes_etf_metadata_into_recommendation(tmp_path) -> 
     assert market_input.instrument_metadata["512480"] == metadata
 
 
+@pytest.mark.parametrize("policy_failure", ["provider_missing", "settlement_unknown"])
+def test_intraday_etf_policy_failure_does_not_reuse_minute_cache(
+    tmp_path,
+    policy_failure,
+) -> None:
+    settings = Settings(
+        database_path=tmp_path / f"intraday-etf-policy-{policy_failure}.db"
+    )
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    metadata = etf_name_variant_metadata(
+        now=clock.value,
+        trade_date=date(2026, 7, 13),
+    )
+    if policy_failure == "settlement_unknown":
+        metadata = metadata.model_copy(
+            update={"settlement_cycle": SettlementCycle.UNKNOWN}
+        )
+    with connect(settings) as connection:
+        migrate(connection)
+        instrument_repository = InstrumentRepository(connection)
+        instrument_repository.replace_catalog([metadata])
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol=metadata.symbol,
+                name=metadata.name,
+                quantity=1000,
+                available_quantity=1000,
+                cost_price=1.0,
+                opened_at=date(2026, 7, 1),
+            ),
+            now=NOW,
+        )
+        CashAccountRepository(connection).initialize(50_000, now=NOW, note="initial")
+        cached = RisingIntradayProvider(calendar, clock).get_minute_bars(
+            metadata.symbol,
+            date(2026, 7, 14),
+            "1m",
+        )
+        MinuteBarRepository(connection).upsert_many(cached)
+        loader = lambda symbols: {
+            symbol: loaded
+            for symbol in symbols
+            if (loaded := instrument_repository.get(symbol)) is not None
+        }
+        configured_minute_provider = (
+            None
+            if policy_failure == "provider_missing"
+            else RisingIntradayProvider(calendar, clock)
+        )
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=UnexpectedProvider(),
+            daily_provider=UnexpectedProvider(),
+            money_flow_provider=UnexpectedProvider(),
+            intraday_provider=NoopIntradayProvider(),
+            etf_quote_provider=ClockQuoteProvider(clock),
+            etf_daily_provider=UnexpectedProvider(),
+            etf_intraday_provider=(
+                configured_minute_provider
+            ),
+            instrument_metadata_loader=loader,
+            now=clock.now,
+        ).run_intraday()
+        captures = {
+            item.dataset: item
+            for item in MarketCaptureResultRepository(connection).list_for_run(
+                result.run_id
+            )
+            if item.symbol == metadata.symbol
+        }
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        strength = IntradayStrengthSnapshotRepository(connection).latest_for_symbol(
+            metadata.symbol
+        )
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+
+    assert captures[CaptureDataset.MINUTE_BAR].status is CaptureResultStatus.FAILED
+    assert captures[CaptureDataset.INTRADAY_STRENGTH].status is CaptureResultStatus.FAILED
+    expected_error = (
+        "not configured"
+        if policy_failure == "provider_missing"
+        else "settlement"
+    )
+    assert expected_error in captures[CaptureDataset.MINUTE_BAR].error_summary
+    assert "reused same-day minute_cache" not in captures[
+        CaptureDataset.MINUTE_BAR
+    ].error_summary
+    assert market_input is not None
+    assert (
+        market_input.dataset_quality[metadata.symbol][CaptureDataset.MINUTE_BAR].status
+        is CaptureResultStatus.FAILED
+    )
+    assert strength is None
+    assert run is not None
+    assert run.provider_calls == 1
+    if configured_minute_provider is not None:
+        assert configured_minute_provider.calls == []
+
+
 def test_intraday_reuse_repairs_failed_notification_projections_idempotently(
     tmp_path,
     monkeypatch,
@@ -3262,13 +3364,45 @@ def test_intraday_marks_plan_stale_when_manual_ledger_changed_after_close(
         ).run_intraday()
         stale_plan = TradingPlanRepository(connection).get(old_plan.plan_id)
         recommendation = RecommendationRepository(connection).list(limit=1)[0]
+        clock.value = datetime(2026, 7, 14, 2, 3, tzinfo=UTC)
+        next_result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday()
+        next_recommendation = RecommendationRepository(connection).get(
+            next_result.recommendation_ids[0]
+        )
 
     assert result.status in {CaptureRunStatus.SUCCEEDED, CaptureRunStatus.DEGRADED}
     assert stale_plan is not None
     assert stale_plan.status is TradingPlanStatus.STALE
     assert any("手动持仓台账" in warning for warning in stale_plan.warnings)
-    assert recommendation.plan_id is None
+    assert recommendation.plan_id == old_plan.plan_id
+    assert recommendation.plan_version == old_plan.version
+    assert recommendation.valid_until == old_plan.valid_until
+    assert recommendation.data_quality["plan_status"] == "stale"
+    assert recommendation.data_references["plan"] == {
+        "plan_id": old_plan.plan_id,
+        "status": "stale",
+    }
     assert recommendation.action not in {
+        RecommendationAction.BUY,
+        RecommendationAction.ADD,
+    }
+    assert next_recommendation is not None
+    assert next_recommendation.plan_id == old_plan.plan_id
+    assert next_recommendation.plan_version == old_plan.version
+    assert next_recommendation.data_quality["plan_status"] == "stale"
+    assert next_recommendation.data_references["plan"] == {
+        "plan_id": old_plan.plan_id,
+        "status": "stale",
+    }
+    assert next_recommendation.action not in {
         RecommendationAction.BUY,
         RecommendationAction.ADD,
     }
@@ -3308,7 +3442,14 @@ def test_intraday_marks_plan_expired_after_valid_until(tmp_path) -> None:
 
     assert expired is not None
     assert expired.status is TradingPlanStatus.EXPIRED
-    assert recommendation.plan_id is None
+    assert recommendation.plan_id == active.plan_id
+    assert recommendation.plan_version == active.version
+    assert recommendation.valid_until == active.valid_until
+    assert recommendation.data_quality["plan_status"] == "expired"
+    assert recommendation.data_references["plan"] == {
+        "plan_id": active.plan_id,
+        "status": "expired",
+    }
     assert recommendation.action not in {
         RecommendationAction.BUY,
         RecommendationAction.ADD,
@@ -3474,9 +3615,60 @@ def test_intraday_stale_minutes_cannot_confirm_add(tmp_path) -> None:
     assert audit is not None
     assert audit.event_type == "recommendation.generated"
     assert audit.recommendation_id == recommendation.recommendation_id
+    assert audit.payload["data_quality"] == recommendation.data_quality
     assert strength is not None
     assert strength.degraded is True
     assert strength.thresholds["stale_minutes"] == 7
+
+
+def test_intraday_cached_strength_after_provider_failure_cannot_confirm_add(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-cached-no-add.db")
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(NOW)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=NoopIntradayProvider(),
+            now=clock.now,
+        ).run_close(TRADE_DATE)
+        clock.value = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
+        cached = RisingIntradayProvider(calendar, clock).get_minute_bars(
+            "600000", date(2026, 7, 14), "1m"
+        )
+        MinuteBarRepository(connection).upsert_many(cached)
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=FailingIntradayProvider(),
+            now=clock.now,
+        ).run_intraday()
+        recommendation = RecommendationRepository(connection).get(
+            result.recommendation_ids[0]
+        )
+        strength = IntradayStrengthSnapshotRepository(connection).latest_for_symbol(
+            "600000"
+        )
+
+    assert recommendation is not None
+    assert recommendation.action is RecommendationAction.HOLD
+    assert "intraday_data_unusable" in recommendation.risk["machine_reason"]
+    assert recommendation.data_quality["intraday_status"] == "degraded"
+    assert recommendation.data_quality["intraday_usable"] is False
+    assert strength is not None
+    assert strength.label.value == "strong"
+    assert strength.degraded is True
 
 
 def test_intraday_stale_quote_cannot_trigger_holding_sell(tmp_path) -> None:
@@ -3594,6 +3786,278 @@ def test_intraday_failure_persists_minute_and_strength_results(tmp_path) -> None
         "synthetic minute outage"
         in failures[CaptureDataset.INTRADAY_STRENGTH].error_summary
     )
+    assert (
+        "reused same-day minute_cache"
+        not in failures[CaptureDataset.INTRADAY_STRENGTH].error_summary
+    )
+
+
+def test_intraday_provider_failure_reuses_fresh_same_day_minute_cache(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-provider-cache.db")
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    trade_date = date(2026, 7, 14)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        cached = RisingIntradayProvider(calendar, clock).get_minute_bars(
+            "600000", trade_date, "1m"
+        )
+        MinuteBarRepository(connection).upsert_many(cached)
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=FailingIntradayProvider(),
+            now=clock.now,
+        ).run_intraday()
+        capture_results = {
+            item.dataset: item
+            for item in MarketCaptureResultRepository(connection).list_for_run(
+                result.run_id
+            )
+        }
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        strength = IntradayStrengthSnapshotRepository(connection).latest_for_symbol(
+            "600000"
+        )
+        run = MarketCaptureRunRepository(connection).get(result.run_id)
+        cached_after = MinuteBarRepository(connection).for_trade_date(
+            "600000", trade_date
+        )
+
+    minute = capture_results[CaptureDataset.MINUTE_BAR]
+    strength_result = capture_results[CaptureDataset.INTRADAY_STRENGTH]
+    assert minute.status is CaptureResultStatus.DEGRADED
+    assert minute.actual_rows == len(cached) == 30
+    assert "minute_cache" in minute.source
+    assert "provider_failure" in minute.source
+    assert "synthetic minute outage" in minute.warning
+    assert strength_result.status is CaptureResultStatus.DEGRADED
+    assert strength_result.actual_rows == 1
+    assert "minute_cache" in strength_result.source
+    assert "synthetic minute outage" in strength_result.warning
+    assert market_input is not None
+    minute_quality = market_input.dataset_quality["600000"][CaptureDataset.MINUTE_BAR]
+    strength_quality = market_input.dataset_quality["600000"][
+        CaptureDataset.INTRADAY_STRENGTH
+    ]
+    assert minute_quality.actual_rows == 30
+    assert minute_quality.status is CaptureResultStatus.DEGRADED
+    assert "minute_cache" in minute_quality.source
+    assert "provider_failure" in minute_quality.source
+    assert "synthetic minute outage" in minute_quality.warning
+    assert "minute_cache" in strength_quality.source
+    assert "provider_failure" in strength_quality.source
+    assert "synthetic minute outage" in strength_quality.warning
+    assert strength_result.source == strength_quality.source
+    assert strength is not None
+    assert strength.degraded is True
+    assert any(
+        "synthetic minute outage" in reason
+        for reason in strength.degradation_reasons
+    )
+    assert run is not None
+    assert run.provider_calls == 2
+    assert run.rows_received == 1
+    assert run.rows_written == 2
+    assert run.recommendation_count == 1
+    assert cached_after == cached
+
+
+def test_intraday_provider_failure_marks_lagging_same_day_cache_stale(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-provider-stale-cache.db")
+    calendar = XSHGTradingCalendar()
+    cache_clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    observed_clock = MutableClock(datetime(2026, 7, 14, 2, 10, tzinfo=UTC))
+    trade_date = date(2026, 7, 14)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        cached = RisingIntradayProvider(calendar, cache_clock).get_minute_bars(
+            "600000", trade_date, "1m"
+        )
+        MinuteBarRepository(connection).upsert_many(cached)
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(observed_clock),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=FailingIntradayProvider(),
+            stale_trading_minutes=6,
+            now=observed_clock.now,
+        ).run_intraday()
+        capture_results = {
+            item.dataset: item
+            for item in MarketCaptureResultRepository(connection).list_for_run(
+                result.run_id
+            )
+        }
+        strength = IntradayStrengthSnapshotRepository(connection).latest_for_symbol(
+            "600000"
+        )
+
+    minute = capture_results[CaptureDataset.MINUTE_BAR]
+    strength_result = capture_results[CaptureDataset.INTRADAY_STRENGTH]
+    assert minute.status is CaptureResultStatus.STALE
+    assert strength_result.status is CaptureResultStatus.STALE
+    assert minute.actual_rows == len(cached) == 30
+    assert "synthetic minute outage" in minute.warning
+    assert "落后超过 6 个有效交易分钟" in minute.warning
+    assert "synthetic minute outage" in strength_result.warning
+    assert "落后超过 6 个有效交易分钟" in strength_result.warning
+    assert strength is not None
+    assert strength.data_time == cached[-1].minute
+    assert strength.thresholds["stale_minutes"] == 6
+
+
+@pytest.mark.parametrize("cache_scope", ["previous_trade_date", "other_symbol"])
+def test_intraday_provider_failure_does_not_reuse_wrong_minute_cache_scope(
+    tmp_path,
+    cache_scope,
+) -> None:
+    settings = Settings(
+        database_path=tmp_path / f"intraday-wrong-cache-{cache_scope}.db"
+    )
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    trade_date = date(2026, 7, 14)
+    cached_symbol = "000001" if cache_scope == "other_symbol" else "600000"
+    cached_date = date(2026, 7, 13) if cache_scope == "previous_trade_date" else trade_date
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        wrong_scope_cache = RisingIntradayProvider(calendar, clock).get_minute_bars(
+            cached_symbol, cached_date, "1m"
+        )
+        MinuteBarRepository(connection).upsert_many(wrong_scope_cache)
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=FailingIntradayProvider(),
+            now=clock.now,
+        ).run_intraday()
+        capture_results = {
+            item.dataset: item
+            for item in MarketCaptureResultRepository(connection).list_for_run(
+                result.run_id
+            )
+        }
+        strength = IntradayStrengthSnapshotRepository(connection).latest_for_symbol(
+            "600000"
+        )
+
+    assert capture_results[CaptureDataset.MINUTE_BAR].status is CaptureResultStatus.FAILED
+    assert capture_results[CaptureDataset.MINUTE_BAR].actual_rows == 0
+    assert (
+        capture_results[CaptureDataset.INTRADAY_STRENGTH].status
+        is CaptureResultStatus.FAILED
+    )
+    assert capture_results[CaptureDataset.INTRADAY_STRENGTH].actual_rows == 0
+    assert strength is None
+
+
+@pytest.mark.parametrize("failure_stage", ["cache_read", "strength_calculation"])
+def test_intraday_cache_internal_error_after_provider_failure_terminates_run(
+    tmp_path,
+    monkeypatch,
+    failure_stage,
+) -> None:
+    settings = Settings(
+        database_path=tmp_path / f"intraday-cache-internal-{failure_stage}.db"
+    )
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    trade_date = date(2026, 7, 14)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        cached = RisingIntradayProvider(calendar, clock).get_minute_bars(
+            "600000", trade_date, "1m"
+        )
+        MinuteBarRepository(connection).upsert_many(cached)
+
+        if failure_stage == "cache_read":
+            def fail_cache_read(self, symbol, requested_date):  # noqa: ANN001
+                del self, symbol, requested_date
+                raise ValueError("synthetic cached minute validation failure")
+
+            monkeypatch.setattr(
+                MinuteBarRepository,
+                "for_trade_date",
+                fail_cache_read,
+            )
+        else:
+            def fail_strength_calculation(*args, **kwargs):  # noqa: ANN002, ANN003
+                del args, kwargs
+                raise ValueError("synthetic cached strength calculation failure")
+
+            monkeypatch.setattr(
+                "quantitative_trading.decision.workflow.calculate_intraday_strength",
+                fail_strength_calculation,
+            )
+
+        with pytest.raises(ValueError, match="synthetic cached"):
+            DecisionWorkflow(
+                connection,
+                calendar=calendar,
+                quote_provider=ClockQuoteProvider(clock),
+                daily_provider=CalendarDailyProvider(calendar),
+                money_flow_provider=CalendarFlowProvider(calendar),
+                intraday_provider=FailingIntradayProvider(),
+                now=clock.now,
+            ).run_intraday()
+        run = MarketCaptureRunRepository(connection).get("intraday-20260714-1000")
+
+    assert run is not None
+    assert run.status is CaptureRunStatus.FAILED
+
+
+def test_intraday_provider_failure_rejects_future_same_day_minute_cache(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-future-cache.db")
+    calendar = XSHGTradingCalendar()
+    cache_clock = MutableClock(datetime(2026, 7, 14, 2, 0, tzinfo=UTC))
+    observed_clock = MutableClock(datetime(2026, 7, 14, 1, 55, tzinfo=UTC))
+    trade_date = date(2026, 7, 14)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        future_cache = RisingIntradayProvider(calendar, cache_clock).get_minute_bars(
+            "600000", trade_date, "1m"
+        )
+        MinuteBarRepository(connection).upsert_many(future_cache)
+
+        with pytest.raises(ValueError, match="future minute"):
+            DecisionWorkflow(
+                connection,
+                calendar=calendar,
+                quote_provider=ClockQuoteProvider(observed_clock),
+                daily_provider=CalendarDailyProvider(calendar),
+                money_flow_provider=CalendarFlowProvider(calendar),
+                intraday_provider=FailingIntradayProvider(),
+                now=observed_clock.now,
+            ).run_intraday()
+        run = MarketCaptureRunRepository(connection).get("intraday-20260714-0954")
+
+    assert run is not None
+    assert run.status is CaptureRunStatus.FAILED
 
 
 def test_intraday_partial_account_is_reflected_in_holding_recommendation(

@@ -113,14 +113,17 @@ def planned_entry_signal(
     money_flow_applicable: bool = True,
     data_quality: Literal["complete", "degraded", "failed", "stale"],
     invalid_if: list[str],
+    quote_usable: bool = True,
+    history_usable: bool = True,
+    intraday_usable: bool = True,
 ) -> StrategySignal:
-    if data_quality == "failed":
+    if not quote_usable:
         return StrategySignal(
             symbol=symbol,
             action=StrategyAction.AVOID,
             confidence="low",
-            machine_reason=["required_market_data_failed"],
-            human_reason=["关键行情数据不可用，当前不参与"],
+            machine_reason=["quote_unavailable"],
+            human_reason=["当前行情不可用，暂停价格触发型动作"],
             invalid_if=invalid_if,
         )
 
@@ -131,14 +134,21 @@ def planned_entry_signal(
         blockers.append(("plan_entry_not_allowed", "收盘计划未允许新增买入或加仓"))
     if not plan_condition_met:
         blockers.append(("plan_condition_not_met", "尚未命中计划内条件"))
+    if not history_usable:
+        blockers.append(("history_unavailable", "日线历史不可用"))
     if not daily_structure_confirmed:
         blockers.append(("daily_structure_not_confirmed", "日线结构尚未确认"))
-    if intraday_strength != "strong":
+    if not intraday_usable:
+        blockers.append(
+            (
+                "intraday_data_unusable",
+                "分时数据仅可展示，不能作为买入或加仓确认",
+            )
+        )
+    elif intraday_strength != "strong":
         blockers.append(("intraday_strength_not_confirmed", "分时强弱尚未确认"))
     if money_flow_confirmed is False:
         blockers.append(("money_flow_filtered", "资金流条件形成过滤"))
-    if data_quality == "stale":
-        blockers.append(("market_data_stale", "行情数据已经过期"))
 
     if blockers:
         return StrategySignal(

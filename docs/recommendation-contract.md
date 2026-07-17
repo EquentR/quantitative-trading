@@ -161,7 +161,7 @@
 
 当前 decision intraday 的 run 与 `MarketInputSnapshot` 必须保存一致的 `effective_trade_date` 和 `history_cutoff_date`；正常盘中历史 cutoff 为前一 `XSHG` 交易日。legacy retry 只补齐缺失值并保留已有非空 provenance，调用方不得从 `fetched_at` 或自然日自行推导替代值。
 
-`data_quality` 保存总体质量、逐数据集状态、warnings 和实际生效的 stale/降级语义。总体质量仍只使用 `complete/degraded/failed/stale`；ETF 合法的资金流不适用本身不降低总体质量。`position_constraint` 保存建议仓位区间、建议数量以及经过现金、单票、总仓位、证券交易制度、手动可用数量和流动性裁决后真正生效的上限。所有这些字段由后端生成，前端不得补算。
+`data_quality` 保存总体质量、逐数据集状态、warnings 和实际生效的 stale/降级语义。盘中建议必须显式保存 `quote_status/quote_usable`、`history_status/history_usable`、`intraday_status/intraday_usable` 和 `plan_status`；这些字段与 `data_references` 的实际快照引用一致。活动计划被判定为 `stale/expired` 后不得继续消费条件或冻结 history，但建议仍必须保留原 `plan_id`、版本、`valid_until` 和真实 plan status，不得降成 `missing`。总体质量仍只使用 `complete/degraded/failed/stale`，仅用于展示和审计聚合，不得替代逐数据集动作门禁；ETF 合法的资金流不适用本身不降低总体质量。provider 失败后从同 symbol、同交易日分钟缓存计算出的 degraded/stale strength 只能展示和提示风险，不能确认 `buy/add`。`position_constraint` 保存建议仓位区间、建议数量以及经过现金、单票、总仓位、证券交易制度、手动可用数量和流动性裁决后真正生效的上限。所有这些字段由后端生成，前端不得补算。
 
 ## 4. 首版实现约束
 
@@ -233,6 +233,7 @@ GET /api/v1/recommendations/{recommendation_id}/trace
 - 建议 ID。
 - `run_id`、`market_input_snapshot_id` 和 `plan_id`。
 - 输入数据快照引用。
+- `data_quality` 的 overall、逐数据集 status/usable 和 plan status。
 - 手动持仓台账快照引用。
 - 策略信号。
 - 风控结果。
