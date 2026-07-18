@@ -13,23 +13,29 @@ export interface MarketRefreshOptions {
   onPhase?: (phase: MarketRefreshPhase) => void
   onTerminal?: (result: MarketRefreshResult) => Promise<void> | void
   onPartial?: (stages: PartialStages) => Promise<void> | void
+  onStageProgress?: (progress: MarketRefreshStageProgress) => void
 }
 
 export type MarketRefreshPhase = 'idle' | 'backfill' | 'intraday' | 'refreshing'
 
 export type MarketRefreshStageStatus = 'succeeded' | 'degraded' | 'failed'
+export type MarketRefreshProgressStatus = 'running' | MarketRefreshStageStatus
 export type MarketRefreshOverallStatus = 'success' | 'partial' | 'failed'
 
-export interface MarketRefreshStage {
+export interface MarketRefreshStageProgress {
   workflowType: 'backfill' | 'intraday'
   runId: string
-  status: MarketRefreshStageStatus
+  status: MarketRefreshProgressStatus
   warnings: string[]
   reused: boolean
   mode: 'decision' | 'display_only' | null
   requestedSymbolScope: string[]
-  scopeReported: boolean
   leaseExpiresAt: string | null
+}
+
+export interface MarketRefreshStage extends Omit<MarketRefreshStageProgress, 'status'> {
+  status: MarketRefreshStageStatus
+  scopeReported: boolean
 }
 
 export interface MarketRefreshResult {
@@ -250,13 +256,45 @@ function terminalStage(
     workflowType: stage,
     runId: run.run_id,
     status: run.status as MarketRefreshStageStatus,
-    warnings: run.error_summary ? [run.error_summary] : [],
+    warnings: runWarnings(run),
     reused: true,
     mode: run.mode,
     requestedSymbolScope: run.requested_symbol_scope,
     scopeReported: true,
     leaseExpiresAt: run.lease_expires_at,
   }
+}
+
+function runWarnings(run: MarketCaptureRun): string[] {
+  const warnings = [
+    run.error_summary,
+    ...(run.results ?? []).flatMap((result) => [result.warning, result.error_summary]),
+  ]
+  return [...new Set(warnings.map((warning) => warning.trim()).filter(Boolean))]
+}
+
+function runningStage(
+  stage: 'backfill' | 'intraday',
+  runId: string,
+  leaseExpiresAt: string | null,
+  run?: MarketCaptureRun,
+): MarketRefreshStageProgress {
+  return {
+    workflowType: stage,
+    runId,
+    status: 'running',
+    warnings: run ? runWarnings(run) : [],
+    reused: true,
+    mode: run?.mode ?? null,
+    requestedSymbolScope: run?.requested_symbol_scope ?? [],
+    leaseExpiresAt: run?.lease_expires_at ?? leaseExpiresAt,
+  }
+}
+
+function conflictLeaseExpiresAt(error: ApiError): string | null {
+  if (typeof error.details !== 'object' || error.details === null) return null
+  const value = (error.details as Record<string, unknown>).lease_expires_at
+  return typeof value === 'string' && value ? value : null
 }
 
 async function defaultSleep(milliseconds: number): Promise<void> {
@@ -276,6 +314,10 @@ async function followRun(
   const interval = options.pollIntervalMs ?? 2_000
   let deadline = retryDeadline(conflict, now)
   let missingRunReads = 0
+
+  options.onStageProgress?.(
+    runningStage(stage, runId, conflictLeaseExpiresAt(conflict)),
+  )
 
   while (true) {
     if (options.signal?.aborted) {
@@ -318,7 +360,11 @@ async function followRun(
       )
     }
     const terminal = terminalStage(stage, run, stages)
-    if (terminal) return terminal
+    if (terminal) {
+      options.onStageProgress?.(terminal)
+      return terminal
+    }
+    options.onStageProgress?.(runningStage(stage, runId, null, run))
 
     const lease = run.lease_expires_at === null
       ? Number.NaN
@@ -364,6 +410,7 @@ async function executeStage(
     if (options.signal?.aborted) {
       throw new MarketRefreshCancelledError(stage, projected.runId, stages)
     }
+    options.onStageProgress?.(projected)
     return projected
   } catch (error) {
     if (options.signal?.aborted && !(error instanceof MarketRefreshCancelledError)) {
@@ -452,6 +499,7 @@ export async function executeMarketRefresh(
     && !stages.backfill.reused
   ) {
     stages.backfill.requestedSymbolScope = expectedSymbols
+    options.onStageProgress?.(stages.backfill)
   }
   let missingBackfill = missingSymbols(
     expectedSymbols,
@@ -476,6 +524,7 @@ export async function executeMarketRefresh(
       retry.requestedSymbolScope = missingBackfill
     }
     stages.backfill = mergeBackfillStages(stages.backfill, retry)
+    options.onStageProgress?.(stages.backfill)
     missingBackfill = missingSymbols(
       expectedSymbols,
       stages.backfill.requestedSymbolScope,
@@ -486,6 +535,7 @@ export async function executeMarketRefresh(
     missingBackfill,
     '回填范围仍缺少标的',
   )
+  options.onStageProgress?.(stages.backfill)
   if (options.symbols === undefined && stages.backfill.scopeReported) {
     expectedSymbols = canonicalSymbols(stages.backfill.requestedSymbolScope)
   }
@@ -515,6 +565,7 @@ export async function executeMarketRefresh(
     missingIntraday,
     '盘中范围未覆盖统一股票池',
   )
+  options.onStageProgress?.(stages.intraday)
 
   const completedStages = stages as MarketRefreshResult['stages']
   const result = {
@@ -546,6 +597,10 @@ export function useMarketRefreshCoordinator() {
   const error = ref<Error | null>(null)
   const message = ref('')
   const isPending = ref(false)
+  const stageProgress = ref<Partial<Record<
+    'backfill' | 'intraday',
+    MarketRefreshStageProgress
+  >>>({})
   const hasFailed = computed(() => result.value?.overallStatus === 'failed')
   let controller: AbortController | null = null
   let executionId = 0
@@ -560,12 +615,21 @@ export function useMarketRefreshCoordinator() {
     error.value = null
     message.value = ''
     result.value = null
+    stageProgress.value = {}
     try {
       const completed = await executeMarketRefresh(client, {
         ...options,
         signal: activeController.signal,
         onPhase: (value) => {
           if (isCurrent()) phase.value = value
+        },
+        onStageProgress: (value) => {
+          if (!isCurrent()) return
+          stageProgress.value = {
+            ...stageProgress.value,
+            [value.workflowType]: value,
+          }
+          options.onStageProgress?.(value)
         },
         onTerminal: async () => invalidateRefreshQueries(queryClient),
         onPartial: async () => invalidateRefreshQueries(queryClient),
@@ -600,6 +664,7 @@ export function useMarketRefreshCoordinator() {
     error,
     message,
     isPending,
+    stageProgress,
     hasFailed,
     run,
     cancel,

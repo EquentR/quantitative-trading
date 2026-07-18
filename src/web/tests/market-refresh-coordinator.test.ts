@@ -165,6 +165,72 @@ describe('market refresh coordinator', () => {
     expect(result.overallStatus).toBe('success')
   })
 
+  test('publishes exact 409 run progress and terminal result warnings', async () => {
+    const post = vi.fn(async (path: string) => {
+      if (path.endsWith('/backfill/run')) {
+        throw new ApiError({
+          code: 'workflow_in_progress',
+          message: 'running',
+          details: {
+            run_id: 'backfill-active',
+            lease_expires_at: '2026-07-18T10:10:00+08:00',
+          },
+          status: 409,
+        })
+      }
+      return response('intraday', 'success', 'intraday-1')
+    })
+    const degraded = {
+      ...runDetail('backfill-active', 'degraded'),
+      error_summary: '回填结果部分可用',
+      results: [
+        {
+          run_id: 'backfill-active',
+          symbol: '600000',
+          dataset: 'daily_bar',
+          status: 'degraded',
+          data_start: '2025-07-18',
+          data_end: '2026-07-17',
+          data_time: null,
+          fetched_at: '2026-07-18T10:01:00+08:00',
+          expected_rows: 250,
+          actual_rows: 249,
+          source: 'akshare',
+          warning: '缺少一个交易日',
+          error_summary: 'provider coverage incomplete',
+        },
+      ],
+    } as MarketCaptureRun
+    const reads = [runDetail('backfill-active', 'running'), degraded]
+    const get = vi.fn(async () => reads.shift()!)
+    const onStageProgress = vi.fn()
+    const client = { post, get } as unknown as Pick<ApiClient, 'post' | 'get'>
+
+    await executeMarketRefresh(client, {
+      now: () => new Date('2026-07-18T10:02:00+08:00'),
+      sleep: async () => undefined,
+      onStageProgress,
+    })
+
+    expect(onStageProgress).toHaveBeenCalledWith(expect.objectContaining({
+      workflowType: 'backfill',
+      runId: 'backfill-active',
+      status: 'running',
+      reused: true,
+    }))
+    expect(onStageProgress).toHaveBeenCalledWith(expect.objectContaining({
+      workflowType: 'backfill',
+      runId: 'backfill-active',
+      status: 'degraded',
+      warnings: [
+        '回填结果部分可用',
+        '缺少一个交易日',
+        'provider coverage incomplete',
+      ],
+      reused: true,
+    }))
+  })
+
   test('reports still-running without claiming failure when backend lease expires', async () => {
     const post = vi.fn(async () => {
       throw new ApiError({

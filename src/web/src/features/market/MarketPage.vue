@@ -7,6 +7,7 @@ import Alert from '@/components/ui/Alert.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Button from '@/components/ui/Button.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
+import MarketRefreshStages from '@/components/domain/MarketRefreshStages.vue'
 import RecommendationStatusBadge from '@/components/domain/RecommendationStatusBadge.vue'
 import type { MarketQualityStatus, MarketStrengthComponent } from '@/api/types'
 import {
@@ -311,6 +312,7 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
     <Alert v-if="refreshError" :variant="marketRefresh.error.value?.name === 'MarketRefreshPendingError' ? 'warning' : 'danger'">
       {{ refreshError }}
     </Alert>
+    <MarketRefreshStages :stages="marketRefresh.stageProgress.value" />
 
     <p class="text-xs text-muted-foreground">决策股票池来自手动持仓台账和后端启用的自选置顶标的。</p>
 

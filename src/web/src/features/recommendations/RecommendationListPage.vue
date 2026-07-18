@@ -5,6 +5,7 @@ import { RefreshCw } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
 import Alert from '@/components/ui/Alert.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
+import MarketRefreshStages from '@/components/domain/MarketRefreshStages.vue'
 import RecommendationStatusBadge from '@/components/domain/RecommendationStatusBadge.vue'
 import RecommendationDetailDrawer from './RecommendationDetailDrawer.vue'
 import { useRecommendationQuery, useRecommendationsQuery } from '@/queries/recommendations'
@@ -139,6 +140,7 @@ function keyPriceText(r: Recommendation): string {
     </Alert>
     <Alert v-if="marketRefresh.hasFailed.value" variant="danger">{{ marketRefresh.message.value }}</Alert>
     <p v-else-if="marketRefresh.message.value" class="text-sm text-emerald-700" role="status">{{ marketRefresh.message.value }}</p>
+    <MarketRefreshStages :stages="marketRefresh.stageProgress.value" />
 
     <div class="inline-flex rounded-md border border-border p-0.5" role="group" aria-label="建议视图">
       <button

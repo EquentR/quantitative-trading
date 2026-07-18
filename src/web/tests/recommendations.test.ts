@@ -178,7 +178,7 @@ test('建议页刷新使用认证的两阶段工作流', async () => {
       workflowCalled = true
       return HttpResponse.json({
         task: 'intraday', status: 'success', run_id: 'intraday-test', snapshot_id: 1,
-        plan_id: null, recommendation_ids: ['rec-001'], warnings: [], reused: false,
+        plan_id: null, recommendation_ids: ['rec-001'], warnings: ['分钟数据使用降级源'], reused: true,
         ready: null, cleaned_rows: null, mode: 'decision',
         effective_trade_date: '2026-07-17', history_cutoff_date: '2026-07-16',
         requested_symbol_scope: ['600000', '600519'], lease_expires_at: null,
@@ -197,6 +197,11 @@ test('建议页刷新使用认证的两阶段工作流', async () => {
   await waitFor(() => expect(workflowCalled).toBe(true))
   expect(deprecatedScanCalled).toBe(false)
   expect(screen.getByRole('status')).toHaveTextContent('行情与建议已刷新')
+  const stages = screen.getByRole('region', { name: '行情刷新阶段详情' })
+  expect(within(stages).getByText('backfill-mock-run')).toBeInTheDocument()
+  expect(within(stages).getByText('intraday-test')).toBeInTheDocument()
+  expect(within(stages).getByText('分钟数据使用降级源')).toBeInTheDocument()
+  expect(within(stages).getByText('复用已有运行')).toBeInTheDocument()
   await waitFor(() => expect(screen.getByText('600000')).toBeInTheDocument())
 })
 

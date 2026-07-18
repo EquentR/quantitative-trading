@@ -67,7 +67,7 @@ test('获取行情按回填和盘中阶段顺序运行并显示 display-only 结
       })
       return HttpResponse.json({
         task: 'backfill', status: 'success', run_id: 'backfill-ui', snapshot_id: 1,
-        plan_id: null, recommendation_ids: [], warnings: [], reused: false,
+        plan_id: null, recommendation_ids: [], warnings: ['日 K 已按截止日固化'], reused: false,
         ready: null, cleaned_rows: null, mode: null,
         effective_trade_date: '2026-07-17', history_cutoff_date: '2026-07-17',
         requested_symbol_scope: ['600000', '600519'], lease_expires_at: null,
@@ -81,7 +81,7 @@ test('获取行情按回填和盘中阶段顺序运行并显示 display-only 结
       })
       return HttpResponse.json({
         task: 'intraday', status: 'success', run_id: 'intraday-ui', snapshot_id: 2,
-        plan_id: null, recommendation_ids: [], warnings: [], reused: false,
+        plan_id: null, recommendation_ids: [], warnings: [], reused: true,
         ready: null, cleaned_rows: null, mode: 'display_only',
         effective_trade_date: '2026-07-17', history_cutoff_date: '2026-07-17',
         requested_symbol_scope: ['600000', '600519'], lease_expires_at: null,
@@ -95,6 +95,14 @@ test('获取行情按回填和盘中阶段顺序运行并显示 display-only 结
 
   await waitFor(() => expect(calls).toEqual(['backfill', 'intraday']))
   expect(await screen.findByRole('status')).toHaveTextContent('行情展示已刷新，本次未生成交易建议')
+  const stages = screen.getByRole('region', { name: '行情刷新阶段详情' })
+  expect(within(stages).getByText('日 K 回填')).toBeInTheDocument()
+  expect(within(stages).getByText('报价与分时')).toBeInTheDocument()
+  expect(within(stages).getByText('backfill-ui')).toBeInTheDocument()
+  expect(within(stages).getByText('intraday-ui')).toBeInTheDocument()
+  expect(within(stages).getByText('日 K 已按截止日固化')).toBeInTheDocument()
+  expect(within(stages).getByText('新运行')).toBeInTheDocument()
+  expect(within(stages).getByText('复用已有运行')).toBeInTheDocument()
   expect(screen.getByRole('button', { name: '获取行情' })).not.toBeDisabled()
 })
 

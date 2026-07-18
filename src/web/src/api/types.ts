@@ -570,6 +570,23 @@ export interface MarketCaptureRun {
     'quote' | 'daily_bar' | 'money_flow' | 'minute_bar' | 'intraday_strength',
     { complete: number; degraded: number; failed: number; stale: number }
   >>
+  results?: MarketCaptureResult[]
+}
+
+export interface MarketCaptureResult {
+  run_id: string
+  symbol: string
+  dataset: 'quote' | 'daily_bar' | 'money_flow' | 'minute_bar' | 'intraday_strength'
+  status: 'complete' | 'degraded' | 'failed' | 'stale' | 'not_applicable'
+  data_start: string | null
+  data_end: string | null
+  data_time: string | null
+  fetched_at: string
+  expected_rows: number
+  actual_rows: number
+  source: string
+  warning: string
+  error_summary: string
 }
 
 export interface EmailNotificationSettings {

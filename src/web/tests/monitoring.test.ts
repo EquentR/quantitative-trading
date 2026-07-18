@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/vue'
+import { render, screen, waitFor, within } from '@testing-library/vue'
 import userEvent from '@testing-library/user-event'
 import { createPinia, setActivePinia } from 'pinia'
 import { VueQueryPlugin } from '@tanstack/vue-query'
@@ -38,7 +38,7 @@ test('点击刷新行情后按回填和盘中顺序运行并显示终态', async
       calls.push('backfill')
       return HttpResponse.json({
         task: 'backfill', status: 'success', run_id: 'backfill-monitor', snapshot_id: 1,
-        plan_id: null, recommendation_ids: [], warnings: [], reused: false,
+        plan_id: null, recommendation_ids: [], warnings: ['回填覆盖存在校验提示'], reused: false,
         ready: null, cleaned_rows: null, mode: null, effective_trade_date: '2026-07-17',
         history_cutoff_date: '2026-07-17', requested_symbol_scope: [], lease_expires_at: null,
       })
@@ -47,7 +47,7 @@ test('点击刷新行情后按回填和盘中顺序运行并显示终态', async
       calls.push('intraday')
       return HttpResponse.json({
         task: 'intraday', status: 'success', run_id: 'intraday-monitor', snapshot_id: 2,
-        plan_id: null, recommendation_ids: [], warnings: [], reused: false,
+        plan_id: null, recommendation_ids: [], warnings: [], reused: true,
         ready: null, cleaned_rows: null, mode: 'display_only', effective_trade_date: '2026-07-17',
         history_cutoff_date: '2026-07-17', requested_symbol_scope: [], lease_expires_at: null,
       })
@@ -59,6 +59,11 @@ test('点击刷新行情后按回填和盘中顺序运行并显示终态', async
 
   await waitFor(() => expect(calls).toEqual(['backfill', 'intraday']))
   expect(screen.getByText('行情展示已刷新，本次未生成交易建议')).toBeInTheDocument()
+  const stages = screen.getByRole('region', { name: '行情刷新阶段详情' })
+  expect(within(stages).getByText('backfill-monitor')).toBeInTheDocument()
+  expect(within(stages).getByText('intraday-monitor')).toBeInTheDocument()
+  expect(within(stages).getByText('回填覆盖存在校验提示')).toBeInTheDocument()
+  expect(within(stages).getByText('复用已有运行')).toBeInTheDocument()
 })
 
 test('报价分时阶段失败时显示阶段化脱敏错误且不显示成功提示', async () => {

@@ -5,6 +5,7 @@ import Button from '@/components/ui/Button.vue'
 import Alert from '@/components/ui/Alert.vue'
 import StatusBadges from '@/components/domain/StatusBadges.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
+import MarketRefreshStages from '@/components/domain/MarketRefreshStages.vue'
 import { ApiError } from '@/api/client'
 import {
   useServiceStatusQuery,
@@ -160,6 +161,7 @@ async function onGenerate() {
       <Alert v-if="refreshError" :variant="marketRefresh.error.value?.name === 'MarketRefreshPendingError' ? 'warning' : 'danger'">
         {{ refreshError }}
       </Alert>
+      <MarketRefreshStages :stages="marketRefresh.stageProgress.value" />
     </section>
 
     <section class="space-y-2">
