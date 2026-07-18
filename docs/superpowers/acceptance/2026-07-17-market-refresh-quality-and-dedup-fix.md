@@ -108,6 +108,21 @@
 
 ### V3：最终关闭验证
 
-将在本记录通过独立审核后运行。最终关闭必须至少包含完整 Python、完整 Vitest、生产 build、
-Playwright desktop/mobile、`git diff --check`、敏感信息检查、临时进程/目录检查和 Git 身份检查。
-结果不得提前填写。
+本记录通过独立审核后，于 2026-07-18 实际运行：
+
+- `uv run pytest -q`：退出码 0，进度到 `100%`；仅有 Starlette/httpx 和 NumPy
+  第三方弃用警告。
+- Node 24 `pnpm test`：23 files、`161/161` tests 通过。
+- Node 24 `pnpm build`：退出码 0，2454 modules transformed；产物 JS 888.36 KB，
+  仅既有 chunk size warning。
+- Node 24 `pnpm e2e`：Chromium desktop/mobile `30/30` 通过。
+- 真实服务 `GET /api/v1/service/status` 返回 200 和 `auth_status=configured`；未借用 token 的
+  `GET /api/v1/market/symbols` 按预期返回 401 `unauthorized`，没有写现场数据。
+- `git diff --check`、受控敏感 token/private-key 模式扫描通过；没有跟踪 DB/SQLite/log/data
+  文件，`data/` 仍被 `.gitignore` 忽略。
+- 无 `market_refresh_e2e_server.py`、Playwright 或 `qt-market-refresh-e2e-*` 遗留。
+  工作区已有一个运行 4 天的 Vite `:5173` 开发服务，确认不是本轮 E2E 产物并保留。
+- HEAD author/committer 及仓库本地 Git 身份均为 `Equent <ryq2836@qq.com>`。
+- 常驻 reviewer 最终 `FINAL PASS`：独立关键 Python 到 `100%`、完整 Vitest `161/161`、
+  build 和静态清理检查通过，未发现 Task 1-8 或补修后的残余 requirement；没有重复主线程刚完成的
+  Playwright `30/30`。
