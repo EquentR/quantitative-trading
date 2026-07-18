@@ -16,6 +16,7 @@ from quantitative_trading.decision.factory import (
 from quantitative_trading.email.outbox import EmailDeliveryService
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
+    CaptureExecutionMode,
     CaptureRunAlreadyActiveError,
     CaptureRunStatus,
 )
@@ -180,7 +181,10 @@ def _run_scheduler_task(
         with connect(settings) as connection:
             migrate(connection)
             workflow = _build_decision_workflow(connection, settings)
-            result = workflow.run_intraday(as_of=task_now)
+            result = workflow.run_intraday(
+                as_of=task_now,
+                mode=CaptureExecutionMode.DECISION,
+            )
         return SchedulerJobResult(
             task_type="intraday",
             reason="intraday_reused" if result.reused else "intraday_completed",

@@ -38,6 +38,7 @@ from quantitative_trading.market.features import (
 )
 from quantitative_trading.market.models import (
     CaptureDataset,
+    CaptureExecutionMode,
     CaptureResultStatus,
     CaptureRunAlreadyActiveError,
     CaptureRunStatus,
@@ -75,7 +76,7 @@ from quantitative_trading.risk.models import RiskConfig, RiskContext
 from quantitative_trading.runtime.account_snapshot_job import (
     create_and_save_account_snapshot_with_connection,
 )
-from quantitative_trading.sanitization import safe_error_summary
+from quantitative_trading.sanitization import safe_error_summary, sanitize_sensitive_data
 from quantitative_trading.universe.models import (
     UniverseSnapshot,
     UniverseSnapshotStatus,
@@ -107,6 +108,11 @@ class IntradayWorkflowResult:
     status: CaptureRunStatus
     market_input_snapshot_id: int
     recommendation_ids: tuple[str, ...]
+    mode: CaptureExecutionMode
+    effective_trade_date: date
+    history_cutoff_date: date
+    requested_symbol_scope: tuple[str, ...]
+    lease_expires_at: datetime
     warnings: tuple[str, ...] = ()
 
 
@@ -263,6 +269,58 @@ class DecisionWorkflow:
             )
         except sqlite3.Error:
             pass
+
+    def _record_display_only_audit(
+        self,
+        run: MarketCaptureRun,
+        *,
+        requested_at: datetime,
+        manual_reason: str | None,
+        event_type: str,
+        created_at: datetime,
+        market_input_snapshot_id: int | None = None,
+        error_summary: str = "",
+        commit: bool = True,
+    ) -> None:
+        reason = sanitize_sensitive_data(
+            "" if manual_reason is None else manual_reason[:500]
+        )
+        is_success = event_type == "market_capture.display_only"
+        audit_id = (
+            f"audit-{run.run_id}"
+            if is_success
+            else f"audit-{run.run_id}-failed-{run.retry_count}"
+        )
+        payload = {
+            "run_id": run.run_id,
+            "requested_at": requested_at.isoformat(),
+            "manual_reason": reason,
+            "mode": CaptureExecutionMode.DISPLAY_ONLY.value,
+            "effective_trade_date": (
+                run.effective_trade_date or run.trade_date
+            ).isoformat(),
+            "history_cutoff_date": (
+                run.history_cutoff_date
+                or self.calendar.previous_trading_day(run.trade_date)
+            ).isoformat(),
+            "requested_symbol_scope": run.requested_symbol_scope,
+            "lease_expires_at": (
+                run.lease_expires_at or run.started_at + self.INTRADAY_LEASE
+            ).isoformat(),
+        }
+        if market_input_snapshot_id is not None:
+            payload["market_input_snapshot_id"] = market_input_snapshot_id
+        if error_summary:
+            payload["error_summary"] = error_summary
+        AuditLogRepository(self.connection).save(
+            AuditLog(
+                audit_id=audit_id,
+                event_type=event_type,
+                payload=payload,
+                created_at=created_at,
+            ),
+            commit=commit,
+        )
 
     def run_close(
         self,
@@ -915,19 +973,47 @@ class DecisionWorkflow:
             warnings=tuple(active_plan.warnings),
         )
 
-    def run_intraday(self, *, as_of: datetime | None = None) -> IntradayWorkflowResult:
+    def run_intraday(
+        self,
+        *,
+        as_of: datetime | None = None,
+        mode: CaptureExecutionMode = CaptureExecutionMode.DECISION,
+        manual_reason: str | None = None,
+    ) -> IntradayWorkflowResult:
+        mode = CaptureExecutionMode(mode)
         started_at = self._now()
         logical_now = started_at if as_of is None else as_of
         if logical_now.tzinfo is None or logical_now.utcoffset() is None:
             raise ValueError("intraday as_of must be timezone-aware")
         local_now = logical_now.astimezone(self.calendar.timezone)
-        trade_date = local_now.date()
-        if not self.calendar.is_trading_day(trade_date):
-            raise ValueError("intraday workflow requires an XSHG trading day")
+        if mode is CaptureExecutionMode.DECISION:
+            trade_date = local_now.date()
+            if not self.calendar.is_trading_day(trade_date):
+                raise ValueError("intraday workflow requires an XSHG trading day")
+            history_cutoff_date = self.calendar.previous_trading_day(trade_date)
+        else:
+            resolution = self.calendar.resolve_market_dates(
+                local_now,
+                session_ready=lambda _: True,
+            )
+            trade_date = resolution.effective_trade_date
+            history_cutoff_date = resolution.history_cutoff_date
         period_minute = local_now.minute - local_now.minute % 3
-        history_cutoff_date = self.calendar.previous_trading_day(trade_date)
         period_start = local_now.replace(minute=period_minute, second=0, microsecond=0)
-        run_id = f"intraday-{trade_date:%Y%m%d}-{period_start:%H%M}"
+        if mode is CaptureExecutionMode.DECISION:
+            run_id = f"intraday-{trade_date:%Y%m%d}-{period_start:%H%M}"
+            idempotency_key = (
+                f"intraday:{trade_date.isoformat()}:{period_start:%H%M}"
+            )
+        else:
+            run_id = (
+                f"intraday-{mode.value}-{trade_date:%Y%m%d}-"
+                f"{period_start:%Y%m%d-%H%M}"
+            )
+            idempotency_key = (
+                f"intraday:{mode.value}:{trade_date.isoformat()}:"
+                f"{period_start:%Y%m%d-%H%M}"
+            )
         run_repository = MarketCaptureRunRepository(self.connection)
         run_repository.fail_expired_intraday_runs(
             period_ended_by=period_start,
@@ -944,22 +1030,65 @@ class DecisionWorkflow:
                 MarketCaptureRun(
                     run_id=run_id,
                     workflow_type="intraday",
+                    mode=mode,
                     trade_date=trade_date,
                     effective_trade_date=trade_date,
                     history_cutoff_date=history_cutoff_date,
                     period_start=period_start,
                     period_end=period_start + timedelta(minutes=3),
-                    idempotency_key=f"intraday:{trade_date.isoformat()}:{period_start:%H%M}",
+                    lease_expires_at=started_at + self.INTRADAY_LEASE,
+                    idempotency_key=idempotency_key,
                     status=CaptureRunStatus.RUNNING,
                     started_at=started_at,
                 )
             )
         except CaptureRunAlreadyActiveError as exc:
             raise WorkflowAlreadyRunningError(exc.run_id) from exc
-        if not created and run.status in {
+        reusable_statuses = {
             CaptureRunStatus.SUCCEEDED,
             CaptureRunStatus.DEGRADED,
-        }:
+        }
+        display_snapshot_id = None
+        display_success_audit = None
+        if mode is CaptureExecutionMode.DISPLAY_ONLY:
+            display_snapshot_id = self._market_input_id_for_run_or_none(run_id)
+            display_success_audit = AuditLogRepository(self.connection).get(
+                f"audit-{run_id}"
+            )
+        if (
+            mode is CaptureExecutionMode.DISPLAY_ONLY
+            and run.status is CaptureRunStatus.FAILED
+            and display_snapshot_id is not None
+            and display_success_audit is not None
+        ):
+            reusable_statuses.add(CaptureRunStatus.FAILED)
+        if not created and run.status in reusable_statuses:
+            if mode is CaptureExecutionMode.DISPLAY_ONLY:
+                snapshot_id = (
+                    display_snapshot_id
+                    if display_snapshot_id is not None
+                    else self._market_input_id_for_run(run_id)
+                )
+                return IntradayWorkflowResult(
+                    run_id=run_id,
+                    reused=True,
+                    status=run.status,
+                    market_input_snapshot_id=snapshot_id,
+                    recommendation_ids=(),
+                    mode=CaptureExecutionMode.DISPLAY_ONLY,
+                    effective_trade_date=(
+                        run.effective_trade_date or run.trade_date
+                    ),
+                    history_cutoff_date=(
+                        run.history_cutoff_date or history_cutoff_date
+                    ),
+                    requested_symbol_scope=tuple(run.requested_symbol_scope),
+                    lease_expires_at=(
+                        run.lease_expires_at
+                        or run.started_at + self.INTRADAY_LEASE
+                    ),
+                    warnings=(),
+                )
             existing = [
                 item
                 for item in RecommendationRepository(self.connection).list(limit=2000)
@@ -1014,6 +1143,15 @@ class DecisionWorkflow:
                 status=run.status,
                 market_input_snapshot_id=snapshot_id,
                 recommendation_ids=tuple(item.recommendation_id for item in existing),
+                mode=run.mode or CaptureExecutionMode.DECISION,
+                effective_trade_date=run.effective_trade_date or run.trade_date,
+                history_cutoff_date=(
+                    run.history_cutoff_date or history_cutoff_date
+                ),
+                requested_symbol_scope=tuple(run.requested_symbol_scope),
+                lease_expires_at=(
+                    run.lease_expires_at or run.started_at + self.INTRADAY_LEASE
+                ),
                 warnings=tuple(projection_warnings),
             )
         if not created:
@@ -1029,6 +1167,11 @@ class DecisionWorkflow:
                 provenance_updates["effective_trade_date"] = trade_date
             if run.history_cutoff_date is None:
                 provenance_updates["history_cutoff_date"] = history_cutoff_date
+            if run.mode is None:
+                provenance_updates["mode"] = mode
+            provenance_updates["lease_expires_at"] = (
+                run.started_at + self.INTRADAY_LEASE
+            )
             if provenance_updates:
                 run = run.model_copy(update=provenance_updates)
                 run_repository.update_claimed(
@@ -1039,23 +1182,41 @@ class DecisionWorkflow:
         try:
             return self._run_intraday_claimed(
                 started_at=started_at,
+                requested_at=logical_now,
+                manual_reason=manual_reason,
                 trade_date=trade_date,
                 run=run,
                 run_repository=run_repository,
             )
         except Exception as exc:
+            self.connection.rollback()
             self._mark_capture_run_failed(
                 run_repository,
                 run.run_id,
                 exc,
                 fallback_time=started_at,
             )
+            if mode is CaptureExecutionMode.DISPLAY_ONLY:
+                failed_run = run_repository.get(run.run_id) or run
+                try:
+                    self._record_display_only_audit(
+                        failed_run,
+                        requested_at=logical_now,
+                        manual_reason=manual_reason,
+                        event_type="market_capture.display_only_failed",
+                        created_at=started_at,
+                        error_summary=safe_error_summary(exc),
+                    )
+                except Exception:
+                    pass
             raise
 
     def _run_intraday_claimed(
         self,
         *,
         started_at: datetime,
+        requested_at: datetime,
+        manual_reason: str | None,
         trade_date: date,
         run: MarketCaptureRun,
         run_repository: MarketCaptureRunRepository,
@@ -1065,18 +1226,24 @@ class DecisionWorkflow:
         positions = PositionRepository(self.connection).list()
         positions_by_symbol = {position.symbol: position for position in positions}
         watchlist = WatchPinnedRepository(self.connection).list()
-        plan_repository = TradingPlanRepository(self.connection)
-        plan = plan_repository.active_for_day(trade_date)
-        plan_reference = plan or plan_repository.latest_for_day(trade_date)
-        if plan is not None and started_at > plan.valid_until:
-            plan_reference = plan_repository.mark_expired(plan)
+        if run.mode is CaptureExecutionMode.DISPLAY_ONLY:
             plan = None
-        elif plan is not None and self._plan_authority_context_changed(plan, positions):
-            plan_reference = plan_repository.mark_stale(
-                plan,
-                warning="手动持仓台账或手动资金在计划生成后发生变化",
-            )
-            plan = None
+            plan_reference = None
+        else:
+            plan_repository = TradingPlanRepository(self.connection)
+            plan = plan_repository.active_for_day(trade_date)
+            plan_reference = plan or plan_repository.latest_for_day(trade_date)
+            if plan is not None and started_at > plan.valid_until:
+                plan_reference = plan_repository.mark_expired(plan)
+                plan = None
+            elif plan is not None and self._plan_authority_context_changed(
+                plan, positions
+            ):
+                plan_reference = plan_repository.mark_stale(
+                    plan,
+                    warning="手动持仓台账或手动资金在计划生成后发生变化",
+                )
+                plan = None
         plan_symbols = set() if plan is None else set(plan.symbol_contexts)
         decision_symbols = sorted(set(positions_by_symbol) | plan_symbols)
         metadata_by_symbol = self._load_instrument_metadata(
@@ -1109,8 +1276,17 @@ class DecisionWorkflow:
                 ],
             )
         )
-        run = run.model_copy(update={"requested_symbols": len(capture_symbols)})
+        run = run.model_copy(
+            update={
+                "requested_symbols": len(capture_symbols),
+                "requested_symbol_scope": capture_symbols,
+            }
+        )
         run_repository.update_claimed(run, claim_started_at=run.started_at)
+
+        expectation_at = run.period_start or started_at
+        if expectation_at.astimezone(self.calendar.timezone).date() != trade_date:
+            expectation_at = self.calendar.session(trade_date).close_at
 
         (
             quote_refs,
@@ -1203,6 +1379,48 @@ class DecisionWorkflow:
                 daily_repository=daily_repository,
             )
             warnings.extend(history_warnings)
+        verified_quote_writes = 0
+        if run.mode is CaptureExecutionMode.DISPLAY_ONLY:
+            quote_repository = QuoteSnapshotRepository(self.connection)
+            for symbol, quote in tuple(quotes.items()):
+                if quote.data_time is not None:
+                    continue
+                verified_quote = self._verify_close_quote_from_daily_bar(
+                    quote,
+                    trade_date=trade_date,
+                    daily_repository=daily_repository,
+                    observed_at=requested_at,
+                )
+                if verified_quote.data_time is None:
+                    continue
+                quotes[symbol] = verified_quote
+                quote_refs[symbol] = quote_repository.save(verified_quote)
+                verified_quote_writes += 1
+                quote_quality = DatasetQuality(
+                    status=CaptureResultStatus.DEGRADED,
+                    data_time=verified_quote.data_time,
+                    expected_rows=1,
+                    actual_rows=1,
+                    source=verified_quote.source,
+                    warning=verified_quote.warning,
+                )
+                dataset_quality.setdefault(symbol, {})[
+                    CaptureDataset.QUOTE
+                ] = quote_quality
+                result_repository.upsert(
+                    MarketCaptureResult(
+                        run_id=run_id,
+                        symbol=symbol,
+                        dataset=CaptureDataset.QUOTE,
+                        status=quote_quality.status,
+                        data_time=verified_quote.data_time,
+                        fetched_at=verified_quote.fetched_at,
+                        expected_rows=1,
+                        actual_rows=1,
+                        source=verified_quote.source,
+                        warning=verified_quote.warning,
+                    )
+                )
         flow_refs = (
             {}
             if close_input is None
@@ -1228,7 +1446,7 @@ class DecisionWorkflow:
         strength_by_symbol = {}
         provider_calls = quote_provider_calls
         rows_received = len(quotes)
-        rows_written = len(quote_refs)
+        rows_written = len(quote_refs) + verified_quote_writes
         for symbol in capture_symbols:
             try:
                 metadata = metadata_by_symbol.get(symbol)
@@ -1427,7 +1645,7 @@ class DecisionWorkflow:
                 DatasetQuality(
                     status=minute_status,
                     data_time=strength.data_time,
-                    expected_rows=self.calendar.expected_minutes_through(started_at),
+                    expected_rows=self.calendar.expected_minutes_through(expectation_at),
                     actual_rows=len(minute_bars),
                     source=strength.source,
                     warning="; ".join(strength.degradation_reasons),
@@ -1464,7 +1682,7 @@ class DecisionWorkflow:
                         data_time=strength.data_time,
                         fetched_at=started_at,
                         expected_rows=(
-                            self.calendar.expected_minutes_through(started_at)
+                            self.calendar.expected_minutes_through(expectation_at)
                             if dataset is CaptureDataset.MINUTE_BAR
                             else 1
                         ),
@@ -1495,8 +1713,11 @@ class DecisionWorkflow:
             },
             dataset_quality=dataset_quality,
             capture_run_id=run_id,
+            mode=run.mode,
             effective_trade_date=run.effective_trade_date,
             history_cutoff_date=run.history_cutoff_date,
+            requested_symbol_scope=run.requested_symbol_scope,
+            lease_expires_at=run.lease_expires_at,
             thresholds={
                 "stale_trading_minutes": float(self.stale_trading_minutes),
             },
@@ -1507,7 +1728,7 @@ class DecisionWorkflow:
         market_input_id = MarketInputSnapshotRepository(self.connection).save(
             market_input
         )
-        if not decision_symbols:
+        if run.mode is CaptureExecutionMode.DISPLAY_ONLY or not decision_symbols:
             degraded = any(
                 item.status
                 not in {
@@ -1530,28 +1751,54 @@ class DecisionWorkflow:
                 if degraded
                 else CaptureRunStatus.SUCCEEDED
             )
-            run_repository.update_claimed(
-                run.model_copy(
-                    update={
-                        "status": final_status,
-                        "finished_at": self._now(),
-                        "processed_symbols": len(capture_symbols),
-                        "provider_calls": provider_calls,
-                        "provider_duration_ms": provider_duration_ms,
-                        "rows_received": rows_received,
-                        "rows_written": rows_written,
-                        "warning_count": len(warnings),
-                        "failure_count": unusable_quotes,
-                    }
-                ),
-                claim_started_at=run.started_at,
+            completed_run = run.model_copy(
+                update={
+                    "status": final_status,
+                    "finished_at": self._now(),
+                    "processed_symbols": len(capture_symbols),
+                    "provider_calls": provider_calls,
+                    "provider_duration_ms": provider_duration_ms,
+                    "rows_received": rows_received,
+                    "rows_written": rows_written,
+                    "warning_count": len(warnings),
+                    "failure_count": unusable_quotes,
+                }
             )
+            if run.mode is CaptureExecutionMode.DISPLAY_ONLY:
+                run_repository.update_claimed(
+                    completed_run,
+                    claim_started_at=run.started_at,
+                    commit=False,
+                )
+                self._record_display_only_audit(
+                    completed_run,
+                    requested_at=requested_at,
+                    manual_reason=manual_reason,
+                    event_type="market_capture.display_only",
+                    created_at=started_at,
+                    commit=False,
+                )
+                self.connection.commit()
+            else:
+                run_repository.update_claimed(
+                    completed_run,
+                    claim_started_at=run.started_at,
+                )
             return IntradayWorkflowResult(
                 run_id=run_id,
                 reused=False,
                 status=final_status,
                 market_input_snapshot_id=market_input_id,
                 recommendation_ids=(),
+                mode=run.mode or CaptureExecutionMode.DECISION,
+                effective_trade_date=run.effective_trade_date or run.trade_date,
+                history_cutoff_date=(
+                    run.history_cutoff_date or self.calendar.previous_trading_day(trade_date)
+                ),
+                requested_symbol_scope=tuple(run.requested_symbol_scope),
+                lease_expires_at=(
+                    run.lease_expires_at or run.started_at + self.INTRADAY_LEASE
+                ),
                 warnings=tuple(warnings),
             )
 
@@ -2040,6 +2287,15 @@ class DecisionWorkflow:
             recommendation_ids=tuple(
                 recommendation.recommendation_id for recommendation in recommendations
             ),
+            mode=run.mode or CaptureExecutionMode.DECISION,
+            effective_trade_date=run.effective_trade_date or run.trade_date,
+            history_cutoff_date=(
+                run.history_cutoff_date or self.calendar.previous_trading_day(trade_date)
+            ),
+            requested_symbol_scope=tuple(run.requested_symbol_scope),
+            lease_expires_at=(
+                run.lease_expires_at or run.started_at + self.INTRADAY_LEASE
+            ),
             warnings=tuple(warnings),
         )
 
@@ -2058,7 +2314,7 @@ class DecisionWorkflow:
         ):
             return quote
         session_close = self.calendar.session(trade_date).close_at
-        if observed_at < session_close:
+        if observed_at <= session_close:
             return quote
         current_bars = daily_repository.current(quote.symbol, limit=1)
         if not current_bars:
@@ -2536,6 +2792,12 @@ class DecisionWorkflow:
         }
 
     def _market_input_id_for_run(self, run_id: str) -> int:
+        snapshot_id = self._market_input_id_for_run_or_none(run_id)
+        if snapshot_id is not None:
+            return snapshot_id
+        raise KeyError(f"market input snapshot not found for run: {run_id}")
+
+    def _market_input_id_for_run_or_none(self, run_id: str) -> int | None:
         rows = self.connection.execute(
             "SELECT id, payload_json FROM market_input_snapshots ORDER BY id DESC"
         ).fetchall()
@@ -2543,7 +2805,7 @@ class DecisionWorkflow:
             snapshot = MarketInputSnapshot.model_validate_json(row["payload_json"])
             if snapshot.capture_run_id == run_id:
                 return int(row["id"])
-        raise KeyError(f"market input snapshot not found for run: {run_id}")
+        return None
 
     def _local_history_references(
         self,

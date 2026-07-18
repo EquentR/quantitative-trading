@@ -26,6 +26,7 @@ from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.cli_service import MarketCliService
 from quantitative_trading.market.models import (
     CaptureDataset,
+    CaptureExecutionMode,
     CaptureResultStatus,
     DailyBar,
     DailyMoneyFlow,
@@ -51,7 +52,10 @@ from quantitative_trading.market.repositories import (
     MinuteBarRepository,
     content_digest,
 )
-from quantitative_trading.market.repository import MarketInputSnapshotRepository
+from quantitative_trading.market.repository import (
+    MarketInputSnapshotRepository,
+    QuoteSnapshotRepository,
+)
 from quantitative_trading.notification.repository import NotificationRepository
 from quantitative_trading.planning.models import TradingPlanStatus
 from quantitative_trading.planning.repository import TradingPlanRepository
@@ -3454,6 +3458,595 @@ def test_intraday_marks_plan_expired_after_valid_until(tmp_path) -> None:
         RecommendationAction.BUY,
         RecommendationAction.ADD,
     }
+
+
+def test_display_only_intraday_persists_mode_dates_scope_and_wall_clock_bucket(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-display-only-run.db")
+    calendar = XSHGTradingCalendar()
+    requested_at = datetime(2026, 7, 18, 2, 0, tzinfo=UTC)
+    effective_date = date(2026, 7, 17)
+    clock = MutableClock(requested_at)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        desired = calendar.sessions_ending(effective_date, 250)
+        daily_provider = CalendarDailyProvider(calendar)
+        for bar in daily_provider.get_daily_bars(
+            "600000", desired[0], desired[-1], "forward"
+        ):
+            DailyBarRepository(connection).save(bar)
+
+        workflow = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        )
+        first = workflow.run_intraday(
+            as_of=requested_at,
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+            manual_reason="market page refresh",
+        )
+        second = workflow.run_intraday(
+            as_of=requested_at + timedelta(minutes=1),
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+        )
+        run = MarketCaptureRunRepository(connection).get(first.run_id)
+        market_input = MarketInputSnapshotRepository(connection).get(
+            first.market_input_snapshot_id
+        )
+        audit = AuditLogRepository(connection).get(f"audit-{first.run_id}")
+
+    assert first.run_id == "intraday-display_only-20260717-20260718-1000"
+    assert second.run_id == first.run_id
+    assert second.reused is True
+    assert first.mode is CaptureExecutionMode.DISPLAY_ONLY
+    assert first.effective_trade_date == effective_date
+    assert first.history_cutoff_date == effective_date
+    assert first.requested_symbol_scope == ("600000",)
+    assert first.lease_expires_at == requested_at + timedelta(minutes=10)
+    assert run is not None
+    assert run.mode is CaptureExecutionMode.DISPLAY_ONLY
+    assert run.effective_trade_date == effective_date
+    assert run.history_cutoff_date == effective_date
+    assert run.requested_symbol_scope == ["600000"]
+    assert run.lease_expires_at == requested_at + timedelta(minutes=10)
+    assert run.idempotency_key == (
+        "intraday:display_only:2026-07-17:20260718-1000"
+    )
+    assert market_input is not None
+    assert market_input.mode is CaptureExecutionMode.DISPLAY_ONLY
+    assert market_input.effective_trade_date == effective_date
+    assert market_input.history_cutoff_date == effective_date
+    assert market_input.requested_symbol_scope == ["600000"]
+    assert market_input.lease_expires_at == requested_at + timedelta(minutes=10)
+    assert audit is not None
+    assert audit.event_type == "market_capture.display_only"
+    assert audit.payload == {
+        "run_id": first.run_id,
+        "requested_at": requested_at.isoformat(),
+        "manual_reason": "market page refresh",
+        "mode": "display_only",
+        "effective_trade_date": effective_date.isoformat(),
+        "history_cutoff_date": effective_date.isoformat(),
+        "requested_symbol_scope": ["600000"],
+        "lease_expires_at": (requested_at + timedelta(minutes=10)).isoformat(),
+    }
+
+
+def test_display_only_intraday_hard_exits_before_decision_side_effects(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-display-only-guard.db")
+    calendar = XSHGTradingCalendar()
+    requested_at = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
+    clock = MutableClock(requested_at)
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("display-only crossed the decision boundary")
+
+    monkeypatch.setattr(
+        "quantitative_trading.decision.workflow.create_and_save_account_snapshot_with_connection",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        "quantitative_trading.decision.workflow.evaluate_plan_conditions",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        "quantitative_trading.decision.workflow._risk_context_state",
+        forbidden,
+    )
+    monkeypatch.setattr(
+        "quantitative_trading.decision.workflow.decide_symbol",
+        forbidden,
+    )
+
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        desired = calendar.sessions_ending(date(2026, 7, 13), 250)
+        daily_provider = CalendarDailyProvider(calendar)
+        for bar in daily_provider.get_daily_bars(
+            "600000", desired[0], desired[-1], "forward"
+        ):
+            DailyBarRepository(connection).save(bar)
+        protected_tables = (
+            "account_snapshots",
+            "trading_plans",
+            "recommendations",
+            "notifications",
+            "email_deliveries",
+        )
+        before = {
+            table: connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in protected_tables
+        }
+
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+            notification_dispatcher=FailingRecommendationDispatcher(),
+        ).run_intraday(
+            as_of=requested_at,
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+            manual_reason="manual market refresh",
+        )
+        after = {
+            table: connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            for table in protected_tables
+        }
+
+    assert result.recommendation_ids == ()
+    assert result.mode is CaptureExecutionMode.DISPLAY_ONLY
+    assert after == before
+
+
+def test_display_only_intraday_does_not_expire_or_rewrite_existing_plan(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "display-plan-immutable.db")
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(datetime(2026, 7, 16, 7, 20, tzinfo=UTC))
+    daily_provider = CalendarDailyProvider(calendar)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        close = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=NoopIntradayProvider(),
+            now=clock.now,
+        ).run_close(date(2026, 7, 16))
+        before = TradingPlanRepository(connection).get(close.plan_id)
+        assert before is not None
+        assert before.trading_day == date(2026, 7, 17)
+
+        clock.value = datetime(2026, 7, 18, 2, 0, tzinfo=UTC)
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday(
+            as_of=clock.value,
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+        )
+        after = TradingPlanRepository(connection).get(close.plan_id)
+
+    assert result.recommendation_ids == ()
+    assert after == before
+
+
+def test_display_only_intraday_does_not_resave_or_promote_timed_stale_quote(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "display-timed-quote.db")
+    calendar = XSHGTradingCalendar()
+    requested_at = datetime(2026, 7, 18, 2, 0, tzinfo=UTC)
+    clock = MutableClock(requested_at)
+    daily_provider = MatchingCloseDailyProvider(calendar)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        desired = calendar.sessions_ending(date(2026, 7, 17), 250)
+        for bar in daily_provider.get_daily_bars(
+            "600000", desired[0], desired[-1], "forward"
+        ):
+            DailyBarRepository(connection).save(bar)
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday(
+            as_of=requested_at,
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+        )
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        quote = QuoteSnapshotRepository(connection).get(
+            market_input.quote_snapshot_refs["600000"]
+        )
+        quote_count = connection.execute(
+            "SELECT COUNT(*) FROM quote_snapshots WHERE symbol='600000'"
+        ).fetchone()[0]
+
+    assert quote is not None
+    assert quote.status is QuoteStatus.STALE
+    assert market_input.dataset_quality["600000"][CaptureDataset.QUOTE].status is (
+        CaptureResultStatus.STALE
+    )
+    assert quote_count == 1
+
+
+def test_display_only_intraday_restart_reads_provenance_and_next_bucket_is_new(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "intraday-display-only-restart.db")
+    calendar = XSHGTradingCalendar()
+    clock = MutableClock(datetime(2026, 7, 18, 2, 0, tzinfo=UTC))
+    daily_provider = CalendarDailyProvider(calendar)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        desired = calendar.sessions_ending(date(2026, 7, 17), 250)
+        for bar in daily_provider.get_daily_bars(
+            "600000", desired[0], desired[-1], "forward"
+        ):
+            DailyBarRepository(connection).save(bar)
+        first = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday(
+            as_of=clock.value,
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+        )
+
+    clock.value += timedelta(minutes=3)
+    with connect(settings) as connection:
+        migrate(connection)
+        persisted_run = MarketCaptureRunRepository(connection).get(first.run_id)
+        persisted_input = MarketInputSnapshotRepository(connection).get(
+            first.market_input_snapshot_id
+        )
+        second = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday(
+            as_of=clock.value,
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+        )
+
+    assert persisted_run is not None
+    assert persisted_run.mode is CaptureExecutionMode.DISPLAY_ONLY
+    assert persisted_run.requested_symbol_scope == ["600000"]
+    assert persisted_input is not None
+    assert persisted_input.mode is CaptureExecutionMode.DISPLAY_ONLY
+    assert persisted_input.requested_symbol_scope == ["600000"]
+    assert persisted_input.lease_expires_at == datetime(
+        2026, 7, 18, 2, 10, tzinfo=UTC
+    )
+    assert second.run_id == "intraday-display_only-20260717-20260718-1003"
+    assert second.run_id != first.run_id
+    assert second.reused is False
+
+
+def test_display_only_intraday_reuse_never_reads_recommendations_or_dispatches(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(database_path=tmp_path / "display-reuse-hard-gate.db")
+    calendar = XSHGTradingCalendar()
+    requested_at = datetime(2026, 7, 18, 2, 0, tzinfo=UTC)
+    clock = MutableClock(requested_at)
+
+    def forbidden_list(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("display-only reuse read recommendations")
+
+    monkeypatch.setattr(RecommendationRepository, "list", forbidden_list)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        daily_provider = CalendarDailyProvider(calendar)
+        desired = calendar.sessions_ending(date(2026, 7, 17), 250)
+        for bar in daily_provider.get_daily_bars(
+            "600000", desired[0], desired[-1], "forward"
+        ):
+            DailyBarRepository(connection).save(bar)
+        workflow = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+            notification_dispatcher=FailingRecommendationDispatcher(),
+        )
+
+        first = workflow.run_intraday(
+            as_of=requested_at,
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+        )
+        second = workflow.run_intraday(
+            as_of=requested_at + timedelta(minutes=1),
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+        )
+
+    assert first.recommendation_ids == second.recommendation_ids == ()
+    assert second.reused is True
+
+
+def test_display_only_intraday_retries_same_bucket_after_pre_input_exception(
+    tmp_path,
+) -> None:
+    settings = Settings(database_path=tmp_path / "display-pre-input-retry.db")
+    calendar = XSHGTradingCalendar()
+    requested_at = datetime(2026, 7, 18, 2, 0, tzinfo=UTC)
+    clock = MutableClock(requested_at)
+
+    class FailOnceIntradayProvider(RisingIntradayProvider):
+        def __init__(self, calendar, clock):
+            super().__init__(calendar, clock)
+            self.failed = False
+
+        def get_minute_bars(self, symbol, trade_date, interval):
+            if not self.failed:
+                self.failed = True
+                raise ValueError("synthetic internal display failure")
+            return super().get_minute_bars(symbol, trade_date, interval)
+
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        daily_provider = CalendarDailyProvider(calendar)
+        desired = calendar.sessions_ending(date(2026, 7, 17), 250)
+        for bar in daily_provider.get_daily_bars(
+            "600000", desired[0], desired[-1], "forward"
+        ):
+            DailyBarRepository(connection).save(bar)
+        workflow = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=FailOnceIntradayProvider(calendar, clock),
+            now=clock.now,
+        )
+
+        with pytest.raises(ValueError, match="synthetic internal display failure"):
+            workflow.run_intraday(
+                as_of=requested_at,
+                mode=CaptureExecutionMode.DISPLAY_ONLY,
+            )
+        run_id = "intraday-display_only-20260717-20260718-1000"
+        failure_audit = AuditLogRepository(connection).get(
+            f"audit-{run_id}-failed-0"
+        )
+        assert failure_audit is not None
+        assert failure_audit.payload["run_id"] == run_id
+        assert failure_audit.payload["mode"] == "display_only"
+        assert failure_audit.payload["effective_trade_date"] == "2026-07-17"
+        assert failure_audit.payload["history_cutoff_date"] == "2026-07-17"
+        assert failure_audit.payload["requested_symbol_scope"] == ["600000"]
+        assert failure_audit.payload["lease_expires_at"] == (
+            requested_at + timedelta(minutes=10)
+        ).isoformat()
+        assert "synthetic internal display failure" in failure_audit.payload[
+            "error_summary"
+        ]
+        clock.value = requested_at + timedelta(minutes=2)
+        retry = workflow.run_intraday(
+            as_of=clock.value,
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+        )
+        run = MarketCaptureRunRepository(connection).get(retry.run_id)
+        market_input = MarketInputSnapshotRepository(connection).get(
+            retry.market_input_snapshot_id
+        )
+        success_audit = AuditLogRepository(connection).get(f"audit-{run_id}")
+
+    assert retry.reused is False
+    assert retry.market_input_snapshot_id > 0
+    assert retry.lease_expires_at == clock.value + timedelta(minutes=10)
+    assert run is not None
+    assert run.retry_count == 1
+    assert run.lease_expires_at == clock.value + timedelta(minutes=10)
+    assert market_input is not None
+    assert market_input.lease_expires_at == clock.value + timedelta(minutes=10)
+    assert success_audit is not None
+    assert success_audit.payload["lease_expires_at"] == (
+        clock.value + timedelta(minutes=10)
+    ).isoformat()
+
+
+def test_display_only_intraday_retries_when_terminal_audit_write_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    settings = Settings(database_path=tmp_path / "display-audit-retry.db")
+    calendar = XSHGTradingCalendar()
+    requested_at = datetime(2026, 7, 18, 2, 0, tzinfo=UTC)
+    clock = MutableClock(requested_at)
+    real_save = AuditLogRepository.save
+    failed = False
+
+    def fail_success_audit_once(repository, audit, *, commit=True):
+        nonlocal failed
+        if audit.event_type == "market_capture.display_only" and not failed:
+            failed = True
+            raise sqlite3.OperationalError("synthetic display audit failure")
+        return real_save(repository, audit, commit=commit)
+
+    monkeypatch.setattr(AuditLogRepository, "save", fail_success_audit_once)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        daily_provider = CalendarDailyProvider(calendar)
+        desired = calendar.sessions_ending(date(2026, 7, 17), 250)
+        for bar in daily_provider.get_daily_bars(
+            "600000", desired[0], desired[-1], "forward"
+        ):
+            DailyBarRepository(connection).save(bar)
+        workflow = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=ClockQuoteProvider(clock),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        )
+
+        with pytest.raises(sqlite3.OperationalError, match="display audit failure"):
+            workflow.run_intraday(
+                as_of=requested_at,
+                mode=CaptureExecutionMode.DISPLAY_ONLY,
+            )
+        run_id = "intraday-display_only-20260717-20260718-1000"
+        failed_run = MarketCaptureRunRepository(connection).get(run_id)
+        assert failed_run is not None
+        assert failed_run.status is CaptureRunStatus.FAILED
+        assert AuditLogRepository(connection).get(f"audit-{run_id}") is None
+
+        retry = workflow.run_intraday(
+            as_of=requested_at,
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+        )
+        completed_run = MarketCaptureRunRepository(connection).get(run_id)
+        audit = AuditLogRepository(connection).get(f"audit-{run_id}")
+
+    assert retry.reused is False
+    assert completed_run is not None
+    assert completed_run.retry_count == 1
+    assert audit is not None
+    assert audit.event_type == "market_capture.display_only"
+
+
+@pytest.mark.parametrize(
+    ("case", "requested_at", "price", "seed_daily", "verified"),
+    (
+        (
+            "matched_post_close",
+            datetime(2026, 7, 18, 2, 0, tzinfo=UTC),
+            10.5,
+            True,
+            True,
+        ),
+        (
+            "mismatched_post_close",
+            datetime(2026, 7, 18, 2, 0, tzinfo=UTC),
+            10.6,
+            True,
+            False,
+        ),
+        (
+            "lunch_break",
+            datetime(2026, 7, 17, 4, 0, tzinfo=UTC),
+            10.5,
+            True,
+            False,
+        ),
+        (
+            "missing_daily_bar",
+            datetime(2026, 7, 18, 2, 0, tzinfo=UTC),
+            10.5,
+            False,
+            False,
+        ),
+    ),
+)
+def test_display_only_intraday_strictly_verifies_untimed_post_close_quote(
+    tmp_path,
+    case,
+    requested_at,
+    price,
+    seed_daily,
+    verified,
+) -> None:
+    settings = Settings(database_path=tmp_path / f"display-quote-{case}.db")
+    calendar = XSHGTradingCalendar()
+    effective_date = (
+        requested_at.astimezone(calendar.timezone).date()
+        if calendar.is_trading_day(requested_at.astimezone(calendar.timezone).date())
+        else calendar.previous_trading_day(
+            requested_at.astimezone(calendar.timezone).date()
+        )
+    )
+    clock = MutableClock(requested_at)
+    daily_provider = MatchingCloseDailyProvider(calendar)
+    with connect(settings) as connection:
+        migrate(connection)
+        seed_account(connection)
+        if seed_daily:
+            desired = calendar.sessions_ending(effective_date, 250)
+            for bar in daily_provider.get_daily_bars(
+                "600000", desired[0], desired[-1], "forward"
+            ):
+                DailyBarRepository(connection).save(bar)
+        result = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=NoTimeQuoteProvider(price),
+            daily_provider=daily_provider,
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=RisingIntradayProvider(calendar, clock),
+            now=clock.now,
+        ).run_intraday(
+            as_of=requested_at,
+            mode=CaptureExecutionMode.DISPLAY_ONLY,
+        )
+        market_input = MarketInputSnapshotRepository(connection).get(
+            result.market_input_snapshot_id
+        )
+        quote = QuoteSnapshotRepository(connection).get(
+            market_input.quote_snapshot_refs["600000"]
+        )
+
+    assert quote is not None
+    assert (quote.data_time is not None) is verified
+    if verified:
+        assert quote.data_time == calendar.session(effective_date).close_at
+        assert "verified against same-day daily close" in quote.warning
 
 
 def test_intraday_strength_uses_normalized_full_day_minute_cache(tmp_path) -> None:

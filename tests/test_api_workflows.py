@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -26,6 +26,7 @@ from quantitative_trading.ledger.models import PositionInput
 from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
+    CaptureExecutionMode,
     CaptureRunStatus,
     DailyBar,
     DailyMoneyFlow,
@@ -527,6 +528,11 @@ def test_close_workflow_uses_factory_and_returns_unified_result(
         "reused": False,
         "ready": True,
         "cleaned_rows": None,
+        "mode": None,
+        "effective_trade_date": None,
+        "history_cutoff_date": None,
+        "requested_symbol_scope": None,
+        "lease_expires_at": None,
     }
     assert calls == [(date(2026, 7, 14), False)]
     assert factory_times == [NORMAL_CLOSE_TIME.astimezone(UTC)]
@@ -723,17 +729,22 @@ def test_intraday_uses_current_period_and_rejects_outside_trading_session(
     tmp_path,
     monkeypatch,
 ) -> None:
-    calls: list[str] = []
+    calls: list[dict] = []
 
     class FakeWorkflow:
-        def run_intraday(self):
-            calls.append("intraday")
+        def run_intraday(self, **kwargs):
+            calls.append(kwargs)
             return SimpleNamespace(
                 run_id="intraday-20260714-1000",
                 reused=False,
                 status=CaptureRunStatus.DEGRADED,
                 market_input_snapshot_id=23,
                 recommendation_ids=("rec-1", "rec-2"),
+                mode=CaptureExecutionMode.DECISION,
+                effective_trade_date=date(2026, 7, 14),
+                history_cutoff_date=date(2026, 7, 13),
+                requested_symbol_scope=("600000",),
+                lease_expires_at=INTRADAY_TIME.astimezone(UTC) + timedelta(minutes=10),
                 warnings=("quote partial",),
             )
 
@@ -762,21 +773,136 @@ def test_intraday_uses_current_period_and_rejects_outside_trading_session(
         "reused": False,
         "ready": None,
         "cleaned_rows": None,
+        "mode": "decision",
+        "effective_trade_date": "2026-07-14",
+        "history_cutoff_date": "2026-07-13",
+        "requested_symbol_scope": ["600000"],
+        "lease_expires_at": "2026-07-14T02:11:00Z",
     }
     assert outside.status_code == 422
     assert outside.json()["error"]["code"] == "workflow_outside_session"
-    assert calls == ["intraday"]
+    assert calls == [
+        {
+            "as_of": INTRADAY_TIME.astimezone(UTC),
+            "mode": CaptureExecutionMode.DECISION,
+            "manual_reason": None,
+        }
+    ]
+
+
+def test_intraday_allows_explicit_weekend_display_only_and_returns_provenance(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    weekend = datetime(2026, 7, 18, 10, 1, tzinfo=SHANGHAI)
+    calls: list[dict] = []
+
+    class FakeWorkflow:
+        def run_intraday(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                run_id="intraday-display_only-20260717-20260718-1000",
+                reused=False,
+                status=CaptureRunStatus.DEGRADED,
+                market_input_snapshot_id=24,
+                recommendation_ids=(),
+                mode=CaptureExecutionMode.DISPLAY_ONLY,
+                effective_trade_date=date(2026, 7, 17),
+                history_cutoff_date=date(2026, 7, 17),
+                requested_symbol_scope=("600000",),
+                lease_expires_at=weekend.astimezone(UTC) + timedelta(minutes=10),
+                warnings=("minute cache stale",),
+            )
+
+    install_clock(monkeypatch, weekend)
+    install_workflow(monkeypatch, FakeWorkflow())
+    client, headers, _settings = authenticated_client(tmp_path)
+
+    response = client.post(
+        "/api/v1/service/workflows/intraday/run",
+        json={
+            "outside_session_mode": "display_only",
+            "manual_reason": "market page refresh",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "display_only"
+    assert body["effective_trade_date"] == "2026-07-17"
+    assert body["history_cutoff_date"] == "2026-07-17"
+    assert body["requested_symbol_scope"] == ["600000"]
+    assert body["lease_expires_at"] == "2026-07-18T02:11:00Z"
+    assert body["plan_id"] is None
+    assert body["recommendation_ids"] == []
+    assert any("本次未生成交易建议" in warning for warning in body["warnings"])
+    assert calls == [
+        {
+            "as_of": weekend.astimezone(UTC),
+            "mode": CaptureExecutionMode.DISPLAY_ONLY,
+            "manual_reason": "market page refresh",
+        }
+    ]
+
+
+def test_weekend_display_only_exception_does_not_dispatch_system_alert(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    weekend = datetime(2026, 7, 18, 10, 1, tzinfo=SHANGHAI)
+
+    class FailingWorkflow:
+        def run_intraday(self, **kwargs):
+            del kwargs
+            raise RuntimeError("synthetic display-only failure")
+
+    install_clock(monkeypatch, weekend)
+    install_workflow(monkeypatch, FailingWorkflow())
+    client, headers, settings = authenticated_client(
+        tmp_path,
+        raise_server_exceptions=False,
+    )
+
+    response = client.post(
+        "/api/v1/service/workflows/intraday/run",
+        json={"outside_session_mode": "display_only"},
+        headers=headers,
+    )
+
+    assert response.status_code == 500
+    with connect(settings) as connection:
+        alerts = NotificationRepository(connection).list_recent(limit=10)
+        failures = AuditLogRepository(connection).list(
+            event_type="service.workflow.run_failed"
+        )
+    assert alerts == []
+    assert len(failures) == 1
+    assert failures[0].payload["run_id"] == (
+        "intraday-display_only-20260717-20260718-1000"
+    )
+    assert failures[0].payload["mode"] == "display_only"
+    assert failures[0].payload["effective_trade_date"] == "2026-07-17"
+    assert failures[0].payload["history_cutoff_date"] == "2026-07-17"
+    assert failures[0].payload["requested_symbol_scope"] == []
+    assert failures[0].payload["lease_expires_at"] == "2026-07-18T02:11:00+00:00"
 
 
 def test_intraday_failed_result_dispatches_system_alert(tmp_path, monkeypatch) -> None:
     class FailedWorkflow:
-        def run_intraday(self):
+        def run_intraday(self, **kwargs):
+            del kwargs
             return SimpleNamespace(
                 run_id="intraday-20260714-1000",
                 reused=False,
                 status=CaptureRunStatus.FAILED,
                 market_input_snapshot_id=24,
                 recommendation_ids=(),
+                mode=CaptureExecutionMode.DECISION,
+                effective_trade_date=date(2026, 7, 14),
+                history_cutoff_date=date(2026, 7, 13),
+                requested_symbol_scope=("600000",),
+                lease_expires_at=INTRADAY_TIME.astimezone(UTC) + timedelta(minutes=10),
                 warnings=("all requested quotes unavailable",),
             )
 
@@ -837,6 +963,11 @@ def test_cleanup_uses_retention_service_and_defaults_as_of(
         "reused": False,
         "ready": None,
         "cleaned_rows": 31,
+        "mode": None,
+        "effective_trade_date": None,
+        "history_cutoff_date": None,
+        "requested_symbol_scope": None,
+        "lease_expires_at": None,
     }
     assert explicit.status_code == 200
     assert explicit.json()["run_id"] == "cleanup-2026-07-13"
@@ -883,7 +1014,8 @@ def test_workflow_failures_return_stable_sanitized_error(
 
 def test_concurrent_workflow_returns_stable_conflict(tmp_path, monkeypatch) -> None:
     class ActiveWorkflow:
-        def run_intraday(self):
+        def run_intraday(self, **kwargs):
+            del kwargs
             raise WorkflowAlreadyRunningError("intraday-20260714-1000")
 
     install_clock(monkeypatch, INTRADAY_TIME)

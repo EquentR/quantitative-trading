@@ -181,7 +181,7 @@ GET /api/v1/market/snapshots/{snapshot_id}/trace?symbol=600000
 
 日 K 最多返回 250 个交易日的前复权 OHLC、成交量、成交额和后端计算的 MA5/10/20/60。A 股资金流最多返回 60 个交易日的主力、超大单、大单、中单和小单净额及净占比；ETF 返回稳定 `not_applicable`，不表示 provider 失败，也不能作为资金确认。日 K 或适用的资金流尚未首次回填时返回 unavailable 和空集合，前端显示中性待回填状态；真实 provider 失败仍显示错误。分钟接口只返回指定交易日且窗口受限的 1 分钟事实、后端 VWAP 和建议发生点；强弱接口返回组件、方向、理由、覆盖率、规则版本和降级原因。前端不得补算这些字段或证券交易制度。
 
-`/market/runs` 和详情返回 capture run、逐标的逐数据集质量及运行成本。run 字段包含工作流类型、交易日、周期起止、幂等键、开始/结束和计算后的 `duration_ms`、请求/处理标的数、`provider_calls/provider_duration_ms`、返回/写入/清理行数、计划/建议/通知/邮件 outbox 数量、重试和最终错误摘要。`dataset_counts` 按 `quote/daily_bar/money_flow/minute_bar/intraday_strength` 汇总 `complete/degraded/failed/stale` 数量。trace 接口必须同时提供 `snapshot_id` 和六位 `symbol`，因为一个市场输入快照包含多个标的；响应解析 quote、history、money flow、intraday strength、计划和建议引用，并返回实际生效阈值。缺少 symbol 返回校验错误，不能任意选择一个标的。
+`/market/runs` 和详情返回 capture run、逐标的逐数据集质量及运行成本。run 字段包含工作流类型、`mode`、交易日、有效交易日、history cutoff、周期起止、请求标的 scope、`lease_expires_at`、幂等键、开始/结束和计算后的 `duration_ms`、请求/处理标的数、`provider_calls/provider_duration_ms`、返回/写入/清理行数、计划/建议/通知/邮件 outbox 数量、重试和最终错误摘要。`dataset_counts` 按 `quote/daily_bar/money_flow/minute_bar/intraday_strength` 汇总 `complete/degraded/failed/stale` 数量。trace 接口必须同时提供 `snapshot_id` 和六位 `symbol`，因为一个市场输入快照包含多个标的；响应解析 quote、history、money flow、intraday strength、计划和建议引用，并返回实际生效阈值。缺少 symbol 返回校验错误，不能任意选择一个标的。
 
 盘中 stale 默认阈值由 `QT_MARKET_STALE_TRADING_MINUTES=6` 配置，按有效交易分钟计算；午休和非交易时段不累计。API 返回原始 `data_time`、质量和快照中的实际阈值，不用请求时间掩盖旧数据。
 
@@ -292,6 +292,10 @@ POST /api/v1/service/workflows/{workflow_type}/run
 ```
 
 调度 start/stop 只切换本地调度和持久化启用状态，不触发真实下单，不控制真实交易客户端，也不修改真实券商账户。工作流手动触发必须认证，`workflow_type` 为 `close/intraday/backfill/cleanup`；强制运行、跳过交易日历或超过收盘截止补跑必须记录原因和审计。相同幂等键已有有效执行租约时返回 HTTP `409 workflow_in_progress`，不会重复调用 provider；数据库按 `workflow_type` 对所有 `running` run 建立全局唯一租约，因此 HTTP、CLI、后台调度和多进程重叠周期都会被拒绝或记录 overrun。失败、降级未发布或租约超时的 run 通过原子 compare-and-set 重领并增加 `retry_count`。未处理异常必须把已领取的 run 落成 `failed`。旧 `POST /service/run-once` 和 `GET /account/snapshot?fresh=true` 经认证后固定返回 HTTP `410`，不再形成重复行情采集路径。
+
+普通 intraday 请求在非交易时段仍返回 HTTP `422 workflow_outside_session`。行情展示刷新必须显式提交 `{"outside_session_mode":"display_only","manual_reason":"market_page_refresh"}`；服务端仅在非交易时段选择 display-only，交易时段同一请求仍执行 decision，后台 scheduler 也永远执行 decision。display-only 响应的 `recommendation_ids` 为空、`plan_id` 为空，并在 warnings 明确“本次未生成交易建议”；该模式不会创建账户快照、计划、建议、通知或邮件。
+
+`WorkflowRunResponse` 对所有工作流增加可空的 `mode/effective_trade_date/history_cutoff_date/requested_symbol_scope/lease_expires_at`。intraday 返回实际值；其他工作流当前可以为 `null`。客户端必须使用响应或 run detail 中后端计算的 `lease_expires_at`，不能自行硬编码另一个运行超时。CLI 对应入口是 `qt workflow intraday --display-only [--reason ...]`；它与既有 `--force/--reason` 语义独立，`--force` 和 `--display-only` 不可组合。
 
 `GET /service/status` 的认证响应包含最近任务类型、`last_reason`、开始/结束时间、状态、安全错误摘要、最近计划/建议引用，以及累计 `overrun_count` 和 `skipped_count`。未认证请求仍只返回认证启动状态，不暴露监控细节。
 

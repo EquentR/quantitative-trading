@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 import logging
 from typing import Annotated, Literal
 
@@ -22,9 +22,11 @@ from quantitative_trading.decision.factory import (
 )
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.models import (
+    CaptureExecutionMode,
     CaptureRunAlreadyActiveError,
     CaptureRunStatus,
 )
+from quantitative_trading.market.repositories import MarketCaptureRunRepository
 from quantitative_trading.planning.repository import TradingPlanRepository
 from quantitative_trading.ledger.repository import PositionRepository
 from quantitative_trading.sanitization import safe_error_summary
@@ -41,6 +43,7 @@ LOGGER = logging.getLogger(__name__)
 
 WorkflowType = Literal["close", "intraday", "backfill", "cleanup"]
 BackfillAsOfMode = Literal["latest_complete"]
+OutsideSessionMode = Literal["display_only"]
 Symbol = Annotated[str, Field(pattern=r"^[0-9]{6}$")]
 
 
@@ -54,6 +57,7 @@ class WorkflowRunRequest(BaseModel):
     as_of: date | None = None
     as_of_mode: BackfillAsOfMode | None = None
     symbols: list[Symbol] | None = Field(default=None, min_length=1, max_length=500)
+    outside_session_mode: OutsideSessionMode | None = None
 
 
 class WorkflowRunResponse(BaseModel):
@@ -67,6 +71,11 @@ class WorkflowRunResponse(BaseModel):
     reused: bool
     ready: bool | None
     cleaned_rows: int | None
+    mode: CaptureExecutionMode | None = None
+    effective_trade_date: date | None = None
+    history_cutoff_date: date | None = None
+    requested_symbol_scope: list[Symbol] | None = None
+    lease_expires_at: datetime | None = None
 
 
 def _current_time() -> datetime:
@@ -160,6 +169,7 @@ def _validate_fields(
             request.as_of is not None
             or request.as_of_mode is not None
             or request.symbols is not None
+            or request.outside_session_mode is not None
         ):
             raise _invalid_request(workflow_type)
         return
@@ -169,7 +179,8 @@ def _validate_fields(
                 request.trade_date is not None,
                 request.force,
                 request.skip_calendar,
-                request.manual_reason is not None,
+                request.manual_reason is not None
+                and request.outside_session_mode is None,
                 request.as_of is not None,
                 request.as_of_mode is not None,
                 request.symbols is not None,
@@ -185,6 +196,7 @@ def _validate_fields(
                 request.manual_reason is not None,
                 request.as_of is not None,
                 request.trade_date is not None and request.as_of_mode is not None,
+                request.outside_session_mode is not None,
             )
         ):
             raise _invalid_request(workflow_type)
@@ -197,6 +209,7 @@ def _validate_fields(
             request.manual_reason is not None,
             request.as_of_mode is not None,
             request.symbols is not None,
+            request.outside_session_mode is not None,
         )
     ):
         raise _invalid_request(workflow_type)
@@ -232,6 +245,11 @@ def _audit_request(
             "manual_reason": request.manual_reason,
             "symbols": request.symbols,
             **(
+                {"outside_session_mode": request.outside_session_mode}
+                if request.outside_session_mode is not None
+                else {}
+            ),
+            **(
                 {"as_of_mode": request.as_of_mode}
                 if request.as_of_mode is not None
                 else {}
@@ -249,6 +267,17 @@ def _audit_failed_request(
     exc: ApiError,
     now: datetime,
 ) -> None:
+    display_only = False
+    if (
+        workflow_type == "intraday"
+        and request.outside_session_mode == "display_only"
+    ):
+        calendar = XSHGTradingCalendar()
+        local_now = now.astimezone(calendar.timezone)
+        display_only = not (
+            calendar.is_trading_day(local_now.date())
+            and calendar.is_trading_minute(local_now)
+        )
     event_type = (
         "service.workflow.run_failed"
         if exc.status_code >= 500
@@ -256,6 +285,42 @@ def _audit_failed_request(
     )
     try:
         with connection_scope(container.settings) as connection:
+            provenance = {}
+            if display_only:
+                resolution = calendar.resolve_market_dates(
+                    local_now,
+                    session_ready=lambda _: True,
+                )
+                period_minute = local_now.minute - local_now.minute % 3
+                period_start = local_now.replace(
+                    minute=period_minute,
+                    second=0,
+                    microsecond=0,
+                )
+                run_id = (
+                    "intraday-display_only-"
+                    f"{resolution.effective_trade_date:%Y%m%d}-"
+                    f"{period_start:%Y%m%d-%H%M}"
+                )
+                run = MarketCaptureRunRepository(connection).get(run_id)
+                provenance = {
+                    "run_id": run_id,
+                    "mode": CaptureExecutionMode.DISPLAY_ONLY.value,
+                    "effective_trade_date": (
+                        resolution.effective_trade_date.isoformat()
+                    ),
+                    "history_cutoff_date": resolution.history_cutoff_date.isoformat(),
+                    "requested_symbol_scope": (
+                        []
+                        if run is None
+                        else run.requested_symbol_scope
+                    ),
+                    "lease_expires_at": (
+                        (now + timedelta(minutes=10)).isoformat()
+                        if run is None or run.lease_expires_at is None
+                        else run.lease_expires_at.isoformat()
+                    ),
+                }
             AuditService(AuditLogRepository(connection)).record_event(
                 event_type=event_type,
                 recommendation_id=None,
@@ -272,6 +337,12 @@ def _audit_failed_request(
                     ),
                     "as_of": None if request.as_of is None else request.as_of.isoformat(),
                     "symbols": request.symbols,
+                    **provenance,
+                    **(
+                        {"outside_session_mode": request.outside_session_mode}
+                        if request.outside_session_mode is not None
+                        else {}
+                    ),
                     **(
                         {"as_of_mode": request.as_of_mode}
                         if request.as_of_mode is not None
@@ -280,7 +351,7 @@ def _audit_failed_request(
                 },
                 now=now,
             )
-            if exc.status_code >= 500:
+            if exc.status_code >= 500 and not display_only:
                 details = exc.details or {}
                 dispatch_workflow_failure_alert(
                     connection,
@@ -393,10 +464,16 @@ def _run_intraday(
 ) -> WorkflowRunResponse:
     calendar = XSHGTradingCalendar()
     local_now = now.astimezone(calendar.timezone)
-    if not calendar.is_trading_day(local_now.date()) or not calendar.is_trading_minute(
-        local_now
-    ):
+    in_session = calendar.is_trading_day(
+        local_now.date()
+    ) and calendar.is_trading_minute(local_now)
+    if not in_session and request.outside_session_mode != "display_only":
         raise _outside_intraday_session()
+    mode = (
+        CaptureExecutionMode.DECISION
+        if in_session
+        else CaptureExecutionMode.DISPLAY_ONLY
+    )
 
     try:
         with connection_scope(container.settings) as connection:
@@ -414,9 +491,20 @@ def _run_intraday(
                 container.settings,
                 now=lambda: now,
             )
-            result = workflow.run_intraday()
-            plan = TradingPlanRepository(connection).active_for_day(local_now.date())
-            if result.status is CaptureRunStatus.FAILED:
+            result = workflow.run_intraday(
+                as_of=now,
+                mode=mode,
+                manual_reason=request.manual_reason,
+            )
+            plan = (
+                TradingPlanRepository(connection).active_for_day(local_now.date())
+                if mode is CaptureExecutionMode.DECISION
+                else None
+            )
+            if (
+                mode is CaptureExecutionMode.DECISION
+                and result.status is CaptureRunStatus.FAILED
+            ):
                 _dispatch_failed_result_alert(
                     connection,
                     container,
@@ -445,10 +533,22 @@ def _run_intraday(
         snapshot_id=result.market_input_snapshot_id,
         plan_id=None if plan is None else plan.plan_id,
         recommendation_ids=list(result.recommendation_ids),
-        warnings=list(result.warnings),
+        warnings=[
+            *result.warnings,
+            *(
+                ["行情展示已刷新，本次未生成交易建议"]
+                if result.mode is CaptureExecutionMode.DISPLAY_ONLY
+                else []
+            ),
+        ],
         reused=result.reused,
         ready=None,
         cleaned_rows=None,
+        mode=result.mode,
+        effective_trade_date=result.effective_trade_date,
+        history_cutoff_date=result.history_cutoff_date,
+        requested_symbol_scope=list(result.requested_symbol_scope),
+        lease_expires_at=result.lease_expires_at,
     )
 
 

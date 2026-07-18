@@ -597,14 +597,28 @@ class MarketInputSnapshot(BaseModel):
     mode: CaptureExecutionMode | None = None
     effective_trade_date: date | None = None
     history_cutoff_date: date | None = None
+    requested_symbol_scope: list[str] = Field(default_factory=list, max_length=500)
+    lease_expires_at: datetime | None = None
     data_time: datetime | None = None
     fetched_at: datetime
     warnings: list[str]
 
-    @field_validator("data_time", "fetched_at")
+    @field_validator("data_time", "fetched_at", "lease_expires_at")
     @classmethod
     def datetimes_must_be_timezone_aware(cls, value: datetime | None) -> datetime | None:
         return _must_be_timezone_aware(value)
+
+    @field_validator("requested_symbol_scope")
+    @classmethod
+    def requested_scope_must_be_canonical(cls, value: list[str]) -> list[str]:
+        if any(
+            len(symbol) != 6 or not symbol.isascii() or not symbol.isdigit()
+            for symbol in value
+        ):
+            raise ValueError("requested symbol scope must contain six ASCII digits")
+        if value != sorted(set(value)):
+            raise ValueError("requested symbol scope must be sorted and unique")
+        return value
 
     @field_validator(
         "quote_snapshot_refs",

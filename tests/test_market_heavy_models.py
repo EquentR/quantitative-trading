@@ -424,11 +424,21 @@ def test_market_input_snapshot_accepts_run_link_and_dataset_quality_defaults() -
         mode="display_only",
         effective_trade_date=date(2026, 7, 13),
         history_cutoff_date=date(2026, 7, 10),
+        requested_symbol_scope=["512480", "600000"],
+        lease_expires_at=FETCHED_AT + timedelta(minutes=10),
         fetched_at=FETCHED_AT,
         warnings=[],
     )
     assert display.mode == "display_only"
+    assert display.requested_symbol_scope == ["512480", "600000"]
+    assert display.lease_expires_at == FETCHED_AT + timedelta(minutes=10)
     assert legacy.mode is None
+    assert legacy.requested_symbol_scope == []
+    assert legacy.lease_expires_at is None
+
+    restored = MarketInputSnapshot.model_validate_json(display.model_dump_json())
+    assert restored.requested_symbol_scope == ["512480", "600000"]
+    assert restored.lease_expires_at == FETCHED_AT + timedelta(minutes=10)
 
     with pytest.raises(ValidationError, match="timezone-aware"):
         IntradayStrengthSnapshot(

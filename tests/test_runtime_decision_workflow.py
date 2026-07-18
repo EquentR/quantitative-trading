@@ -4,7 +4,7 @@ from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 from quantitative_trading.config import Settings
-from quantitative_trading.market.models import CaptureRunStatus
+from quantitative_trading.market.models import CaptureExecutionMode, CaptureRunStatus
 
 
 TRADING_TIME = datetime(2026, 7, 14, 2, 0, tzinfo=UTC)
@@ -14,11 +14,16 @@ CLOSE_TIME = datetime(2026, 7, 14, 7, 20, tzinfo=UTC)
 def test_runtime_routes_intraday_to_unified_workflow(tmp_path, monkeypatch) -> None:
     import quantitative_trading.runtime.service_app as service_app
 
-    calls: list[datetime] = []
+    calls: list[tuple[datetime, CaptureExecutionMode]] = []
 
     class FakeWorkflow:
-        def run_intraday(self, *, as_of: datetime):
-            calls.append(as_of)
+        def run_intraday(
+            self,
+            *,
+            as_of: datetime,
+            mode: CaptureExecutionMode,
+        ):
+            calls.append((as_of, mode))
             return SimpleNamespace(
                 run_id="intraday-20260714-1000",
                 status=CaptureRunStatus.SUCCEEDED,
@@ -41,7 +46,7 @@ def test_runtime_routes_intraday_to_unified_workflow(tmp_path, monkeypatch) -> N
         now=TRADING_TIME,
     )
 
-    assert calls == [TRADING_TIME]
+    assert calls == [(TRADING_TIME, CaptureExecutionMode.DECISION)]
     assert result.task_type == "intraday"
     assert result.reason == "intraday_completed"
     assert result.snapshot_id == 17

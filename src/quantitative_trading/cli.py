@@ -7,7 +7,7 @@ import sys
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
@@ -101,7 +101,8 @@ from quantitative_trading.market.adapters import (
 )
 from quantitative_trading.market.calendar import XSHGTradingCalendar
 from quantitative_trading.market.cli_service import MarketCliService
-from quantitative_trading.market.models import CaptureRunStatus
+from quantitative_trading.market.models import CaptureExecutionMode, CaptureRunStatus
+from quantitative_trading.market.repositories import MarketCaptureRunRepository
 from quantitative_trading.market.snapshot_service import MarketSnapshotService
 from quantitative_trading.notification.models import NotificationStatus
 from quantitative_trading.notification.repository import NotificationRepository
@@ -1124,6 +1125,15 @@ def _audit_manual_workflow(
     skip_calendar: bool,
     manual_reason: str | None,
 ) -> None:
+    provenance = {}
+    if hasattr(result, "mode"):
+        provenance = {
+            "mode": result.mode.value,
+            "effective_trade_date": result.effective_trade_date.isoformat(),
+            "history_cutoff_date": result.history_cutoff_date.isoformat(),
+            "requested_symbol_scope": list(result.requested_symbol_scope),
+            "lease_expires_at": result.lease_expires_at.isoformat(),
+        }
     AuditService(AuditLogRepository(connection)).record_event(
         event_type="workflow.manual_run",
         recommendation_id=None,
@@ -1133,6 +1143,7 @@ def _audit_manual_workflow(
             "force": force,
             "skip_calendar": skip_calendar,
             "manual_reason": manual_reason,
+            **provenance,
         },
         now=now,
     )
@@ -1168,10 +1179,22 @@ def _audit_cli_failure(
     force: bool = False,
     skip_calendar: bool = False,
     manual_reason: str | None = None,
+    dispatch_alert: bool = True,
+    requested_at: datetime | None = None,
+    mode: CaptureExecutionMode | None = None,
 ) -> None:
     try:
         failed_at = datetime.now(UTC)
         with _database_scope() as (settings, connection):
+            provenance = (
+                {}
+                if requested_at is None or mode is None
+                else _intraday_failure_provenance(
+                    connection,
+                    requested_at=requested_at,
+                    mode=mode,
+                )
+            )
             AuditService(AuditLogRepository(connection)).record_event(
                 event_type="workflow.manual_run_failed",
                 recommendation_id=None,
@@ -1184,19 +1207,68 @@ def _audit_cli_failure(
                     "skip_calendar": skip_calendar,
                     "manual_reason": manual_reason,
                     "error": error,
+                    **provenance,
                 },
                 now=failed_at,
             )
-            dispatch_workflow_failure_alert(
-                connection,
-                settings,
-                workflow_type=workflow_type,
-                error=error,
-                source="cli",
-                now=failed_at,
-            )
+            if dispatch_alert:
+                dispatch_workflow_failure_alert(
+                    connection,
+                    settings,
+                    workflow_type=workflow_type,
+                    error=error,
+                    source="cli",
+                    now=failed_at,
+                )
     except Exception:
         return
+
+
+def _intraday_failure_provenance(
+    connection: sqlite3.Connection,
+    *,
+    requested_at: datetime,
+    mode: CaptureExecutionMode,
+) -> dict[str, object]:
+    calendar = XSHGTradingCalendar()
+    local_now = requested_at.astimezone(calendar.timezone)
+    if mode is CaptureExecutionMode.DISPLAY_ONLY:
+        resolution = calendar.resolve_market_dates(
+            local_now,
+            session_ready=lambda _: True,
+        )
+        effective_trade_date = resolution.effective_trade_date
+        history_cutoff_date = resolution.history_cutoff_date
+    else:
+        effective_trade_date = local_now.date()
+        history_cutoff_date = calendar.previous_trading_day(effective_trade_date)
+    period_minute = local_now.minute - local_now.minute % 3
+    period_start = local_now.replace(
+        minute=period_minute,
+        second=0,
+        microsecond=0,
+    )
+    run_id = (
+        f"intraday-{effective_trade_date:%Y%m%d}-{period_start:%H%M}"
+        if mode is CaptureExecutionMode.DECISION
+        else (
+            f"intraday-{mode.value}-{effective_trade_date:%Y%m%d}-"
+            f"{period_start:%Y%m%d-%H%M}"
+        )
+    )
+    run = MarketCaptureRunRepository(connection).get(run_id)
+    return {
+        "run_id": run_id,
+        "mode": mode.value,
+        "effective_trade_date": effective_trade_date.isoformat(),
+        "history_cutoff_date": history_cutoff_date.isoformat(),
+        "requested_symbol_scope": [] if run is None else run.requested_symbol_scope,
+        "lease_expires_at": (
+            requested_at + timedelta(minutes=10)
+            if run is None or run.lease_expires_at is None
+            else run.lease_expires_at
+        ).isoformat(),
+    }
 
 
 def _dispatch_cli_failed_result_alert(
@@ -1225,6 +1297,7 @@ def _dispatch_cli_failed_result_alert(
 @workflow_app.command("intraday")
 def run_intraday_workflow(
     force: Annotated[bool, typer.Option("--force")] = False,
+    display_only: Annotated[bool, typer.Option("--display-only")] = False,
     reason: Annotated[str | None, typer.Option("--reason")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
@@ -1235,11 +1308,21 @@ def run_intraday_workflow(
         local_now.date()
     ) and calendar.is_trading_minute(local_now)
     manual_reason = reason.strip() if reason and reason.strip() else None
-    requires_auth = force or not in_session
+    if manual_reason is not None and len(manual_reason) > 500:
+        raise typer.BadParameter("reason must be 500 characters or fewer")
+    if force and display_only:
+        raise typer.BadParameter("--force and --display-only cannot be combined")
+    mode = (
+        CaptureExecutionMode.DISPLAY_ONLY
+        if display_only and not in_session
+        else CaptureExecutionMode.DECISION
+    )
+    requires_auth = force
     if not in_session:
-        if not force:
+        if not force and not display_only:
             raise typer.BadParameter("intraday workflow is outside an XSHG session")
-        manual_reason = _require_manual_reason(manual_reason)
+        if force:
+            manual_reason = _require_manual_reason(manual_reason)
     elif force:
         manual_reason = _require_manual_reason(manual_reason)
 
@@ -1251,7 +1334,11 @@ def run_intraday_workflow(
                 connection,
                 settings,
                 now=lambda: now,
-            ).run_intraday()
+            ).run_intraday(
+                as_of=now,
+                mode=mode,
+                manual_reason=manual_reason,
+            )
             _audit_manual_workflow(
                 connection,
                 workflow_type="intraday",
@@ -1261,7 +1348,10 @@ def run_intraday_workflow(
                 skip_calendar=False,
                 manual_reason=manual_reason,
             )
-            if result.status is CaptureRunStatus.FAILED:
+            if (
+                result.status is CaptureRunStatus.FAILED
+                and mode is CaptureExecutionMode.DECISION
+            ):
                 _dispatch_cli_failed_result_alert(
                     settings,
                     connection,
@@ -1277,6 +1367,9 @@ def run_intraday_workflow(
             trade_date=local_now.date(),
             force=force,
             manual_reason=manual_reason,
+            dispatch_alert=mode is CaptureExecutionMode.DECISION,
+            requested_at=now,
+            mode=mode,
         )
         raise typer.BadParameter(
             f"intraday workflow failed: {safe_error_summary(exc)}"
@@ -1289,6 +1382,11 @@ def run_intraday_workflow(
         "market_input_snapshot_id": result.market_input_snapshot_id,
         "recommendation_ids": list(result.recommendation_ids),
         "warnings": list(result.warnings),
+        "mode": result.mode.value,
+        "effective_trade_date": result.effective_trade_date.isoformat(),
+        "history_cutoff_date": result.history_cutoff_date.isoformat(),
+        "requested_symbol_scope": list(result.requested_symbol_scope),
+        "lease_expires_at": result.lease_expires_at.isoformat(),
     }
     if json_output:
         typer.echo(json.dumps(payload, ensure_ascii=False, default=str))

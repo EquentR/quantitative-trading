@@ -167,14 +167,14 @@
 
 **步骤：**
 
-- [ ] Cycle 6A：RED/GREEN display-only run ID/key 使用 mode + effective date + requested_at 上海墙钟 3 分钟 bucket；decision 保持交易周期。mode/dates/scope/10 分钟 `lease_expires_at` 进入 run、MarketInput、响应和审计。
-- [ ] Cycle 6B：RED/GREEN 在估值/strategy/risk/recommendation/notification dispatcher 前硬门禁；除表行数不变外，用 spies 断言这些依赖根本未调用，recommendation_ids 恒空。
-- [ ] Cycle 6C：RED/GREEN 普通非交易 intraday 仍 422，交易时段和 scheduler 永远 decision，周末 display-only 最近完成会话；CLI 旧 force/reason 语义不变。
-- [ ] Cycle 6D：RED/GREEN 旧数据库字段迁移后服务重启可恢复/读取；display-only bucket 不永久复用旧 run。
-- [ ] Cycle 6E：RED/GREEN 盘后无源时间 quote 只有严格匹配同日 K 收盘才获得验证市场时间。
-- [ ] 同步 project/trading/API 文档并运行 docs tests。
-- [ ] VERIFY：运行 workflow/API/CLI/runtime 定向测试。
-- [ ] REVIEW：后台 agent 重点检查 display-only 无任何决策副作用和审计可追溯。
+- [x] Cycle 6A：RED/GREEN display-only run ID/key 使用 mode + effective date + requested_at 上海墙钟 3 分钟 bucket；decision 保持交易周期。mode/dates/scope/10 分钟 `lease_expires_at` 进入 run、MarketInput、响应和审计。
+- [x] Cycle 6B：RED/GREEN 在估值/strategy/risk/recommendation/notification dispatcher 前硬门禁；除表行数不变外，用 spies 断言这些依赖根本未调用，recommendation_ids 恒空。
+- [x] Cycle 6C：RED/GREEN 普通非交易 intraday 仍 422，交易时段和 scheduler 永远 decision，周末 display-only 最近完成会话；CLI 旧 force/reason 语义不变。
+- [x] Cycle 6D：RED/GREEN 旧数据库字段迁移后服务重启可恢复/读取；display-only bucket 不永久复用旧 run。
+- [x] Cycle 6E：RED/GREEN 盘后无源时间 quote 只有严格匹配同日 K 收盘才获得验证市场时间。
+- [x] 同步 project/trading/API 文档并运行 docs tests。
+- [x] VERIFY：运行 workflow/API/CLI/runtime 定向测试。
+- [x] REVIEW：后台 agent 重点检查 display-only 无任何决策副作用和审计可追溯。
 
 ## Task 7：前端两阶段刷新与运行跟随
 

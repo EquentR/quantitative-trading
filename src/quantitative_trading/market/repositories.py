@@ -637,6 +637,7 @@ class MarketCaptureRunRepository:
         run: MarketCaptureRun,
         *,
         claim_started_at: datetime,
+        commit: bool = True,
     ) -> None:
         cursor = self.connection.execute(
             """UPDATE market_capture_runs SET
@@ -657,7 +658,8 @@ class MarketCaptureRunRepository:
                 claim_started_at.isoformat(),
             ),
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         if cursor.rowcount != 1:
             raise CaptureRunAlreadyActiveError(run.run_id)
 
