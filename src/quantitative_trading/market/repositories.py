@@ -5,7 +5,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Generic, TypeVar
+from typing import Generic, Sequence, TypeVar
 
 from quantitative_trading.market.models import (
     CaptureRunAlreadyActiveError,
@@ -668,14 +668,27 @@ class MarketCaptureRunRepository:
         run: MarketCaptureRun,
         *,
         started_at: datetime,
+        requested_symbol_scope: Sequence[str] | None = None,
+        requested_symbols: int | None = None,
+        lease_expires_at: datetime | None = None,
     ) -> MarketCaptureRun | None:
         cursor = self.connection.execute(
             """UPDATE market_capture_runs SET
                  status='running', started_at=?, finished_at=NULL,
+                 requested_symbol_scope_json=COALESCE(?, requested_symbol_scope_json),
+                 requested_symbols=COALESCE(?, requested_symbols),
+                 lease_expires_at=COALESCE(?, lease_expires_at),
                  retry_count=retry_count+1, error_summary=''
                WHERE run_id=? AND status=? AND started_at=? AND retry_count=?""",
             (
                 started_at.isoformat(),
+                (
+                    None
+                    if requested_symbol_scope is None
+                    else json.dumps(list(requested_symbol_scope), separators=(",", ":"))
+                ),
+                requested_symbols,
+                None if lease_expires_at is None else lease_expires_at.isoformat(),
                 run.run_id,
                 run.status.value,
                 run.started_at.isoformat(),

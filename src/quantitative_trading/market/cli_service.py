@@ -132,6 +132,8 @@ class MarketCliService:
                 status=CaptureRunStatus.RUNNING,
                 started_at=started_at,
                 requested_symbols=len(requested),
+                requested_symbol_scope=requested,
+                lease_expires_at=started_at + timedelta(hours=4),
             )
         )
         if not created and run.status in {
@@ -150,7 +152,13 @@ class MarketCliService:
                 and started_at - run.started_at < timedelta(hours=4)
             ):
                 raise CaptureRunAlreadyActiveError(run.run_id)
-            claimed = run_repository.claim_retry(run, started_at=started_at)
+            claimed = run_repository.claim_retry(
+                run,
+                started_at=started_at,
+                requested_symbol_scope=requested,
+                requested_symbols=len(requested),
+                lease_expires_at=started_at + timedelta(hours=4),
+            )
             if claimed is None:
                 raise CaptureRunAlreadyActiveError(run.run_id)
             run = claimed

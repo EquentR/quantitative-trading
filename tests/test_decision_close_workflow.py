@@ -1398,9 +1398,79 @@ def test_backfill_reuses_completed_non_empty_cutoff_scope_without_provider_calls
     assert daily_provider.calls == daily_calls
     assert flow_provider.calls == flow_calls
     assert persisted is not None
+    assert persisted.requested_symbol_scope == [metadata.symbol]
+    assert persisted.lease_expires_at == NOW + timedelta(hours=4)
     assert persisted.provider_calls == first.provider_calls == second.provider_calls == 2
     assert persisted.rows_received == first.rows_received == second.rows_received
     assert persisted.rows_written == first.rows_written == second.rows_written
+
+
+def test_backfill_retry_refreshes_legacy_scope_and_lease_atomically(tmp_path) -> None:
+    settings = Settings(database_path=tmp_path / "backfill-retry-provenance.db")
+    calendar = XSHGTradingCalendar()
+    metadata = InstrumentMetadata(
+        symbol="600000",
+        name="浦发银行",
+        exchange=Exchange.SH,
+        instrument_type=InstrumentType.A_SHARE,
+        settlement_cycle=SettlementCycle.T1,
+        price_limit_ratio=0.10,
+        metadata_source="test-directory",
+        metadata_checked_at=NOW,
+        rule_version="test-rules-v1",
+    )
+    old_started_at = NOW - timedelta(hours=5)
+    run_id = "backfill-2026-07-13-a3c25177bb8f"
+    with connect(settings) as connection:
+        migrate(connection)
+        InstrumentRepository(connection).replace_catalog([metadata])
+        PositionRepository(connection).add(
+            PositionInput(
+                symbol=metadata.symbol,
+                name=metadata.name,
+                quantity=100,
+                available_quantity=100,
+                cost_price=10,
+                opened_at=TRADE_DATE,
+            ),
+            now=NOW,
+        )
+        run_repository = MarketCaptureRunRepository(connection)
+        run_repository.get_or_create(
+            MarketCaptureRun(
+                run_id=run_id,
+                workflow_type="backfill",
+                trade_date=TRADE_DATE,
+                idempotency_key="market-backfill:2026-07-13:600000",
+                status=CaptureRunStatus.FAILED,
+                started_at=old_started_at,
+                finished_at=old_started_at + timedelta(minutes=1),
+                requested_symbols=0,
+                requested_symbol_scope=[],
+                lease_expires_at=old_started_at + timedelta(hours=4),
+                error_summary="legacy failed run",
+            )
+        )
+        workflow = DecisionWorkflow(
+            connection,
+            calendar=calendar,
+            quote_provider=RecordingQuoteProvider(),
+            daily_provider=CalendarDailyProvider(calendar),
+            money_flow_provider=CalendarFlowProvider(calendar),
+            intraday_provider=NoopIntradayProvider(),
+            now=lambda: NOW,
+        )
+
+        result = workflow.run_backfill(TRADE_DATE, symbols=[metadata.symbol])
+        persisted = run_repository.get(run_id)
+
+    assert result.reused is True
+    assert persisted is not None
+    assert persisted.retry_count == 1
+    assert persisted.started_at == NOW
+    assert persisted.requested_symbols == 1
+    assert persisted.requested_symbol_scope == [metadata.symbol]
+    assert persisted.lease_expires_at == NOW + timedelta(hours=4)
 
 
 def test_backfill_routes_etf_daily_marks_flow_not_applicable_and_skips_unknown(

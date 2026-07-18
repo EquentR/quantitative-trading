@@ -50,6 +50,12 @@ export function marketRefreshMessage(result: MarketRefreshResult): string {
     warning.includes('minute_cache') || warning.includes('当日缓存'))) {
     return '已使用当日缓存，数据部分可用'
   }
+  if (
+    result.overallStatus === 'partial'
+    && result.stages.intraday.mode === 'display_only'
+  ) {
+    return '行情展示已刷新，数据部分可用，本次未生成交易建议'
+  }
   if (result.overallStatus === 'partial') return '行情数据部分可用'
   if (result.stages.intraday.mode === 'display_only') {
     return '行情展示已刷新，本次未生成交易建议'

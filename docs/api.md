@@ -291,7 +291,7 @@ POST /api/v1/service/scheduler/stop
 POST /api/v1/service/workflows/{workflow_type}/run
 ```
 
-调度 start/stop 只切换本地调度和持久化启用状态，不触发真实下单，不控制真实交易客户端，也不修改真实券商账户。工作流手动触发必须认证，`workflow_type` 为 `close/intraday/backfill/cleanup`；强制运行、跳过交易日历或超过收盘截止补跑必须记录原因和审计。相同幂等键已有有效执行租约时返回 HTTP `409 workflow_in_progress`，不会重复调用 provider；数据库按 `workflow_type` 对所有 `running` run 建立全局唯一租约，因此 HTTP、CLI、后台调度和多进程重叠周期都会被拒绝或记录 overrun。失败、降级未发布或租约超时的 run 通过原子 compare-and-set 重领并增加 `retry_count`。未处理异常必须把已领取的 run 落成 `failed`。旧 `POST /service/run-once` 和 `GET /account/snapshot?fresh=true` 经认证后固定返回 HTTP `410`，不再形成重复行情采集路径。
+调度 start/stop 只切换本地调度和持久化启用状态，不触发真实下单，不控制真实交易客户端，也不修改真实券商账户。工作流手动触发必须认证，`workflow_type` 为 `close/intraday/backfill/cleanup`；强制运行、跳过交易日历或超过收盘截止补跑必须记录原因和审计。相同幂等键已有有效执行租约时返回 HTTP `409 workflow_in_progress`，不会重复调用 provider；数据库按 `workflow_type` 对所有 `running` run 建立全局唯一租约，因此 HTTP、CLI、后台调度和多进程重叠周期都会被拒绝或记录 overrun。backfill run detail 保存规范化 `requested_symbol_scope` 和与活动判定一致的 4 小时 lease，intraday run detail 保存 10 分钟 lease；客户端按 409 中的精确 run ID 读取并校验这些字段。失败、降级未发布或租约超时的 run 通过原子 compare-and-set 重领并增加 `retry_count`。未处理异常必须把已领取的 run 落成 `failed`。旧 `POST /service/run-once` 和 `GET /account/snapshot?fresh=true` 经认证后固定返回 HTTP `410`，不再形成重复行情采集路径。
 
 普通 intraday 请求在非交易时段仍返回 HTTP `422 workflow_outside_session`。行情展示刷新必须显式提交 `{"outside_session_mode":"display_only","manual_reason":"market_page_refresh"}`；服务端仅在非交易时段选择 display-only，交易时段同一请求仍执行 decision，后台 scheduler 也永远执行 decision。display-only 响应的 `recommendation_ids` 为空、`plan_id` 为空，并在 warnings 明确“本次未生成交易建议”；该模式不会创建账户快照、计划、建议、通知或邮件。
 

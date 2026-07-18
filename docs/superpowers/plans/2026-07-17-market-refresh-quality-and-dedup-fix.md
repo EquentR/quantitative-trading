@@ -62,14 +62,14 @@
 
 **步骤：**
 
-- [ ] Cycle 2A：RED/GREEN fingerprint v2 排除纯时间元数据，canonical key 使用上海交易日、symbol、action、plan_id、plan_version、v2 fingerprint；实质变化/跨日新建。运行 identity/dispatcher 定向测试。
-- [ ] Cycle 2B：RED/GREEN 跨周期相同条件保留两条建议，只创建一个 notification，并在单事务按 notification/audit -> canonical group -> link 写入；并发冲突回滚后读取已提交 group，再幂等补 link。运行 dispatcher/service 测试。
-- [ ] Cycle 2C：RED/GREEN legacy migration 从 payload 重算 v2 且不改旧 recommendation identity；NULL/损坏 payload/缺失 recommendation 各自独立成组并脱敏告警。混合状态按 `feedback_recorded > read > unread`、同级最新选择 canonical。覆盖幂等、唯一冲突和完整回滚。
-- [ ] Cycle 2D：RED/GREEN `view=current|history`；无参数保持 history。current/unread 是 canonical recommendation UNION system_alert，行情扫描器逐标计数和 CLI unread 使用同一 service helper。
-- [ ] Cycle 2E：RED/GREEN 改造 route 中按原 recommendation ID 扫描通知的 helper；最新周期 recommendation 通过 link 更新 canonical 旧 notification，不改变其原始 recommendation/audit。legacy 无 link 时只保守匹配完全相同的原 recommendation ID，不猜 canonical；重复 dispatch 不重置处理状态。
-- [ ] 同步 recommendation/API 文档并运行 `pytest -q tests/test_docs_examples.py`。
-- [ ] VERIFY：运行 notification/feedback 定向测试。
-- [ ] REVIEW：后台 agent 核对系统告警闭环、read/feedback 状态不重置、plan ID/version 边界。
+- [x] Cycle 2A：RED/GREEN fingerprint v2 排除纯时间元数据，canonical key 使用上海交易日、symbol、action、plan_id、plan_version、v2 fingerprint；实质变化/跨日新建。运行 identity/dispatcher 定向测试。
+- [x] Cycle 2B：RED/GREEN 跨周期相同条件保留两条建议，只创建一个 notification，并在单事务按 notification/audit -> canonical group -> link 写入；并发冲突回滚后读取已提交 group，再幂等补 link。运行 dispatcher/service 测试。
+- [x] Cycle 2C：RED/GREEN legacy migration 从 payload 重算 v2 且不改旧 recommendation identity；NULL/损坏 payload/缺失 recommendation 各自独立成组并脱敏告警。混合状态按 `feedback_recorded > read > unread`、同级最新选择 canonical。覆盖幂等、唯一冲突和完整回滚。
+- [x] Cycle 2D：RED/GREEN `view=current|history`；无参数保持 history。current/unread 是 canonical recommendation UNION system_alert，行情扫描器逐标计数和 CLI unread 使用同一 service helper。
+- [x] Cycle 2E：RED/GREEN 改造 route 中按原 recommendation ID 扫描通知的 helper；最新周期 recommendation 通过 link 更新 canonical 旧 notification，不改变其原始 recommendation/audit。legacy 无 link 时只保守匹配完全相同的原 recommendation ID，不猜 canonical；重复 dispatch 不重置处理状态。
+- [x] 同步 recommendation/API 文档并运行 `pytest -q tests/test_docs_examples.py`。
+- [x] VERIFY：运行 notification/feedback 定向测试。
+- [x] REVIEW：后台 agent 核对系统告警闭环、read/feedback 状态不重置、plan ID/version 边界。
 
 ## Task 3：建议 current/history 投影
 
@@ -85,11 +85,11 @@
 
 **步骤：**
 
-- [ ] Cycle 3A：RED/GREEN current 用 SQL 每 symbol 稳定选最新，history 保留全部且两者 total/pagination 正确；API 无 view 参数保持旧 history 数据和 Recommendation item 结构。
-- [ ] Cycle 3B：RED/GREEN 显式 `view=current|history` 返回 `RecommendationListItem`，投影不可变 recommendation 加可空 notification ID/status；legacy 无 view 和详情/trace 不变。
-- [ ] 同步 recommendation/API 文档并运行 docs tests。
-- [ ] VERIFY：运行 recommendation repository/API 测试。
-- [ ] REVIEW：后台 agent 核对大数据分页不在前端分组、详情/trace 契约不变。
+- [x] Cycle 3A：RED/GREEN current 用 SQL 每 symbol 稳定选最新，history 保留全部且两者 total/pagination 正确；API 无 view 参数保持旧 history 数据和 Recommendation item 结构。
+- [x] Cycle 3B：RED/GREEN 显式 `view=current|history` 返回 `RecommendationListItem`，投影不可变 recommendation 加可空 notification ID/status；legacy 无 view 和详情/trace 不变。
+- [x] 同步 recommendation/API 文档并运行 docs tests。
+- [x] VERIFY：运行 recommendation repository/API 测试。
+- [x] REVIEW：后台 agent 核对大数据分页不在前端分组、详情/trace 契约不变。
 
 ## Task 4：安全日 K cutoff 与本地 History 固化
 
@@ -224,10 +224,10 @@
 
 **步骤：**
 
-- [ ] 复核各任务已同步 display-only、cutoff/history、dataset-specific quality、分钟缓存、current/history 和通知 link 契约；这里只补遗漏，不延后语义文档。
-- [ ] 运行 docs 契约测试、完整 Python 测试、Node 24 全部 Vitest、生产构建和 Playwright 桌面/移动目标流程。
-- [ ] `market-refresh.spec.ts` 使用临时数据库和确定性 provider，覆盖桌面/移动、409 跟随、display-only 零决策副作用、current/history 与部分成功；不得污染现场数据库。
-- [ ] 使用临时数据库验证周末/非交易 display-only；真实服务只做安全的行情冒烟检查。
-- [ ] 检查 `git diff --check`、敏感信息、提交身份和工作树。
-- [ ] 后台 agent 对规格逐条验收，并独立复跑关键测试。
-- [ ] 使用 `Equent <ryq2836@qq.com>` 提交实现；不得修改系统默认 git config。
+- [x] 复核各任务已同步 display-only、cutoff/history、dataset-specific quality、分钟缓存、current/history 和通知 link 契约；这里只补遗漏，不延后语义文档。
+- [x] 运行 docs 契约测试、完整 Python 测试、Node 24 全部 Vitest、生产构建和 Playwright 桌面/移动目标流程。
+- [x] `market-refresh.spec.ts` 使用临时数据库和确定性 provider，覆盖桌面/移动、409 跟随、display-only 零决策副作用、current/history 与部分成功；不得污染现场数据库。
+- [x] 使用临时数据库验证周末/非交易 display-only；真实服务只做安全的行情冒烟检查。
+- [x] 检查 `git diff --check`、敏感信息、提交身份和工作树。
+- [x] 后台 agent 对规格逐条验收，并独立复跑关键测试。
+- [x] 使用 `Equent <ryq2836@qq.com>` 提交实现；不得修改系统默认 git config。

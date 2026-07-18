@@ -179,3 +179,28 @@ def test_data_source_docs_define_traceable_market_snapshot_semantics() -> None:
     assert "降级到 AkShare 新浪分钟接口" in section
     assert "计划、策略、风控、建议、通知和审计只能引用本轮已经固化的输入" in section
     assert "不读取或修改真实券商账户" in section
+
+
+def test_docs_define_market_refresh_quality_and_view_contracts() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    project_spec = Path("docs/project-spec.md").read_text(encoding="utf-8")
+    data_sources = Path("docs/data-sources.md").read_text(encoding="utf-8")
+    trading_policy = Path("docs/trading-policy.md").read_text(encoding="utf-8")
+    recommendation_contract = Path("docs/recommendation-contract.md").read_text(
+        encoding="utf-8"
+    )
+    api_docs = Path("docs/api.md").read_text(encoding="utf-8")
+
+    assert "先运行 `backfill`，再运行 `intraday`" in readme
+    assert "页面保持当前阶段提示" in readme
+    assert "精确 run ID 跟随" in readme
+    assert "当前状态" in readme and "历史记录" in readme
+    assert "两阶段行情刷新" in project_spec
+    assert "4 小时 lease" in project_spec
+    assert "4 小时 lease" in data_sources
+    assert "4 小时 lease" in api_docs
+    assert "分钟 provider 抛出已识别的采集错误" in trading_policy
+    assert "`overall` 继续用于展示和审计聚合" in trading_policy
+    assert "不得作为单一布尔门禁" in trading_policy
+    assert "GET /api/v1/recommendations?view=current" in recommendation_contract
+    assert "每个 Recommendation 通过显式 link" in recommendation_contract

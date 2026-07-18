@@ -453,7 +453,9 @@ describe('market refresh coordinator', () => {
     expect(phases).toEqual(['backfill', 'intraday', 'refreshing'])
     expect(onTerminal).toHaveBeenCalledOnce()
     expect(result.overallStatus).toBe('partial')
-    expect(marketRefreshMessage(result)).toBe('行情数据部分可用')
+    expect(marketRefreshMessage(result)).toBe(
+      '行情展示已刷新，数据部分可用，本次未生成交易建议',
+    )
   })
 
   test('invokes partial invalidation after backfill terminal and intraday fatal', async () => {
@@ -522,6 +524,18 @@ describe('market refresh coordinator', () => {
     expect(marketRefreshMessage(displayResult)).toBe(
       '行情展示已刷新，本次未生成交易建议',
     )
+    expect(marketRefreshMessage({
+      ...displayResult,
+      overallStatus: 'partial',
+      stages: {
+        ...displayResult.stages,
+        intraday: {
+          ...displayResult.stages.intraday,
+          status: 'degraded',
+          warnings: ['weekend minute data is stale'],
+        },
+      },
+    })).toBe('行情展示已刷新，数据部分可用，本次未生成交易建议')
     expect(marketRefreshMessage({
       ...displayResult,
       overallStatus: 'partial',

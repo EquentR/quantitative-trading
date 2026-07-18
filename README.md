@@ -182,6 +182,8 @@ qt market snapshot
 
 盘中报价和分钟数据默认落后超过 6 个有效交易分钟即标记 stale，午休和非交易时段不累计。可在 `.env` 中设置 `QT_MARKET_STALE_TRADING_MINUTES=6`（允许 1 到 60）；实际生效值会保存到输入快照并在数据引用页展示。
 
+分钟 provider 抛出已识别的外部采集错误时，工作流只会尝试复用同一标的、同一有效交易日已经落库的分钟缓存；不会跨标的或跨交易日借用。缓存重新计算的强弱至少标记为 degraded，超过 stale 阈值时标记为 stale，只用于展示和风险说明，不能确认 `buy/add`。
+
 公开报价响应若没有经过契约验证的市场源时间，只保存抓取时间并标为 partial，且不得用抓取时间替代 `data_time`。收盘工作流只有在报价最新价与同日已固化前复权日 K 收盘价严格一致时，才以交易所会话收盘时间创建一条 partial 验证报价；否则不能发布收盘计划、放行 `buy/add` 或形成完整账户估值。分时规则版本和九个阈值可通过 `QT_MARKET_STRENGTH_*` 环境变量配置，实际值随强弱快照保存。
 
 每个 `DecisionWorkflow` 运行形成 `run_id -> market_input_snapshot_id -> plan_id -> recommendation_id -> notification_id -> delivery_id` 追踪链；数据库对每种工作流类型维持全局 running 租约，避免 HTTP、CLI 和调度器跨周期重复采集。逐标的外部失败保存为 degraded/failed/stale 质量结果并继续其他标的；数据库、引用或模型契约失败终止当前整轮。CLI 和 API 不输出第三方原始响应。
@@ -194,9 +196,12 @@ qt market cleanup --date 2026-07-13
 qt market runs --limit 20
 qt market runs --limit 20 --json
 qt workflow intraday
+qt workflow intraday --display-only --reason "人工刷新行情展示"
 qt workflow close --date 2026-07-13
 qt workflow close --date 2026-07-13 --force --reason "人工确认补跑"
 ```
+
+Web 行情页点击“获取行情”时，先运行 `backfill`，再运行 `intraday`；共享 coordinator 分别保存两个阶段的 run、状态和 warning，监控页可查看后端运行事实。若后端返回 `409 workflow_in_progress`，页面保持当前阶段提示并按返回的精确 run ID 跟随，不会立即误报失败；任一阶段降级或失败时保留另一阶段已经落库的结果并显示部分成功。非交易时段第二阶段显式进入 display-only，只刷新展示事实和质量，不生成账户快照、计划、建议、通知或邮件。
 
 监控页和 `/api/v1/market/runs` 展示工作流类型、交易日、周期、幂等键、起止与耗时、请求/处理标的数、provider 调用与耗时、行数、计划/建议/通知/outbox 数量，以及各数据集 `complete/degraded/failed/stale` 的 `dataset_counts`。服务状态另显示最近任务原因及累计 `overrun_count/skipped_count`。计划、建议、通知、反馈、审计和邮件投递等列表 API 统一返回 `{items,total,page,page_size}`。
 
@@ -249,7 +254,7 @@ nvm use
 qt service run
 ```
 
-前端包含台账、资金账户、账户快照、观察池、候选预览与证券搜索、建议、通知、复盘、调度和设置页，并提供顶级“行情”工作台。准备页只在用户点击或提交搜索时请求候选；确认成功后刷新观察池、股票池、计划、建议和服务状态。行情页在桌面使用左侧决策标的扫描器，在小屏幕使用选择抽屉；详情包含 `概览`、`K 线`、`资金流`、`分时强弱` 和 `数据引用`。图表使用后端返回的证券元数据、前复权日 K、均线、适用品种的资金流、分钟价格、前收、VWAP、成交量和建议发生点，不在浏览器推断证券类型、交易制度、特征或动作。
+前端包含台账、资金账户、账户快照、观察池、候选预览与证券搜索、建议、通知、复盘、调度和设置页，并提供顶级“行情”工作台。准备页只在用户点击或提交搜索时请求候选；确认成功后刷新观察池、股票池、计划、建议和服务状态。行情页在桌面使用左侧决策标的扫描器，在小屏幕使用选择抽屉；详情包含 `概览`、`K 线`、`资金流`、`分时强弱` 和 `数据引用`。图表使用后端返回的证券元数据、前复权日 K、均线、适用品种的资金流、分钟价格、前收、VWAP、成交量和建议发生点，不在浏览器推断证券类型、交易制度、特征或动作。建议页和复盘页默认显示每个标的最新的“当前状态”，并可切换到保留全部三分钟周期的“历史记录”；通知当前视图按 canonical 条件折叠，历史视图仍保留原始通知和审计。
 
 页面必须明确区分 loading、empty、partial/degraded、stale、failed 和认证过期状态。SMTP 配置与失败投递列表分别降级，邮件故障不能影响本地通知。前端不自动真实下单，不控制真实交易客户端，不保存真实券商凭据。
 
