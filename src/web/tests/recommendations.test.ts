@@ -13,6 +13,16 @@ import AppShell from '@/app/AppShell.vue'
 import RecommendationListPage from '@/features/recommendations/RecommendationListPage.vue'
 import type { Recommendation, NotificationProcessingStatus } from '@/api/types'
 
+function linked(recommendation: Recommendation, status: NotificationProcessingStatus | null = null) {
+  return {
+    recommendation,
+    notification: status === null ? null : {
+      notification_id: `notif-${recommendation.recommendation_id}`,
+      status,
+    },
+  }
+}
+
 beforeEach(() => {
   localStorage.clear()
 })
@@ -57,6 +67,66 @@ test('路由页面渲染建议列表表头与模拟建议行', async () => {
   expect(screen.getByText('示例银行')).toBeInTheDocument()
 })
 
+test('建议页默认 current 并可切换 history linked projection', async () => {
+  const user = userEvent.setup()
+  const views: string[] = []
+  server.use(
+    http.get('/api/v1/recommendations', ({ request }) => {
+      const view = new URL(request.url).searchParams.get('view') ?? ''
+      views.push(view)
+      const recommendation = view === 'history'
+        ? { ...mockRecommendations[0], recommendation_id: 'rec-history' }
+        : mockRecommendations[0]
+      return HttpResponse.json({
+        items: [{ recommendation, notification: {
+          notification_id: view === 'history' ? 'notif-history' : 'notif-001',
+          status: view === 'history' ? 'read' : 'unread',
+        } }],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      })
+    }),
+  )
+  await renderPage()
+
+  expect(await screen.findByRole('button', { name: '当前状态' })).toHaveAttribute('aria-pressed', 'true')
+  expect((await screen.findAllByText('未读')).length).toBeGreaterThan(0)
+  await user.click(screen.getByRole('button', { name: '历史记录' }))
+
+  expect((await screen.findAllByText('已读')).length).toBeGreaterThan(0)
+  expect(views).toContain('current')
+  expect(views).toContain('history')
+})
+
+test('切换 current/history 时清理旧处理筛选和详情定位', async () => {
+  const user = userEvent.setup()
+  server.use(
+    http.get('/api/v1/recommendations', ({ request }) => {
+      const view = new URL(request.url).searchParams.get('view')
+      const recommendation = view === 'history'
+        ? { ...mockRecommendations[0], recommendation_id: 'rec-history', symbol: '600519' }
+        : mockRecommendations[0]
+      return HttpResponse.json({
+        items: [linked(recommendation, view === 'history' ? null : 'unread')],
+        total: 1, page: 1, page_size: 20,
+      })
+    }),
+  )
+  const { router } = await renderPage()
+  await screen.findByText('600000')
+  await user.selectOptions(screen.getByLabelText('处理状态筛选'), 'unread')
+  await user.click(screen.getByRole('button', { name: /查看详情 600000/ }))
+  await screen.findByRole('dialog', { name: '建议详情' })
+
+  await user.click(screen.getByRole('button', { name: '历史记录' }))
+
+  expect(await screen.findByText('600519')).toBeInTheDocument()
+  expect(screen.queryByLabelText('处理状态筛选')).not.toBeInTheDocument()
+  expect(screen.queryByRole('dialog', { name: '建议详情' })).not.toBeInTheDocument()
+  expect(router.currentRoute.value.query.recommendation_id).toBeUndefined()
+})
+
 test('动作/置信度/处理状态徽章渲染期望中文标签', async () => {
   await renderPage()
 
@@ -98,7 +168,7 @@ test('recommendation_id query 自动定位详情并可返回对应行情', async
   expect(router.currentRoute.value.query.symbol).toBe('600000')
 })
 
-test('扫描按钮触发认证盘中工作流并按 recommendation_ids 刷新列表', async () => {
+test('建议页刷新使用认证的两阶段工作流', async () => {
   const user = userEvent.setup()
   let workflowCalled = false
   let deprecatedScanCalled = false
@@ -109,7 +179,9 @@ test('扫描按钮触发认证盘中工作流并按 recommendation_ids 刷新列
       return HttpResponse.json({
         task: 'intraday', status: 'success', run_id: 'intraday-test', snapshot_id: 1,
         plan_id: null, recommendation_ids: ['rec-001'], warnings: [], reused: false,
-        ready: null, cleaned_rows: null,
+        ready: null, cleaned_rows: null, mode: 'decision',
+        effective_trade_date: '2026-07-17', history_cutoff_date: '2026-07-16',
+        requested_symbol_scope: ['600000', '600519'], lease_expires_at: null,
       })
     }),
     http.post('/api/v1/recommendations/scan', () => {
@@ -120,15 +192,15 @@ test('扫描按钮触发认证盘中工作流并按 recommendation_ids 刷新列
   await renderPage()
   await screen.findByText('600000')
 
-  await user.click(screen.getByRole('button', { name: '扫描建议' }))
+  await user.click(screen.getByRole('button', { name: '刷新行情与建议' }))
 
   await waitFor(() => expect(workflowCalled).toBe(true))
   expect(deprecatedScanCalled).toBe(false)
-  expect(screen.getByRole('status')).toHaveTextContent('盘中工作流已生成 1 条建议')
+  expect(screen.getByRole('status')).toHaveTextContent('行情与建议已刷新')
   await waitFor(() => expect(screen.getByText('600000')).toBeInTheDocument())
 })
 
-test('扫描失败时显示告警且页面仍可用', async () => {
+test('报价分时阶段失败时保留日 K 部分成功提示且页面仍可用', async () => {
   const user = userEvent.setup()
   server.use(
     http.post('/api/v1/service/workflows/intraday/run', () =>
@@ -138,14 +210,14 @@ test('扫描失败时显示告警且页面仍可用', async () => {
   await renderPage()
   await screen.findByText('600000')
 
-  await user.click(screen.getByRole('button', { name: '扫描建议' }))
+  await user.click(screen.getByRole('button', { name: '刷新行情与建议' }))
 
   await waitFor(() =>
-    expect(screen.getByText('扫描建议失败，请稍后重试或检查后端服务状态。')).toBeInTheDocument(),
+    expect(screen.getByText('日 K 已更新，报价/分时刷新失败')).toBeInTheDocument(),
   )
-  // Page remains usable: list still visible, scan button re-enabled.
+  // Page remains usable: list still visible, refresh button re-enabled.
   expect(screen.getByText('600000')).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '扫描建议' })).not.toBeDisabled()
+  expect(screen.getByRole('button', { name: '刷新行情与建议' })).not.toBeDisabled()
 })
 
 test('处理状态筛选可按未读/已读过滤列表', async () => {
@@ -162,11 +234,11 @@ test('处理状态筛选可按未读/已读过滤列表', async () => {
   await waitFor(() => expect(screen.queryByText('600000')).not.toBeInTheDocument())
 })
 
-test('通知数据不可用时不展示处理状态筛选但页面仍可用', async () => {
+test('linked DTO 无通知时不展示处理状态筛选但页面仍可用', async () => {
   server.use(
-    http.get('/api/v1/notifications', () =>
-      HttpResponse.json({ error: { message: 'not mounted' } }, { status: 404 }),
-    ),
+    http.get('/api/v1/recommendations', () => HttpResponse.json({
+      items: [linked(mockRecommendations[0])], total: 1, page: 1, page_size: 20,
+    })),
   )
   await renderPage()
   await screen.findByText('600000')
@@ -184,8 +256,9 @@ test('缺失失效条件的建议详情用告警替代完整展示', async () =>
     risk: { notes: ['行情可能延迟'] },
   }
   server.use(
-    http.get('/api/v1/recommendations', () => HttpResponse.json([brokenRec])),
-    http.get('/api/v1/notifications', () => HttpResponse.json([])),
+    http.get('/api/v1/recommendations', () => HttpResponse.json({
+      items: [linked(brokenRec)], total: 1, page: 1, page_size: 20,
+    })),
   )
   await renderPage()
   await screen.findByRole('button', { name: /查看详情/ })
@@ -248,8 +321,9 @@ test('sell 建议缺少 invalid_if 不触发契约错误并展示不适用', asy
     price_context: {},
   }
   server.use(
-    http.get('/api/v1/recommendations', () => HttpResponse.json([sellRec])),
-    http.get('/api/v1/notifications', () => HttpResponse.json([])),
+    http.get('/api/v1/recommendations', () => HttpResponse.json({
+      items: [linked(sellRec)], total: 1, page: 1, page_size: 20,
+    })),
   )
   await renderPage()
   await screen.findByRole('button', { name: /查看详情/ })
@@ -284,8 +358,9 @@ test('空理由列表展示暂无理由占位', async () => {
     price_context: {},
   }
   server.use(
-    http.get('/api/v1/recommendations', () => HttpResponse.json([emptyReasonRec])),
-    http.get('/api/v1/notifications', () => HttpResponse.json([])),
+    http.get('/api/v1/recommendations', () => HttpResponse.json({
+      items: [linked(emptyReasonRec)], total: 1, page: 1, page_size: 20,
+    })),
   )
   await renderPage()
   await screen.findByRole('button', { name: /查看详情/ })

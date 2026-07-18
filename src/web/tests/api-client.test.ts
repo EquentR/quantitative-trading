@@ -1,4 +1,4 @@
-import { http, HttpResponse } from 'msw'
+import { delay, http, HttpResponse } from 'msw'
 import { describe, expect, test } from 'vitest'
 import { ApiClient, ApiError } from '@/api/client'
 import { server } from '@/test/server'
@@ -58,5 +58,21 @@ describe('ApiClient', () => {
 
     await expect(client.get('/auth/me')).rejects.toMatchObject({ code: 'unauthorized' })
     expect(called).toBe(true)
+  })
+
+  test('请求接收 AbortSignal 并中止 in-flight fetch', async () => {
+    server.use(
+      http.get('/api/v1/auth/me', async () => {
+        await delay(1_000)
+        return HttpResponse.json({ user: 'late' })
+      }),
+    )
+    const client = new ApiClient({ baseUrl: '', getToken: () => 'token-1' })
+    const controller = new AbortController()
+
+    const request = client.get('/auth/me', { signal: controller.signal })
+    controller.abort()
+
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' })
   })
 })

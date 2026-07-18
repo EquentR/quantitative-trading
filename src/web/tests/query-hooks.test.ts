@@ -13,6 +13,9 @@ import { useNotificationsQuery } from '@/queries/notifications'
 import { useAuditLogQuery } from '@/queries/audit'
 import { useFeedbackQuery } from '@/queries/feedback'
 import { notificationsQueryKey } from '@/queries/notifications'
+import { http, HttpResponse } from 'msw'
+import { server } from '@/test/server'
+import { mockNotifications, mockRecommendations } from '@/mocks/handlers'
 
 const queryPlugin: VueQueryPluginOptions = {}
 
@@ -107,20 +110,42 @@ test('通过 query hook 读取最新计划', async () => {
   await waitFor(() => expect(screen.getByText('plan-001-active')).toBeInTheDocument())
 })
 
-test('通过 query hook 读取建议列表', async () => {
+test('建议 query 显式读取 current linked projection', async () => {
+  let requestedView = ''
+  server.use(
+    http.get('/api/v1/recommendations', ({ request }) => {
+      requestedView = new URL(request.url).searchParams.get('view') ?? ''
+      return HttpResponse.json({
+        items: [{ recommendation: mockRecommendations[0], notification: {
+          notification_id: 'notif-001', status: 'unread',
+        } }],
+        total: 1,
+        page: 1,
+        page_size: 20,
+      })
+    }),
+  )
   const Component = defineComponent({
     setup() {
       return { query: useRecommendationsQuery() }
     },
-    template: '<div>{{ query.data.value?.[0].recommendation_id }}</div>',
+    template: '<div>{{ query.data.value?.[0].recommendation.recommendation_id }}-{{ query.data.value?.[0].notification?.status }}</div>',
   })
 
   render(Component, { global: { plugins: [createPinia(), [VueQueryPlugin, queryPlugin]] } })
 
-  await waitFor(() => expect(screen.getByText('rec-001')).toBeInTheDocument())
+  await waitFor(() => expect(screen.getByText('rec-001-unread')).toBeInTheDocument())
+  expect(requestedView).toBe('current')
 })
 
-test('通过 query hook 读取通知列表', async () => {
+test('通知 query 显式读取 current 视图', async () => {
+  let requestedView = ''
+  server.use(
+    http.get('/api/v1/notifications', ({ request }) => {
+      requestedView = new URL(request.url).searchParams.get('view') ?? ''
+      return HttpResponse.json({ items: mockNotifications, total: 1, page: 1, page_size: 50 })
+    }),
+  )
   const Component = defineComponent({
     setup() {
       return { query: useNotificationsQuery() }
@@ -131,6 +156,7 @@ test('通过 query hook 读取通知列表', async () => {
   render(Component, { global: { plugins: [createPinia(), [VueQueryPlugin, queryPlugin]] } })
 
   await waitFor(() => expect(screen.getByText('notif-001-unread')).toBeInTheDocument())
+  expect(requestedView).toBe('current')
 })
 
 test('通知 query 使用独立短轮询周期', () => {
@@ -146,7 +172,7 @@ test('通知 query 使用独立短轮询周期', () => {
   })
 
   const options = queryClient.getQueryCache()
-    .find({ queryKey: notificationsQueryKey })?.options as { refetchInterval?: number } | undefined
+    .find({ queryKey: [...notificationsQueryKey, 'current'] })?.options as { refetchInterval?: number } | undefined
   expect(options?.refetchInterval).toBe(30_000)
 })
 

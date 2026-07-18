@@ -1,22 +1,30 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ScanLine } from 'lucide-vue-next'
+import { RefreshCw } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
 import Alert from '@/components/ui/Alert.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
 import RecommendationStatusBadge from '@/components/domain/RecommendationStatusBadge.vue'
 import RecommendationDetailDrawer from './RecommendationDetailDrawer.vue'
 import { useRecommendationQuery, useRecommendationsQuery } from '@/queries/recommendations'
-import { useNotificationsQuery } from '@/queries/notifications'
-import { useRunIntradayWorkflowMutation } from '@/queries/service'
-import type { Recommendation, NotificationProcessingStatus } from '@/api/types'
+import type {
+  Recommendation,
+  RecommendationListItem,
+  NotificationProcessingStatus,
+  RecommendationView,
+} from '@/api/types'
+import {
+  marketRefreshErrorMessage,
+  marketRefreshPhaseMessage,
+  useMarketRefreshCoordinator,
+} from '@/composables/useMarketRefreshCoordinator'
 
 const route = useRoute()
 const router = useRouter()
-const recommendationsQuery = useRecommendationsQuery()
-const notificationsQuery = useNotificationsQuery()
-const scanMutation = useRunIntradayWorkflowMutation()
+const selectedView = ref<RecommendationView>('current')
+const recommendationsQuery = useRecommendationsQuery(selectedView)
+const marketRefresh = useMarketRefreshCoordinator()
 const requestedRecommendationId = computed(() => {
   const value = Array.isArray(route.query.recommendation_id)
     ? route.query.recommendation_id[0]
@@ -25,32 +33,35 @@ const requestedRecommendationId = computed(() => {
 })
 const requestedRecommendationQuery = useRecommendationQuery(requestedRecommendationId)
 
-const recommendations = computed(() => recommendationsQuery.data.value ?? [])
-const notifications = computed(() => notificationsQuery.data.value ?? [])
-const notificationsError = computed(() => notificationsQuery.error.value != null)
+const items = computed(() => recommendationsQuery.data.value ?? [])
+const recommendations = computed(() => items.value.map((item) => item.recommendation))
 
 const statusByRec = computed(() => {
   const m = new Map<string, NotificationProcessingStatus>()
-  for (const n of notifications.value) {
-    if (n.recommendation_id) m.set(n.recommendation_id, n.status)
+  for (const item of items.value) {
+    if (item.notification) {
+      m.set(item.recommendation.recommendation_id, item.notification.status)
+    }
   }
   return m
 })
 
 const statusFilter = ref<'all' | NotificationProcessingStatus>('all')
 const showFilter = computed(
-  () => !notificationsError.value && notifications.value.length > 0,
+  () => items.value.some((item) => item.notification !== null),
 )
 
 const filteredRecommendations = computed(() => {
-  if (statusFilter.value === 'all') return recommendations.value
+  if (!showFilter.value || statusFilter.value === 'all') return recommendations.value
   return recommendations.value.filter(
     (r) => statusByRec.value.get(r.recommendation_id) === statusFilter.value,
   )
 })
 
-const scanError = ref(false)
-const scanMessage = ref('')
+const refreshLabel = computed(() =>
+  marketRefreshPhaseMessage(marketRefresh.phase.value) || '刷新行情与建议',
+)
+const refreshError = computed(() => marketRefreshErrorMessage(marketRefresh.error.value))
 
 const selectedId = ref<string | null>(null)
 const selectedRecommendation = computed(
@@ -59,10 +70,22 @@ const selectedRecommendation = computed(
       ? requestedRecommendationQuery.data.value
       : null),
 )
+const selectedItem = computed<RecommendationListItem | null>(() =>
+  items.value.find(
+    (item) => item.recommendation.recommendation_id === selectedRecommendation.value?.recommendation_id,
+  ) ?? (selectedRecommendation.value
+    ? { recommendation: selectedRecommendation.value, notification: null }
+    : null),
+)
 
 watch(requestedRecommendationId, (recommendationId) => {
   selectedId.value = recommendationId
 }, { immediate: true })
+
+watch(selectedView, () => {
+  statusFilter.value = 'all'
+  closeDetail()
+})
 
 function openDetail(id: string) {
   selectedId.value = id
@@ -77,15 +100,10 @@ function closeDetail() {
 }
 
 async function onScan() {
-  scanError.value = false
-  scanMessage.value = ''
   try {
-    const result = await scanMutation.mutateAsync()
-    scanMessage.value = result.recommendation_ids.length
-      ? `盘中工作流已生成 ${result.recommendation_ids.length} 条建议`
-      : '盘中工作流完成，本轮没有新建议'
+    await marketRefresh.run()
   } catch {
-    scanError.value = true
+    // The coordinator exposes a sanitized, stage-aware message for the page.
   }
 }
 
@@ -105,9 +123,9 @@ function keyPriceText(r: Recommendation): string {
   <div class="space-y-4">
     <div class="flex items-center justify-between gap-2">
       <h1 class="text-lg font-semibold">建议</h1>
-      <Button variant="primary" :loading="scanMutation.isPending.value" @click="onScan">
-        <ScanLine class="size-4" />
-        扫描建议
+      <Button class="w-44 shrink-0" variant="primary" :loading="marketRefresh.isPending.value" @click="onScan">
+        <RefreshCw v-if="!marketRefresh.isPending.value" class="size-4" />
+        {{ refreshLabel }}
       </Button>
     </div>
     <p class="text-sm text-muted-foreground">建议仅用于本地决策辅助，需人工确认后手动执行，不自动真实下单。</p>
@@ -116,10 +134,25 @@ function keyPriceText(r: Recommendation): string {
       建议数据加载失败，请稍后重试或检查后端服务状态。
     </Alert>
 
-    <Alert v-if="scanError" variant="danger" data-testid="scan-error-alert">
-      扫描建议失败，请稍后重试或检查后端服务状态。
+    <Alert v-if="refreshError" :variant="marketRefresh.error.value?.name === 'MarketRefreshPendingError' ? 'warning' : 'danger'" data-testid="scan-error-alert">
+      {{ refreshError }}
     </Alert>
-    <p v-if="scanMessage" class="text-sm text-emerald-700" role="status">{{ scanMessage }}</p>
+    <Alert v-if="marketRefresh.hasFailed.value" variant="danger">{{ marketRefresh.message.value }}</Alert>
+    <p v-else-if="marketRefresh.message.value" class="text-sm text-emerald-700" role="status">{{ marketRefresh.message.value }}</p>
+
+    <div class="inline-flex rounded-md border border-border p-0.5" role="group" aria-label="建议视图">
+      <button
+        v-for="option in ([['current', '当前状态'], ['history', '历史记录']] as const)"
+        :key="option[0]"
+        type="button"
+        class="min-w-24 rounded px-3 py-1.5 text-sm"
+        :class="selectedView === option[0] ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'"
+        :aria-pressed="selectedView === option[0]"
+        @click="selectedView = option[0]"
+      >
+        {{ option[1] }}
+      </button>
+    </div>
 
     <div v-if="showFilter" class="flex items-center gap-2 text-sm">
       <label for="rec-status-filter" class="whitespace-nowrap">处理状态筛选</label>
@@ -136,7 +169,7 @@ function keyPriceText(r: Recommendation): string {
     </div>
 
     <div v-if="filteredRecommendations.length" class="overflow-x-auto">
-      <table class="w-full table-fixed text-sm">
+      <table class="min-w-[760px] w-full table-fixed text-sm">
         <thead class="text-left text-xs text-muted-foreground">
           <tr>
             <th class="w-1/4 py-1">股票</th>
@@ -183,11 +216,12 @@ function keyPriceText(r: Recommendation): string {
         </tbody>
       </table>
     </div>
-    <p v-else class="text-sm text-muted-foreground">暂无建议，点击"扫描建议"生成。</p>
+    <p v-else class="text-sm text-muted-foreground">当前视图暂无建议。</p>
 
     <RecommendationDetailDrawer
-      v-if="selectedRecommendation"
-      :recommendation="selectedRecommendation"
+      v-if="selectedItem"
+      :recommendation="selectedItem.recommendation"
+      :notification="selectedItem.notification"
       @close="closeDetail"
     />
   </div>

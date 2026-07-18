@@ -6,8 +6,10 @@ import { useRecommendationsQuery } from '@/queries/recommendations'
 import { useFeedbackQuery, useRecordFeedbackMutation } from '@/queries/feedback'
 import type { ExecutionFeedbackInput } from '@/api/types'
 
-const recommendationsQuery = useRecommendationsQuery()
-const recommendations = computed(() => recommendationsQuery.data.value ?? [])
+const recommendationsQuery = useRecommendationsQuery('history')
+const recommendations = computed(() =>
+  (recommendationsQuery.data.value ?? []).map((item) => item.recommendation),
+)
 
 const selectedRecId = ref('')
 const executed = ref<'true' | 'false'>('false')

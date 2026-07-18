@@ -9,6 +9,7 @@ interface ApiClientOptions {
 interface RequestOptions {
   body?: unknown
   headers?: HeadersInit
+  signal?: AbortSignal
 }
 
 export class ApiError extends Error {
@@ -46,12 +47,12 @@ export class ApiClient {
     this.onAuthError = onAuthError
   }
 
-  get<T>(path: string): Promise<T> {
-    return this.request<T>('GET', path)
+  get<T>(path: string, options: Omit<RequestOptions, 'body'> = {}): Promise<T> {
+    return this.request<T>('GET', path, options)
   }
 
-  post<T>(path: string, body?: unknown): Promise<T> {
-    return this.request<T>('POST', path, { body })
+  post<T>(path: string, body?: unknown, options: Omit<RequestOptions, 'body'> = {}): Promise<T> {
+    return this.request<T>('POST', path, { ...options, body })
   }
 
   put<T>(path: string, body?: unknown): Promise<T> {
@@ -93,7 +94,12 @@ export class ApiClient {
       body = JSON.stringify(options.body)
     }
 
-    const response = await fetch(this.url(path), { method, headers, body })
+    const response = await fetch(this.url(path), {
+      method,
+      headers,
+      body,
+      signal: options.signal,
+    })
 
     if (!response.ok) {
       await this.throwApiError(response)

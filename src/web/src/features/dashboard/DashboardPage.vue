@@ -17,15 +17,17 @@ const snapshotQuery = useLatestSnapshotQuery()
 const positionsQuery = usePositionsQuery()
 const cashQuery = useCashAccountQuery()
 const planQuery = useLatestPlanQuery()
-const recommendationsQuery = useRecommendationsQuery()
-const notificationsQuery = useNotificationsQuery()
+const recommendationsQuery = useRecommendationsQuery('current')
+const notificationsQuery = useNotificationsQuery('current')
 
 const service = computed(() => serviceQuery.data.value)
 const snapshot = computed(() => snapshotQuery.data.value)
 const positions = computed(() => positionsQuery.data.value)
 const cash = computed(() => cashQuery.data.value)
 const plan = computed(() => planQuery.data.value)
-const recommendations = computed(() => recommendationsQuery.data.value ?? [])
+const recommendations = computed(() =>
+  (recommendationsQuery.data.value ?? []).map((item) => item.recommendation),
+)
 const notifications = computed(() => notificationsQuery.data.value ?? [])
 
 const snapshotWarning = computed(() => {

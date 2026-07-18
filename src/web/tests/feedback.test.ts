@@ -9,13 +9,13 @@ import ReviewPage from '@/features/review/ReviewPage.vue'
 import { useSessionStore } from '@/stores/session'
 import { server } from '@/test/server'
 import {
-  mockRecommendations,
   mockNotifications,
   mockAuditLog,
   mockServiceStatus,
   mockTradingPlan,
   mockPositions,
   mockCashAccount,
+  mockRecommendationItems,
 } from '@/mocks/handlers'
 
 beforeEach(() => {
@@ -103,7 +103,12 @@ test('提交反馈成功后刷新建议/通知/审计/服务查询且不刷新�
   server.use(
     http.get('/api/v1/recommendations', () => {
       recGetCount++
-      return HttpResponse.json(mockRecommendations)
+      return HttpResponse.json({
+        items: mockRecommendationItems,
+        total: mockRecommendationItems.length,
+        page: 1,
+        page_size: 20,
+      })
     }),
     http.get('/api/v1/notifications', () => {
       notifGetCount++

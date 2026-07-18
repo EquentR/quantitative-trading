@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed } from 'vue'
 import { Play, Square, RefreshCw } from 'lucide-vue-next'
 import Button from '@/components/ui/Button.vue'
 import Alert from '@/components/ui/Alert.vue'
@@ -7,19 +7,23 @@ import StatusBadges from '@/components/domain/StatusBadges.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
 import { ApiError } from '@/api/client'
 import {
-  useRunIntradayWorkflowMutation,
   useServiceStatusQuery,
   useStartSchedulerMutation,
   useStopSchedulerMutation,
 } from '@/queries/service'
 import { useLatestSnapshotQuery } from '@/queries/account'
 import { useMarketRunsQuery } from '@/queries/market'
+import {
+  marketRefreshErrorMessage,
+  marketRefreshPhaseMessage,
+  useMarketRefreshCoordinator,
+} from '@/composables/useMarketRefreshCoordinator'
 
 const serviceQuery = useServiceStatusQuery()
 const snapshotQuery = useLatestSnapshotQuery()
 const startMutation = useStartSchedulerMutation()
 const stopMutation = useStopSchedulerMutation()
-const runIntradayMutation = useRunIntradayWorkflowMutation()
+const marketRefresh = useMarketRefreshCoordinator()
 const marketRunsQuery = useMarketRunsQuery()
 
 const service = () => serviceQuery.data.value
@@ -66,8 +70,10 @@ const snapshotErrorMessage = () => {
   return error.message
 }
 
-const runMessage = ref('')
-const runError = ref('')
+const refreshLabel = computed(() =>
+  marketRefreshPhaseMessage(marketRefresh.phase.value) || '刷新行情数据',
+)
+const refreshError = computed(() => marketRefreshErrorMessage(marketRefresh.error.value))
 
 function formatDuration(value: number | null): string {
   if (value === null) return '进行中'
@@ -103,13 +109,10 @@ function formatDatasetCounts(run: ReturnType<typeof marketRuns>[number]): string
 }
 
 async function onGenerate() {
-  runMessage.value = ''
-  runError.value = ''
   try {
-    await runIntradayMutation.mutateAsync()
-    runMessage.value = '已请求运行盘中决策工作流'
+    await marketRefresh.run()
   } catch {
-    runError.value = '盘中决策工作流运行失败，请稍后重试'
+    // The coordinator exposes a sanitized, stage-aware message for the page.
   }
 }
 </script>
@@ -137,13 +140,26 @@ async function onGenerate() {
           <Square class="size-4" />
           停止工作流调度
         </Button>
-        <Button variant="secondary" :loading="runIntradayMutation.isPending.value" @click="onGenerate">
-          <RefreshCw class="size-4" />
-          运行盘中工作流
+        <Button
+          class="w-44 shrink-0"
+          variant="secondary"
+          :loading="marketRefresh.isPending.value"
+          :aria-label="refreshLabel"
+          @click="onGenerate"
+        >
+          <RefreshCw v-if="!marketRefresh.isPending.value" class="size-4" />
+          {{ refreshLabel }}
         </Button>
       </div>
-      <p v-if="runMessage" class="text-sm text-emerald-700">{{ runMessage }}</p>
-      <Alert v-if="runError" variant="danger">{{ runError }}</Alert>
+      <Alert v-if="marketRefresh.hasFailed.value" variant="danger">
+        {{ marketRefresh.message.value }}
+      </Alert>
+      <p v-else-if="marketRefresh.message.value" class="text-sm text-emerald-700" role="status">
+        {{ marketRefresh.message.value }}
+      </p>
+      <Alert v-if="refreshError" :variant="marketRefresh.error.value?.name === 'MarketRefreshPendingError' ? 'warning' : 'danger'">
+        {{ refreshError }}
+      </Alert>
     </section>
 
     <section class="space-y-2">
@@ -186,6 +202,9 @@ async function onGenerate() {
               <td class="py-2 pr-3">
                 <div>{{ workflowLabels[run.workflow_type] ?? run.workflow_type }}</div>
                 <div class="text-xs text-muted-foreground">交易日 {{ run.trade_date }}</div>
+                <div class="text-xs text-muted-foreground">模式 {{ run.mode ?? '-' }}</div>
+                <div class="text-xs text-muted-foreground">有效交易日 {{ run.effective_trade_date ?? '-' }}</div>
+                <div class="text-xs text-muted-foreground">历史截止 {{ run.history_cutoff_date ?? '-' }}</div>
                 <div class="max-w-56 truncate text-xs text-muted-foreground" :title="run.run_id">{{ run.run_id }}</div>
                 <div class="max-w-64 truncate text-xs text-muted-foreground" :title="run.idempotency_key">{{ run.idempotency_key }}</div>
               </td>
@@ -193,7 +212,11 @@ async function onGenerate() {
                 <div><FormatValues kind="time" :value="run.period_start" /></div>
                 <div class="text-muted-foreground"><FormatValues kind="time" :value="run.period_end" /></div>
               </td>
-              <td class="py-2 pr-3 whitespace-nowrap">请求 {{ run.requested_symbols }} / 完成 {{ run.processed_symbols }}</td>
+              <td class="py-2 pr-3 text-xs">
+                <div class="whitespace-nowrap">请求 {{ run.requested_symbols }} / 完成 {{ run.processed_symbols }}</div>
+                <div class="max-w-72 break-words text-muted-foreground">范围 {{ run.requested_symbol_scope.join(', ') || '-' }}</div>
+                <div class="whitespace-nowrap text-muted-foreground">租约 <FormatValues kind="time" :value="run.lease_expires_at" /></div>
+              </td>
               <td class="py-2 pr-3">{{ run.status }}</td>
               <td class="py-2 pr-3 whitespace-nowrap">{{ formatDuration(run.duration_ms) }}</td>
               <td class="py-2 pr-3 whitespace-nowrap">{{ run.provider_calls }} 次 / {{ formatDuration(run.provider_duration_ms) }}</td>

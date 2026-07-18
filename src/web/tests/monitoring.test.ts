@@ -26,20 +26,42 @@ test('展示调度和盘中工作流控制按钮及安全文案', async () => {
   expect(screen.getByRole('heading', { name: '监控' })).toBeInTheDocument()
   expect(screen.getByRole('button', { name: '启动工作流调度' })).toBeInTheDocument()
   expect(screen.getByRole('button', { name: '停止工作流调度' })).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: '运行盘中工作流' })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: '刷新行情数据' })).toBeInTheDocument()
   expect(screen.getByText(/不执行真实交易/)).toBeInTheDocument()
 })
 
-test('点击运行盘中工作流后显示已请求提示', async () => {
+test('点击刷新行情后按回填和盘中顺序运行并显示终态', async () => {
   const user = userEvent.setup()
+  const calls: string[] = []
+  server.use(
+    http.post('/api/v1/service/workflows/backfill/run', () => {
+      calls.push('backfill')
+      return HttpResponse.json({
+        task: 'backfill', status: 'success', run_id: 'backfill-monitor', snapshot_id: 1,
+        plan_id: null, recommendation_ids: [], warnings: [], reused: false,
+        ready: null, cleaned_rows: null, mode: null, effective_trade_date: '2026-07-17',
+        history_cutoff_date: '2026-07-17', requested_symbol_scope: [], lease_expires_at: null,
+      })
+    }),
+    http.post('/api/v1/service/workflows/intraday/run', () => {
+      calls.push('intraday')
+      return HttpResponse.json({
+        task: 'intraday', status: 'success', run_id: 'intraday-monitor', snapshot_id: 2,
+        plan_id: null, recommendation_ids: [], warnings: [], reused: false,
+        ready: null, cleaned_rows: null, mode: 'display_only', effective_trade_date: '2026-07-17',
+        history_cutoff_date: '2026-07-17', requested_symbol_scope: [], lease_expires_at: null,
+      })
+    }),
+  )
   renderMonitoring()
 
-  await user.click(screen.getByRole('button', { name: '运行盘中工作流' }))
+  await user.click(screen.getByRole('button', { name: '刷新行情数据' }))
 
-  await waitFor(() => expect(screen.getByText('已请求运行盘中决策工作流')).toBeInTheDocument())
+  await waitFor(() => expect(calls).toEqual(['backfill', 'intraday']))
+  expect(screen.getByText('行情展示已刷新，本次未生成交易建议')).toBeInTheDocument()
 })
 
-test('盘中工作流请求失败时显示稳定错误且不显示成功提示', async () => {
+test('报价分时阶段失败时显示阶段化脱敏错误且不显示成功提示', async () => {
   server.use(
     http.post('/api/v1/service/workflows/intraday/run', () =>
       HttpResponse.json(
@@ -51,12 +73,12 @@ test('盘中工作流请求失败时显示稳定错误且不显示成功提示',
   const user = userEvent.setup()
   renderMonitoring()
 
-  await user.click(screen.getByRole('button', { name: '运行盘中工作流' }))
+  await user.click(screen.getByRole('button', { name: '刷新行情数据' }))
 
   await waitFor(() => {
-    expect(screen.getByText('盘中决策工作流运行失败，请稍后重试')).toBeInTheDocument()
+    expect(screen.getByText('日 K 已更新，报价/分时刷新失败')).toBeInTheDocument()
   })
-  expect(screen.queryByText('已请求运行盘中决策工作流')).not.toBeInTheDocument()
+  expect(screen.queryByText('行情与建议已刷新')).not.toBeInTheDocument()
   expect(screen.queryByText(/token=secret/)).not.toBeInTheDocument()
 })
 
@@ -110,6 +132,11 @@ test('展示每轮工作流成本和产物计数', async () => {
   expect(row).toHaveTextContent('quote 完成 2')
   expect(row).toHaveTextContent('minute_bar 完成 1 / 降级 1')
   expect(row).toHaveTextContent('intraday_strength 完成 1 / 陈旧 1')
+  expect(row).toHaveTextContent('模式 decision')
+  expect(row).toHaveTextContent('有效交易日 2026-07-13')
+  expect(row).toHaveTextContent('历史截止 2026-07-10')
+  expect(row).toHaveTextContent('范围 600000, 600519')
+  expect(row).toHaveTextContent('租约')
   expect(row).toHaveTextContent('结束')
 })
 

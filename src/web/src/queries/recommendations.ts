@@ -1,18 +1,27 @@
-import { computed, type Ref } from 'vue'
+import { computed, toValue, type MaybeRefOrGetter, type Ref } from 'vue'
 import { useQuery } from '@tanstack/vue-query'
 import { useApiClient } from '@/api/client-provider'
 import { pageItems } from '@/api/pagination'
-import type { PaginatedResponse, Recommendation } from '@/api/types'
+import type {
+  PaginatedResponse,
+  Recommendation,
+  RecommendationListItem,
+  RecommendationView,
+} from '@/api/types'
 
-export const recommendationsQueryKey = ['recommendations'] as const
+export const recommendationsQueryKey = (view: RecommendationView) => ['recommendations', view] as const
 export const recommendationQueryKey = (recommendationId: string) => ['recommendations', recommendationId] as const
 
-export function useRecommendationsQuery() {
+export function useRecommendationsQuery(
+  view: MaybeRefOrGetter<RecommendationView> = 'current',
+) {
   const client = useApiClient()
   return useQuery({
-    queryKey: recommendationsQueryKey,
+    queryKey: computed(() => recommendationsQueryKey(toValue(view))),
     queryFn: async () => pageItems(
-      await client.get<PaginatedResponse<Recommendation> | Recommendation[]>('/recommendations'),
+      await client.get<PaginatedResponse<RecommendationListItem>>(
+        `/recommendations?view=${toValue(view)}`,
+      ),
     ),
   })
 }

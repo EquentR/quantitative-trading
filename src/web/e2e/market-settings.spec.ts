@@ -60,9 +60,19 @@ async function setupMarketConsole(page: Page, options: MarketConsoleOptions = {}
     if (/^\/market\/symbols\/\d{6}\/minute-bars$/.test(path)) return fulfillJson(route, mockMinuteBars)
     if (/^\/market\/symbols\/\d{6}\/intraday-strength\/latest$/.test(path)) return fulfillJson(route, mockIntradayStrength)
     if (/^\/market\/snapshots\/[^/]+\/trace$/.test(path)) return fulfillJson(route, mockMarketTrace)
-    if (path === '/recommendations') return fulfillJson(route, [recommendation])
+    if (path === '/recommendations') return fulfillJson(route, {
+      items: [{
+        recommendation,
+        notification: { notification_id: notification.notification_id, status: notification.status },
+      }],
+      total: 1,
+      page: 1,
+      page_size: 20,
+    })
     if (path === `/recommendations/${recommendationId}`) return fulfillJson(route, recommendation)
-    if (path === '/notifications') return fulfillJson(route, [notification])
+    if (path === '/notifications') return fulfillJson(route, {
+      items: [notification], total: 1, page: 1, page_size: 50,
+    })
     if (path === '/audit') return fulfillJson(route, [{ ...mockAuditLog, recommendation_id: recommendationId }])
 
     return fulfillJson(route, { error: { code: 'not_found', message: path } }, 404)

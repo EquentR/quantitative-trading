@@ -5,12 +5,12 @@ import Button from '@/components/ui/Button.vue'
 import Alert from '@/components/ui/Alert.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
 import RecommendationStatusBadge from '@/components/domain/RecommendationStatusBadge.vue'
-import { useNotificationsQuery } from '@/queries/notifications'
 import { useAuditLogQuery } from '@/queries/audit'
-import type { Recommendation } from '@/api/types'
+import type { Recommendation, RecommendationNotificationProjection } from '@/api/types'
 
 interface Props {
   recommendation: Recommendation
+  notification: RecommendationNotificationProjection | null
 }
 const props = defineProps<Props>()
 const emit = defineEmits<{ close: [] }>()
@@ -38,20 +38,12 @@ const missingInvalidIf = computed(() => actionRequiresInvalidIf.value && invalid
 const missingDataTime = computed(() => !rec.value.data_time)
 const contractError = computed(() => missingInvalidIf.value || missingDataTime.value)
 
-const notificationsQuery = useNotificationsQuery()
 const auditQuery = useAuditLogQuery()
 
-const notificationsAvailable = computed(
-  () => !notificationsQuery.error.value && !!notificationsQuery.data.value,
-)
-const notification = computed(() =>
-  (notificationsQuery.data.value ?? []).find(
-    (n) => n.recommendation_id === rec.value.recommendation_id,
-  ) ?? null,
-)
 const auditEntry = computed(() => {
-  if (!notification.value?.audit_id) return null
-  return (auditQuery.data.value ?? []).find((a) => a.audit_id === notification.value?.audit_id) ?? null
+  return (auditQuery.data.value ?? []).find(
+    (entry) => entry.recommendation_id === rec.value.recommendation_id,
+  ) ?? null
 })
 const auditAvailable = computed(() => !!auditEntry.value)
 
@@ -115,7 +107,7 @@ onUnmounted(() => {
             <RecommendationStatusBadge kind="action" :value="rec.action" />
             <RecommendationStatusBadge kind="confidence" :value="rec.confidence" />
             <RecommendationStatusBadge
-              v-if="notificationsAvailable && notification"
+              v-if="notification"
               kind="status"
               :value="notification.status"
             />

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import Alert from '@/components/ui/Alert.vue'
 import FormatValues from '@/components/domain/FormatValues.vue'
@@ -9,11 +9,12 @@ import { useNotificationsQuery } from '@/queries/notifications'
 import { useLatestPlanQuery, usePlanQuery } from '@/queries/plans'
 import AuditLogPanel from './AuditLogPanel.vue'
 import FeedbackPanel from './FeedbackPanel.vue'
-import type { Recommendation } from '@/api/types'
+import type { Recommendation, RecommendationView } from '@/api/types'
 
 const route = useRoute()
-const recommendationsQuery = useRecommendationsQuery()
-const notificationsQuery = useNotificationsQuery()
+const selectedView = ref<RecommendationView>('current')
+const recommendationsQuery = useRecommendationsQuery(selectedView)
+const notificationsQuery = useNotificationsQuery(selectedView)
 const planQuery = useLatestPlanQuery()
 const requestedPlanId = computed(() => {
   const value = Array.isArray(route.query.plan_id) ? route.query.plan_id[0] : route.query.plan_id
@@ -21,7 +22,9 @@ const requestedPlanId = computed(() => {
 })
 const requestedPlanQuery = usePlanQuery(requestedPlanId)
 
-const recommendations = computed(() => recommendationsQuery.data.value ?? [])
+const recommendations = computed(() =>
+  (recommendationsQuery.data.value ?? []).map((item) => item.recommendation),
+)
 const notifications = computed(() => notificationsQuery.data.value ?? [])
 const plan = computed(() => requestedPlanId.value
   ? requestedPlanQuery.data.value
@@ -69,13 +72,27 @@ function invalidIfText(r: Recommendation): string {
     <h1 class="text-lg font-semibold">复盘</h1>
     <p class="text-sm text-muted-foreground">复盘用于决策回顾与反馈记录，不自动真实下单，不代表收益保证。</p>
 
+    <div class="inline-flex rounded-md border border-border p-0.5" role="group" aria-label="复盘视图">
+      <button
+        v-for="option in ([['current', '当前状态'], ['history', '历史记录']] as const)"
+        :key="option[0]"
+        type="button"
+        class="min-w-24 rounded px-3 py-1.5 text-sm"
+        :class="selectedView === option[0] ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'"
+        :aria-pressed="selectedView === option[0]"
+        @click="selectedView = option[0]"
+      >
+        {{ option[1] }}
+      </button>
+    </div>
+
     <section class="space-y-2">
       <h2 class="text-sm font-medium">推荐记录</h2>
       <Alert v-if="recommendationsQuery.error.value" variant="warning">
         <p>推荐数据不可用</p>
       </Alert>
       <div v-if="recommendations.length" class="overflow-x-auto">
-        <table class="w-full table-fixed text-xs">
+        <table class="min-w-[1040px] w-full table-fixed text-xs">
           <thead class="text-left text-muted-foreground">
             <tr>
               <th class="w-1/5 py-1">股票</th>
@@ -132,7 +149,7 @@ function invalidIfText(r: Recommendation): string {
         <p>通知数据不可用</p>
       </Alert>
       <div v-if="!notificationsError && notifications.length" class="overflow-x-auto">
-        <table class="w-full table-fixed text-xs">
+        <table class="min-w-[680px] w-full table-fixed text-xs">
           <thead class="text-left text-muted-foreground">
             <tr>
               <th class="w-1/5 py-1">股票</th>

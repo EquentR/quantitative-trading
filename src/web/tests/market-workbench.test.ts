@@ -55,6 +55,128 @@ test('行情工作台展示决策扫描器、五个标签和概览质量状态',
   expect(screen.getByText('跌破 9.70 后计划失效')).toBeInTheDocument()
 })
 
+test('获取行情按回填和盘中阶段顺序运行并显示 display-only 结果', async () => {
+  const user = userEvent.setup()
+  const calls: string[] = []
+  server.use(
+    http.post('/api/v1/service/workflows/backfill/run', async ({ request }) => {
+      calls.push('backfill')
+      expect(await request.json()).toEqual({
+        as_of_mode: 'latest_complete',
+        symbols: ['600000', '600519'],
+      })
+      return HttpResponse.json({
+        task: 'backfill', status: 'success', run_id: 'backfill-ui', snapshot_id: 1,
+        plan_id: null, recommendation_ids: [], warnings: [], reused: false,
+        ready: null, cleaned_rows: null, mode: null,
+        effective_trade_date: '2026-07-17', history_cutoff_date: '2026-07-17',
+        requested_symbol_scope: ['600000', '600519'], lease_expires_at: null,
+      })
+    }),
+    http.post('/api/v1/service/workflows/intraday/run', async ({ request }) => {
+      calls.push('intraday')
+      expect(await request.json()).toEqual({
+        outside_session_mode: 'display_only',
+        manual_reason: 'market_page_refresh',
+      })
+      return HttpResponse.json({
+        task: 'intraday', status: 'success', run_id: 'intraday-ui', snapshot_id: 2,
+        plan_id: null, recommendation_ids: [], warnings: [], reused: false,
+        ready: null, cleaned_rows: null, mode: 'display_only',
+        effective_trade_date: '2026-07-17', history_cutoff_date: '2026-07-17',
+        requested_symbol_scope: ['600000', '600519'], lease_expires_at: null,
+      })
+    }),
+  )
+  await renderMarket()
+  await screen.findByRole('button', { name: /600000 示例银行/ })
+
+  await user.click(screen.getByRole('button', { name: '获取行情' }))
+
+  await waitFor(() => expect(calls).toEqual(['backfill', 'intraday']))
+  expect(await screen.findByRole('status')).toHaveTextContent('行情展示已刷新，本次未生成交易建议')
+  expect(screen.getByRole('button', { name: '获取行情' })).not.toBeDisabled()
+})
+
+test('标的加载中、失败或为空时禁用获取行情且不发工作流请求', async () => {
+  let workflowCalls = 0
+  server.use(
+    http.get('/api/v1/market/symbols', async () => {
+      await delay(120)
+      return HttpResponse.json({ items: [], total: 0 })
+    }),
+    http.post('/api/v1/service/workflows/backfill/run', () => {
+      workflowCalls++
+      return HttpResponse.json({})
+    }),
+  )
+  const first = await renderMarket()
+  expect(screen.getByRole('button', { name: '获取行情' })).toBeDisabled()
+  first.unmount()
+
+  server.use(
+    http.get('/api/v1/market/symbols', () =>
+      HttpResponse.json({ error: { code: 'market_failed', message: 'failed' } }, { status: 503 })),
+  )
+  const second = await renderMarket()
+  await screen.findByText('决策标的加载失败')
+  expect(screen.getByRole('button', { name: '获取行情' })).toBeDisabled()
+  second.unmount()
+
+  server.use(
+    http.get('/api/v1/market/symbols', () => HttpResponse.json({ items: [], total: 0 })),
+  )
+  await renderMarket()
+  await screen.findByText('当前没有决策启用标的')
+  expect(screen.getByRole('button', { name: '获取行情' })).toBeDisabled()
+  expect(workflowCalls).toBe(0)
+})
+
+test('backfill 已落库而 intraday 异常时仍刷新日 K 查询', async () => {
+  const user = userEvent.setup()
+  let dailyReads = 0
+  server.use(
+    http.get('/api/v1/market/symbols/600000/daily-bars', () => {
+      dailyReads++
+      return HttpResponse.json(mockDailyBars)
+    }),
+    http.post('/api/v1/service/workflows/intraday/run', () =>
+      HttpResponse.json({ error: { code: 'provider_disabled', message: 'disabled' } }, { status: 503 })),
+  )
+  await renderMarket()
+  await screen.findByRole('button', { name: /600000 示例银行/ })
+  await waitFor(() => expect(dailyReads).toBeGreaterThan(0))
+  const before = dailyReads
+
+  await user.click(screen.getByRole('button', { name: '获取行情' }))
+
+  await screen.findByText('日 K 已更新，报价/分时刷新失败')
+  await waitFor(() => expect(dailyReads).toBeGreaterThan(before))
+})
+
+test('两阶段业务 failed 使用危险告警而不是绿色成功状态', async () => {
+  const user = userEvent.setup()
+  const failed = (task: 'backfill' | 'intraday') => ({
+    task, status: 'failed', run_id: `${task}-failed`, snapshot_id: null,
+    plan_id: null, recommendation_ids: [], warnings: [`${task} failed`], reused: false,
+    ready: null, cleaned_rows: null, mode: task === 'intraday' ? 'display_only' : null,
+    effective_trade_date: '2026-07-17', history_cutoff_date: '2026-07-17',
+    requested_symbol_scope: ['600000', '600519'], lease_expires_at: null,
+  })
+  server.use(
+    http.post('/api/v1/service/workflows/backfill/run', () => HttpResponse.json(failed('backfill'))),
+    http.post('/api/v1/service/workflows/intraday/run', () => HttpResponse.json(failed('intraday'))),
+  )
+  await renderMarket()
+  await screen.findByRole('button', { name: /600000 示例银行/ })
+
+  await user.click(screen.getByRole('button', { name: '获取行情' }))
+
+  const message = await screen.findByText('行情刷新失败')
+  expect(message.closest('.border-red-300')).not.toBeNull()
+  expect(message).not.toHaveClass('text-emerald-700')
+})
+
 test('扫描器仅在后端股票池内按动作、来源和异常状态筛选', async () => {
   const user = userEvent.setup()
   await renderMarket()

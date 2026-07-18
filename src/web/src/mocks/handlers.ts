@@ -25,6 +25,7 @@ import type {
   MinuteBarsResponse,
   MoneyFlowResponse,
   InstrumentPreview,
+  RecommendationListItem,
 } from '@/api/types'
 
 const now = '2026-07-07T10:30:00+08:00'
@@ -279,6 +280,16 @@ export const mockNotifications: NotificationSummary[] = [
   },
 ]
 
+export const mockRecommendationItems: RecommendationListItem[] = mockRecommendations.map(
+  (recommendation) => ({
+    recommendation,
+    notification: {
+      notification_id: 'notif-001',
+      status: 'unread',
+    },
+  }),
+)
+
 export const mockAuditLog: AuditLog = {
   audit_id: 'audit-001',
   event_type: 'recommendation_created',
@@ -480,9 +491,14 @@ export const mockMarketRuns: MarketCaptureRun[] = [
   {
     run_id: 'intraday-20260713-1021',
     workflow_type: 'intraday',
+    mode: 'decision',
     trade_date: '2026-07-13',
+    effective_trade_date: '2026-07-13',
+    history_cutoff_date: '2026-07-10',
     period_start: '2026-07-13T10:21:00+08:00',
     period_end: '2026-07-13T10:24:00+08:00',
+    requested_symbol_scope: ['600000', '600519'],
+    lease_expires_at: '2026-07-13T10:31:00+08:00',
     idempotency_key: 'intraday:2026-07-13:1021',
     status: 'degraded',
     started_at: '2026-07-13T10:21:00+08:00',
@@ -667,14 +683,32 @@ export const handlers = [
       reused: false,
       ready: null,
       cleaned_rows: null,
+      mode: 'decision',
+      effective_trade_date: '2026-07-07',
+      history_cutoff_date: '2026-07-06',
+      requested_symbol_scope: mockMarketSymbols.map((item) => item.symbol),
+      lease_expires_at: '2026-07-07T10:40:00+08:00',
     }),
   ),
-  http.get('/api/v1/recommendations', () => HttpResponse.json({
-    items: mockRecommendations,
-    total: mockRecommendations.length,
-    page: 1,
-    page_size: 20,
-  })),
+  http.post('/api/v1/service/workflows/backfill/run', () =>
+    HttpResponse.json({
+      task: 'backfill', status: 'success', run_id: 'backfill-mock-run', snapshot_id: 1,
+      plan_id: null, recommendation_ids: [], warnings: [], reused: false,
+      ready: null, cleaned_rows: null, mode: null,
+      effective_trade_date: '2026-07-07', history_cutoff_date: '2026-07-06',
+      requested_symbol_scope: mockMarketSymbols.map((item) => item.symbol),
+      lease_expires_at: null,
+    }),
+  ),
+  http.get('/api/v1/recommendations', ({ request }) => {
+    const view = new URL(request.url).searchParams.get('view')
+    return HttpResponse.json({
+      items: view ? mockRecommendationItems : mockRecommendations,
+      total: mockRecommendations.length,
+      page: 1,
+      page_size: 20,
+    })
+  }),
   http.get('/api/v1/recommendations/:recommendation_id', () =>
     HttpResponse.json(mockRecommendations[0]),
   ),

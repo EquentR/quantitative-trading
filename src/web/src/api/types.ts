@@ -258,6 +258,18 @@ export interface Recommendation {
   data_time: string
 }
 
+export type RecommendationView = 'current' | 'history'
+
+export interface RecommendationNotificationProjection {
+  notification_id: string
+  status: NotificationProcessingStatus
+}
+
+export interface RecommendationListItem {
+  recommendation: Recommendation
+  notification: RecommendationNotificationProjection | null
+}
+
 export interface WorkflowRunResponse {
   task: 'close' | 'intraday' | 'backfill' | 'cleanup'
   status: 'success' | 'degraded' | 'failed'
@@ -269,6 +281,11 @@ export interface WorkflowRunResponse {
   reused: boolean
   ready: boolean | null
   cleaned_rows: number | null
+  mode: 'decision' | 'display_only' | null
+  effective_trade_date: string | null
+  history_cutoff_date: string | null
+  requested_symbol_scope: string[] | null
+  lease_expires_at: string | null
 }
 
 export interface NotificationSummary {
@@ -521,9 +538,14 @@ export interface MarketSnapshotTrace {
 export interface MarketCaptureRun {
   run_id: string
   workflow_type: 'close' | 'intraday' | 'backfill' | 'cleanup'
+  mode: 'decision' | 'display_only' | null
   trade_date: string
+  effective_trade_date: string | null
+  history_cutoff_date: string | null
   period_start: string | null
   period_end: string | null
+  requested_symbol_scope: string[]
+  lease_expires_at: string | null
   idempotency_key: string
   status: 'running' | 'succeeded' | 'degraded' | 'failed'
   started_at: string

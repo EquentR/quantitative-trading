@@ -196,11 +196,27 @@ async function setupConsole(
         updated_at: now,
       },
       '/plans/latest': plan,
-      '/recommendations': recommendations,
+      '/recommendations': {
+        items: recommendations.map((recommendation, index) => ({
+          recommendation,
+          notification: {
+            notification_id: notifications[index].notification_id,
+            status: notifications[index].status,
+          },
+        })),
+        total: recommendations.length,
+        page: 1,
+        page_size: 20,
+      },
       '/feedback': feedback,
     }
     if (workflowReadsAvailable) {
-      responses['/notifications'] = notifications
+      responses['/notifications'] = {
+        items: notifications,
+        total: notifications.length,
+        page: 1,
+        page_size: 50,
+      }
       responses['/audit'] = auditLogs
     }
 
@@ -246,6 +262,13 @@ test('本地控制台框架可渲染并显示安全文案', async ({ page }) => 
 
   await page.goto('/recommendations')
   await expect(page.getByRole('heading', { name: '建议' })).toBeVisible()
+  if (width < 768) {
+    const table = page.getByRole('table').first()
+    await expect.poll(() => table.evaluate((element) => element.scrollWidth))
+      .toBeGreaterThan(700)
+    expect(await table.evaluate((element) =>
+      element.scrollWidth > (element.parentElement?.clientWidth ?? 0))).toBe(true)
+  }
   await page.getByRole('button', { name: '查看详情 600000' }).click()
   await expect(page.getByRole('dialog', { name: '建议详情' })).toBeVisible()
   await expect(page.getByRole('heading', { name: '理由' })).toBeVisible()
@@ -254,6 +277,11 @@ test('本地控制台框架可渲染并显示安全文案', async ({ page }) => 
 
   await page.goto('/review')
   await expect(page.getByRole('heading', { name: '人工执行反馈' })).toBeVisible()
+  if (width < 768) {
+    const table = page.getByRole('table').first()
+    expect(await table.evaluate((element) =>
+      element.scrollWidth > (element.parentElement?.clientWidth ?? 0))).toBe(true)
+  }
   await expect(page.getByRole('heading', { name: '审计日志' })).toBeVisible()
   await expect(page.getByText('按计划执行')).toBeVisible()
   await expect(page.getByText('audit-001')).toBeVisible()

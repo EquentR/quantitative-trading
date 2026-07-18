@@ -202,13 +202,13 @@
 
 **步骤：**
 
-- [ ] Cycle 7A：RED/GREEN coordinator 顺序执行 backfill/intraday，分别保存 run/status/warning/reused。Stage 1 业务 degraded/failed 继续 Stage 2；auth/validation/DB/无可信 run 的 transport fatal 才停。覆盖 Stage 1 失败而 Stage 2 成功的反向 partial。
-- [ ] Cycle 7B：RED/GREEN 409 精确轮询，短暂 404、卸载取消、provider disabled 和服务重启。等待上限取后端 lease_expires_at/retry_after；归一 response `success` 与 detail `succeeded`，未知状态报契约错误。
-- [ ] Cycle 7C：RED/GREEN 409 run scope 校验；不同 backfill scope 完成后只对 missing symbols 重提一次，仍不足则 partial，不无限重试。intraday 校验统一股票池覆盖。
-- [ ] Cycle 7D：RED/GREEN terminal 后 invalidate 全部 query；degraded 显示部分可用，display-only 显示未生成建议，真实 failed 才显示失败。
-- [ ] Cycle 7E：RED/GREEN 行情页三阶段按钮、监控/建议页共享错误处理；建议页显式 `view=current` 和 current/history 控件，详情使用 DTO link。Dashboard 请求 current，Review 可切 current/history，无参数 API 兼容测试保持 history。
-- [ ] VERIFY：使用 Node 24 运行前端定向 Vitest 与 build。
-- [ ] REVIEW：后台 agent 检查错误码处理、轮询泄漏、所有通知/建议消费者、移动/桌面文本与布局。
+- [x] Cycle 7A：RED/GREEN coordinator 顺序执行 backfill/intraday，分别保存 run/status/warning/reused。Stage 1 业务 degraded/failed 继续 Stage 2；auth/validation/DB/无可信 run 的 transport fatal 才停。覆盖 Stage 1 失败而 Stage 2 成功的反向 partial。
+- [x] Cycle 7B：RED/GREEN 409 精确轮询，短暂 404、卸载取消、provider disabled 和服务重启。等待上限取后端 lease_expires_at/retry_after；归一 response `success` 与 detail `succeeded`，未知状态报契约错误。
+- [x] Cycle 7C：RED/GREEN 409 run scope 校验；不同 backfill scope 完成后只对 missing symbols 重提一次，仍不足则 partial，不无限重试。intraday 校验统一股票池覆盖。
+- [x] Cycle 7D：RED/GREEN terminal 后 invalidate 全部 query；degraded 显示部分可用，display-only 显示未生成建议，真实 failed 才显示失败。
+- [x] Cycle 7E：RED/GREEN 行情页三阶段按钮、监控/建议页共享错误处理；建议页显式 `view=current` 和 current/history 控件，详情使用 DTO link。Dashboard 请求 current，Review 可切 current/history，无参数 API 兼容测试保持 history。
+- [x] VERIFY：使用 Node 24 运行前端定向 Vitest 与 build。
+- [x] REVIEW：后台 agent 检查错误码处理、轮询泄漏、所有通知/建议消费者、移动/桌面文本与布局。
 
 ## Task 8：规约同步、全量回归和真实服务验收
 

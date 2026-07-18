@@ -43,6 +43,32 @@ test('复盘页展示推荐记录和人工执行反馈且不出现买入成功',
   expect(screen.queryByText('买入成功')).not.toBeInTheDocument()
 })
 
+test('复盘页可在当前状态与历史记录间切换', async () => {
+  const user = userEvent.setup()
+  const recommendationViews: string[] = []
+  const notificationViews: string[] = []
+  server.use(
+    http.get('/api/v1/recommendations', ({ request }) => {
+      const view = new URL(request.url).searchParams.get('view') ?? ''
+      recommendationViews.push(view)
+      return HttpResponse.json({ items: [], total: 0, page: 1, page_size: 20 })
+    }),
+    http.get('/api/v1/notifications', ({ request }) => {
+      const view = new URL(request.url).searchParams.get('view') ?? ''
+      notificationViews.push(view)
+      return HttpResponse.json({ items: [], total: 0, page: 1, page_size: 50 })
+    }),
+  )
+  await renderReview()
+
+  expect(await screen.findByRole('button', { name: '当前状态' })).toHaveAttribute('aria-pressed', 'true')
+  await user.click(screen.getByRole('button', { name: '历史记录' }))
+  await waitFor(() => {
+    expect(recommendationViews).toContain('history')
+    expect(notificationViews).toContain('history')
+  })
+})
+
 test('plan_id query 定位指定计划并可按计划标的返回行情', async () => {
   const user = userEvent.setup()
   server.use(

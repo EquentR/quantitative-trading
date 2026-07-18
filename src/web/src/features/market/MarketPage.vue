@@ -20,6 +20,11 @@ import {
 } from '@/queries/market'
 import MarketChart from './MarketChart.vue'
 import MarketScanner from './MarketScanner.vue'
+import {
+  marketRefreshErrorMessage,
+  marketRefreshPhaseMessage,
+  useMarketRefreshCoordinator,
+} from '@/composables/useMarketRefreshCoordinator'
 
 type MarketTab = 'overview' | 'daily' | 'money' | 'intraday' | 'trace'
 
@@ -42,6 +47,11 @@ const moneyWindow = ref(60)
 
 const symbolsQuery = useMarketSymbolsQuery()
 const symbols = computed(() => symbolsQuery.data.value?.items ?? [])
+const marketRefresh = useMarketRefreshCoordinator()
+const refreshLabel = computed(() =>
+  marketRefreshPhaseMessage(marketRefresh.phase.value) || '获取行情',
+)
+const refreshError = computed(() => marketRefreshErrorMessage(marketRefresh.error.value))
 const requestedSymbol = computed(() => {
   const value = Array.isArray(route.query.symbol) ? route.query.symbol[0] : route.query.symbol
   return typeof value === 'string' && /^\d{6}$/.test(value) ? value : null
@@ -84,6 +94,14 @@ function selectSymbol(symbol: string) {
   selectedSymbol.value = symbol
   drawerOpen.value = false
   void router.replace({ query: { ...route.query, symbol } })
+}
+
+async function refreshMarket() {
+  try {
+    await marketRefresh.run({ symbols: symbols.value.map((item) => item.symbol) })
+  } catch {
+    // The coordinator exposes a sanitized, stage-aware message for the page.
+  }
 }
 
 function qualityText(status: MarketQualityStatus): string {
@@ -267,11 +285,32 @@ const intradayOption = computed<EChartsCoreOption>(() => ({
   <div class="space-y-3">
     <div class="flex flex-wrap items-center gap-2">
       <h1 class="text-lg font-semibold">行情</h1>
-      <Button class="market-mobile-trigger ml-auto" aria-label="选择决策标的" @click="drawerOpen = true">
+      <Button
+        variant="primary"
+        class="ml-auto w-44 shrink-0"
+        :loading="marketRefresh.isPending.value"
+        :disabled="symbolsQuery.isPending.value || Boolean(symbolsQuery.error.value) || symbols.length === 0"
+        :aria-label="refreshLabel"
+        @click="refreshMarket"
+      >
+        <RefreshCw v-if="!marketRefresh.isPending.value" class="size-4" />
+        {{ refreshLabel }}
+      </Button>
+      <Button class="market-mobile-trigger" aria-label="选择决策标的" @click="drawerOpen = true">
         <SlidersHorizontal class="size-4" />
         选择决策标的
       </Button>
     </div>
+
+    <Alert v-if="marketRefresh.hasFailed.value" variant="danger">
+      {{ marketRefresh.message.value }}
+    </Alert>
+    <p v-else-if="marketRefresh.message.value" class="text-sm text-emerald-700" role="status">
+      {{ marketRefresh.message.value }}
+    </p>
+    <Alert v-if="refreshError" :variant="marketRefresh.error.value?.name === 'MarketRefreshPendingError' ? 'warning' : 'danger'">
+      {{ refreshError }}
+    </Alert>
 
     <p class="text-xs text-muted-foreground">决策股票池来自手动持仓台账和后端启用的自选置顶标的。</p>
 
