@@ -497,6 +497,68 @@ def test_notification_canonical_key_uses_decision_day_not_stale_data_day(tmp_pat
         assert ":no-plan:no-version:" in no_plan.notification.dedup_key
 
 
+def test_notification_canonical_key_separates_plan_id_and_plan_version(tmp_path) -> None:
+    settings = Settings(
+        database_path=tmp_path / "plan-boundaries.db",
+        log_dir=tmp_path / "logs",
+    )
+    recommendations = [
+        recommendation(
+            "rec-plan-a-v1",
+            RecommendationAction.HOLD,
+            plan_id="plan-a",
+        ),
+        recommendation(
+            "rec-plan-b-v1",
+            RecommendationAction.HOLD,
+            plan_id="plan-b",
+        ),
+        recommendation(
+            "rec-plan-a-v2",
+            RecommendationAction.HOLD,
+            plan_id="plan-a",
+        ),
+    ]
+
+    with connect(settings) as connection:
+        migrate(connection)
+        RecommendationRepository(connection).save_many(recommendations, created_at=NOW)
+        dispatcher = build_dispatcher(connection, settings)
+        assert len(
+            {dispatcher.condition_fingerprint(item) for item in recommendations}
+        ) == 1
+
+        plan_a_v1 = dispatcher.persist_local_recommendation(
+            recommendations[0], plan_version=1, now=NOW
+        )
+        plan_b_v1 = dispatcher.persist_local_recommendation(
+            recommendations[1], plan_version=1, now=NOW
+        )
+        plan_a_v2 = dispatcher.persist_local_recommendation(
+            recommendations[2], plan_version=2, now=NOW
+        )
+
+        notifications = [
+            plan_a_v1.notification,
+            plan_b_v1.notification,
+            plan_a_v2.notification,
+        ]
+        assert all(result.created for result in [plan_a_v1, plan_b_v1, plan_a_v2])
+        assert len({item.notification_id for item in notifications}) == 3
+        assert len({item.dedup_key for item in notifications}) == 3
+        assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 3
+        assert connection.execute(
+            "SELECT COUNT(*) FROM notification_canonical_groups"
+        ).fetchone()[0] == 3
+
+        repository = NotificationRepository(connection)
+        for rec, notification in zip(recommendations, notifications, strict=True):
+            link = repository.get_link(rec.recommendation_id)
+            assert link is not None
+            assert link.notification_id == notification.notification_id
+            assert link.canonical_key == notification.dedup_key
+
+
 def test_daily_summary_aggregates_hold_watch_avoid_once_per_plan_version(tmp_path) -> None:
     settings = Settings(database_path=tmp_path / "summary.db", log_dir=tmp_path / "logs")
     recommendations = [
